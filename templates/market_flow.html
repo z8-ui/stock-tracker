@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}全市资金走向{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col">
+        <div class="card">
+            <div class="card-header">大盘指数</div>
+            <div id="index-summary" class="summary-box">
+                <p class="loading-hint">加载中...</p>
+            </div>
+        </div>
+    </div>
+    <div class="col">
+        <div class="card">
+            <div class="card-header">主力资金</div>
+            <div id="flow-summary" class="summary-box">
+                <p class="loading-hint">加载中...</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header">各类型资金流向</div>
+    <div id="chart-main-flow" class="chart-box chart-large"></div>
+</div>
+
+<div class="row">
+    <div class="col">
+        <div class="card">
+            <div class="card-header">资金分布</div>
+            <div id="chart-flow-pie" class="chart-box"></div>
+        </div>
+    </div>
+    <div class="col">
+        <div class="card">
+            <div class="card-header">资金流向说明</div>
+            <div class="summary-box">
+                <p style="color:#8892b0; font-size:13px; line-height:1.8;">
+                    主力净流入 &gt; 0：表示大资金在买入，市场偏强<br>
+                    主力净流入 &lt; 0：表示大资金在卖出，市场偏弱<br><br>
+                    <span style="color:#ef5350;">■ 超大单</span> &gt; 100万元/笔<br>
+                    <span style="color:#ef5350;">■ 大单</span> &gt; 20万元/笔<br>
+                    <span style="color:#26a69a;">■ 中单</span> &gt; 4万元/笔<br>
+                    <span style="color:#26a69a;">■ 小单</span> &lt; 4万元/笔
+                </p>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function loadMarketFlowData() {
+    fetch('/api/market-flow')
+        .then(r => r.json())
+        .then(res => {
+            if (res.code !== 200) {
+                document.getElementById('index-summary').innerHTML = '<p style="color:#8892b0;">暂无数据</p>';
+                return;
+            }
+            const d = res.data;
+            const color = d.index_change >= 0 ? '#ef5350' : '#26a69a';
+
+            // 1. 大盘指数
+            document.getElementById('index-summary').innerHTML = `
+                <div class="summary-number" style="color:${color}">${d.index_price.toFixed(2)}</div>
+                <div class="summary-label">${d.index_name}  ${d.date}</div>
+                <div class="summary-status" style="color:${color}">${d.index_change >= 0 ? '+' : ''}${d.index_change}%</div>
+            `;
+
+            // 2. 主力资金
+            const mfColor = d.main_force >= 0 ? '#ef5350' : '#26a69a';
+            const level = d.main_force > 30 ? '大幅流入' : (d.main_force > 5 ? '小幅流入' : (d.main_force > -5 ? '基本平衡' : '明显流出'));
+            document.getElementById('flow-summary').innerHTML = `
+                <div class="summary-number" style="color:${mfColor}">${d.main_force >= 0 ? '+' : ''}${d.main_force} 亿</div>
+                <div class="summary-label">主力净流入</div>
+                <div class="summary-status" style="color:${mfColor}">状态：${level}</div>
+            `;
+
+            // 3. 柱状图
+            renderMainForceChart('chart-main-flow', d);
+
+            // 4. 饼图
+            renderPieChart('chart-flow-pie', '资金分布', d.items, d.colors);
+        });
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    loadMarketFlowData();
+    startAutoRefresh('marketFlow', loadMarketFlowData);
+});
+</script>
+{% endblock %}

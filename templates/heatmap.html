@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}板块热力图{% endblock %}
+
+{% block content %}
+<div class="card">
+    <div class="card-header">
+        行业板块热力图
+        <span class="hint">方块面积 = 资金流入规模 | 颜色深浅 = 涨跌幅</span>
+    </div>
+    <div id="chart-heatmap" class="chart-box chart-largest"></div>
+</div>
+
+<div class="row">
+    <div class="col">
+    <div class="card">
+        <div class="card-header">板块涨跌幅排行</div>
+        <div id="chart-sector-rank" class="chart-box"></div>
+    </div>
+    <div class="col">
+        <div class="card">
+            <div class="card-header">板块资金流入排行</div>
+            <div id="chart-sector-flow" class="chart-box"></div>
+        </div>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header">数据说明</div>
+    <div class="summary-box" style="color:#8892b0;font-size:12px;line-height:1.8;">
+        <p><b>涨跌幅</b> = 该行业板块当日的加权平均涨跌幅（%）。<span style="color:#ef5350;">■ 红色</span>越深表示涨幅越大，<span style="color:#26a69a;">■ 绿色</span>越深表示跌幅越大。</p>
+        <p><b>资金净流入</b> = 主力资金（超大单+大单）主动买入额 − 主动卖出额，单位为亿元（亿）。正值表示资金净买入，负值表示净卖出。</p>
+        <p style="margin-top:4px;">* 非交易时段为基于真实大盘指数的估算值，交易时段自动切换为东方财富实时数据。</p>
+    </div>
+</div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function loadHeatmapData() {
+    fetch('/api/heatmap')
+        .then(r => r.json())
+        .then(res => {
+            if (res.code !== 200) return;
+            const data = res.data;
+
+            // 1. 热力图（treemap）
+            renderTreemap('chart-heatmap', '行业板块热力图', data);
+
+            // 2. 涨跌幅排行
+            const sortedByChange = [...data].sort((a, b) => b.change - a.change);
+            renderBarChart('chart-sector-rank', '涨跌幅 %', sortedByChange);
+
+            // 3. 资金流入排行
+            const sortedByFlow = [...data].sort((a, b) => b.flow - a.flow);
+            renderBarChart('chart-sector-flow', '资金流入（亿）', sortedByFlow);
+        });
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    loadHeatmapData();
+    startAutoRefresh('heatmap', loadHeatmapData);
+});
+</script>
+{% endblock %}

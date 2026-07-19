@@ -1,0 +1,354 @@
+{% extends "base.html" %}
+{% block title %}估值偏离分析{% endblock %}
+
+{% block content %}
+<!-- ========== Tab 切换 ========== -->
+<div class="card" style="padding:0;">
+    <div class="tab-bar">
+        <button class="tab-btn active" onclick="switchTab(event, 'stock-tab')">个股估值</button>
+        <button class="tab-btn" onclick="switchTab(event, 'sector-tab')">板块估值</button>
+        <button class="tab-btn" onclick="switchTab(event, 'index-tab')">科创50技术分析</button>
+    </div>
+</div>
+
+<!-- ========== Tab 1: 个股估值 ========== -->
+<div id="stock-tab" class="tab-content active">
+    <div class="row">
+        <div class="col" style="flex:2">
+            <div class="card">
+                <div class="card-header">查询个股估值</div>
+                <div class="search-bar">
+                    <input type="text" id="val-stock-search" placeholder="输入股票名称搜索" class="search-input">
+                    <button onclick="searchValStock()" class="btn">搜索</button>
+                </div>
+                <div id="val-search-results" class="search-results"></div>
+            </div>
+        </div>
+        <div class="col" style="flex:1">
+            <div class="card">
+                <div class="card-header">搜索历史</div>
+                <div id="val-search-history" class="chip-group"><p class="hint">暂无</p></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row">
+        <div class="col">
+            <div class="card">
+                <div class="card-header">个股估值偏离</div>
+                <div id="chart-valuation" class="chart-box chart-large"></div>
+            </div>
+        </div>
+        <div class="col">
+            <div class="card">
+                <div class="card-header">股价 vs 内在价值</div>
+                <div id="chart-intrinsic" class="chart-box chart-large"></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row">
+        <div class="col">
+            <div class="card">
+                <div class="card-header">估值详情</div>
+                <div id="valuation-detail" class="summary-box">
+                    <p class="loading-hint">加载中...</p>
+                </div>
+            </div>
+        </div>
+        <div class="col">
+            <div class="card">
+                <div class="card-header">内在价值详情</div>
+                <div id="intrinsic-detail" class="summary-box">
+                    <p class="loading-hint">加载中...</p>
+                </div>
+            </div>
+        </div>
+        <div class="col">
+            <div class="card">
+                <div class="card-header">
+                    自选股池 <button onclick="clearValWatchlist()" style="background:none;border:none;color:#8892b0;cursor:pointer;font-size:12px;">清空</button>
+                </div>
+                <div id="val-watchlist-stocks" class="chip-group">
+                    <p class="loading-hint">暂无自选股</p>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ========== Tab 2: 板块估值 ========== -->
+<div id="sector-tab" class="tab-content">
+    <div class="row">
+        <div class="col">
+            <div class="card">
+                <div class="card-header">板块估值散点图（PE vs PB）</div>
+                <div id="chart-sector-scatter" class="chart-box chart-largest"></div>
+            </div>
+        </div>
+        <div class="col">
+            <div class="card">
+                <div class="card-header">板块PE排行</div>
+                <div id="chart-sector-pe-rank" class="chart-box chart-large"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- ========== Tab 3: 科创50技术分析 ========== -->
+<div id="index-tab" class="tab-content">
+    <div class="row">
+        <div class="col">
+            <div class="card">
+                <div class="card-header">科创50 EMA20 均线偏离度趋势</div>
+                <div id="chart-ema-deviation" class="chart-box chart-largest"></div>
+            </div>
+        </div>
+        <div class="col">
+            <div class="card">
+                <div class="card-header">斐波那契回调线</div>
+                <div id="chart-fibonacci" class="chart-box chart-largest"></div>
+            </div>
+        </div>
+    </div>
+    <div class="card">
+        <div class="card-header">技术分析说明</div>
+        <div id="tech-analysis-summary" class="summary-box">
+            <p class="loading-hint">加载中...</p>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<style>
+.tab-bar { display:flex; border-bottom:1px solid #233054; }
+.tab-btn { background:none; border:none; color:#8892b0; padding:12px 24px; cursor:pointer; font-size:14px; border-bottom:2px solid transparent; transition:all 0.2s; }
+.tab-btn:hover { color:#e0e0e0; }
+.tab-btn.active { color:#ef5350; border-bottom-color:#ef5350; }
+.tab-content { display:none; }
+.tab-content.active { display:block; }
+</style>
+
+<script>
+// ========== 共享自选股池（与个股资金页共用 localStorage key: stockWatchlist） ==========
+function getWatchlist() {
+    try { return JSON.parse(localStorage.getItem('stockWatchlist') || '[]'); } catch(e) { return []; }
+}
+function isInWatchlist(code) {
+    return getWatchlist().some(function(i) { return i.code === code; });
+}
+function toggleValWatchlist(code, name) {
+    var w = getWatchlist();
+    if (isInWatchlist(code)) {
+        w = w.filter(function(i) { return i.code !== code; });
+    } else {
+        w.push({code: code, name: name});
+    }
+    localStorage.setItem('stockWatchlist', JSON.stringify(w));
+    renderValWatchlist();
+    updateValWatchlistBtn(code);
+}
+function clearValWatchlist() {
+    localStorage.setItem('stockWatchlist', '[]');
+    renderValWatchlist();
+}
+function renderValWatchlist() {
+    var w = getWatchlist();
+    var el = document.getElementById('val-watchlist-stocks');
+    if (!w.length) {
+        el.innerHTML = '<p class="hint">暂无自选股，搜索后点击卡片上的"加入自选"添加</p>';
+        return;
+    }
+    el.innerHTML = w.map(function(i) {
+        return '<button class="chip" onclick="loadStockVal(\'' + i.code + '\',\'' + i.name + '\')">' + i.name +
+               ' <span onclick="event.stopPropagation();removeValWatchlist(\'' + i.code + '\')" style="margin-left:4px;cursor:pointer;">✕</span></button>';
+    }).join('');
+}
+function removeValWatchlist(code) {
+    var w = getWatchlist().filter(function(i) { return i.code !== code; });
+    localStorage.setItem('stockWatchlist', JSON.stringify(w));
+    renderValWatchlist();
+}
+function updateValWatchlistBtn(code) {
+    // dynamic update via button in detail area
+}
+
+// ========== 搜索历史 ==========
+function getValHistory() {
+    try { return JSON.parse(localStorage.getItem('valSearchHistory') || '[]'); } catch(e) { return []; }
+}
+function addValHistory(code, name) {
+    var h = getValHistory();
+    h = h.filter(function(i) { return i.code !== code; });
+    h.unshift({code: code, name: name});
+    if (h.length > 10) h = h.slice(0, 10);
+    localStorage.setItem('valSearchHistory', JSON.stringify(h));
+    renderValHistory();
+}
+function renderValHistory() {
+    var h = getValHistory();
+    var el = document.getElementById('val-search-history');
+    if (!h.length) { el.innerHTML = '<p class="hint">暂无</p>'; return; }
+    el.innerHTML = h.map(function(i) {
+        return '<button class="chip" onclick="loadStockVal(\'' + i.code + '\',\'' + i.name + '\')">' + i.name + '</button>';
+    }).join('');
+}
+function searchValStock() {
+    var q = document.getElementById('val-stock-search').value;
+    if (!q) return;
+    fetch('/api/search-stock?q=' + encodeURIComponent(q))
+        .then(function(r) { return r.json(); })
+        .then(function(res) {
+            var el = document.getElementById('val-search-results');
+            if (res.code !== 200 || !res.data || !res.data.length) {
+                el.innerHTML = '<p class="hint">未找到匹配的股票</p>';
+                return;
+            }
+            el.innerHTML = res.data.map(function(s) {
+                return '<button class="chip" onclick="loadStockValBySearch(\'' + s.code + '\',\'' + s.name + '\')">' + s.name + ' (' + s.code + ')</button>';
+            }).join('');
+        });
+}
+function loadStockValBySearch(code, name) {
+    loadStockVal(code, name);
+    document.getElementById('val-search-results').innerHTML = '';
+    document.getElementById('val-stock-search').value = name;
+}
+
+// ========== Tab 切换 ==========
+function switchTab(event, tabId) {
+    document.querySelectorAll('.tab-btn').forEach(function(b) { b.classList.remove('active'); });
+    document.querySelectorAll('.tab-content').forEach(function(c) { c.classList.remove('active'); });
+    event.target.classList.add('active');
+    document.getElementById(tabId).classList.add('active');
+    setTimeout(function() {
+        if (tabId === 'sector-tab') loadSectorValuation();
+        if (tabId === 'index-tab') loadIndexAnalysis();
+    }, 100);
+}
+
+// ========== 个股估值 ==========
+var valCurrentCode = '600519';
+var valCurrentName = '贵州茅台';
+
+function loadStockVal(code, name) {
+    valCurrentCode = code;
+    valCurrentName = name;
+    addValHistory(code, name);
+    renderValWatchlist();
+
+    // 在估值详情卡片加"加入自选"按钮
+    var inWl = isInWatchlist(code);
+    var wlBtn = inWl ? '<span style="color:#ef5350;font-weight:bold;">★ 已自选</span>' :
+        '<button onclick="toggleValWatchlist(\'' + code + '\',\'' + name + '\')" style="background:#ffb74d;border:none;border-radius:4px;padding:4px 10px;color:#fff;cursor:pointer;font-size:12px;">☆ 加入自选</button>';
+
+    Promise.all([
+        fetch('/api/valuation?code=' + code + '&name=' + name).then(function(r) { return r.json(); }),
+        fetch('/api/intrinsic-value?code=' + code).then(function(r) { return r.json(); })
+    ]).then(function(results) {
+        var valRes = results[0];
+        var ivRes = results[1];
+
+        if (valRes.code === 200) {
+            var d = valRes.data;
+            renderValuationGauge('chart-valuation', d);
+            var levelColor = d.level === '偏高' ? '#ef5350' : (d.level === '偏低' ? '#26a69a' : '#ffb74d');
+            document.getElementById('valuation-detail').innerHTML = wlBtn +
+                '<div class="summary-row"><span class="label">PE (市盈率)</span><span class="value">' + d.pe + '</span></div>' +
+                '<div class="summary-row"><span class="label">PB (市净率)</span><span class="value">' + d.pb + '</span></div>' +
+                '<div class="summary-row"><span class="label">PE-TTM</span><span class="value">' + d.pe_ttm + '</span></div>' +
+                '<div class="summary-row"><span class="label">行业平均 PE</span><span class="value">' + d.industry_pe + '</span></div>' +
+                '<hr>' +
+                '<div class="summary-row"><span class="label">偏离度</span><span class="value" style="color:'+levelColor+';font-weight:bold;">' + (d.deviation_pe > 0 ? '+' : '') + d.deviation_pe + '%</span></div>' +
+                '<div class="summary-row"><span class="label">结论</span><span class="value" style="color:'+levelColor+';font-weight:bold;">' + d.level + '</span></div>';
+        }
+
+        if (ivRes.code === 200) {
+            var d = ivRes.data;
+            renderIntrinsicValue('chart-intrinsic', d);
+            var gapColor = d.gap > 0 ? '#ef5350' : '#26a69a';
+            document.getElementById('intrinsic-detail').innerHTML =
+                '<div class="summary-row"><span class="label">当前股价</span><span class="value">' + d.price.toFixed(2) + '</span></div>' +
+                '<div class="summary-row"><span class="label">内在价值（估算）</span><span class="value">' + d.intrinsic_value.toFixed(2) + '</span></div>' +
+                '<div class="summary-row"><span class="label">每股收益 EPS</span><span class="value">' + d.eps + '</span></div>' +
+                '<hr>' +
+                '<div class="summary-row"><span class="label">偏离</span><span class="value" style="color:'+gapColor+';font-weight:bold;">' + (d.gap > 0 ? '+' : '') + d.gap + '%</span></div>' +
+                '<div class="summary-row"><span class="label">判断</span><span class="value" style="color:'+gapColor+';font-weight:bold;">' + (d.gap < -10 ? '低估' : (d.gap > 10 ? '高估' : '合理')) + '</span></div>';
+        }
+    });
+}
+
+// ========== 板块估值 ==========
+function loadSectorValuation() {
+    if (window._sectorLoaded) return;
+    window._sectorLoaded = true;
+    fetch('/api/sector-valuation')
+        .then(function(r) { return r.json(); })
+        .then(function(res) {
+            if (res.code !== 200) return;
+            renderSectorValuation('chart-sector-scatter', res.data);
+            renderSectorPERank('chart-sector-pe-rank', res.data);
+        });
+}
+
+// ========== 指数技术分析 ==========
+function loadIndexAnalysis() {
+    if (window._indexLoaded) return;
+    window._indexLoaded = true;
+    fetch('/api/index-analysis?code=000688&name=科创50')
+        .then(function(r) { return r.json(); })
+        .then(function(res) {
+            if (res.code !== 200) return;
+            var d = res.data;
+            renderEMADeviation('chart-ema-deviation', d);
+
+            var klines = [];
+            for (var i = 0; i < d.dates.length; i++) {
+                klines.push({date: d.dates[i], close: d.closes[i]});
+            }
+            renderFibonacci('chart-fibonacci', d.fibonacci, klines);
+
+            var fib = d.fibonacci;
+            var lastClose = d.closes[d.closes.length - 1];
+            var lastDev = d.deviation[d.deviation.length - 1];
+            var nearestLevel = '';
+            var nearestVal = 0;
+            var levels = Object.keys(fib.levels).sort(function(a,b) { return parseFloat(b) - parseFloat(a); });
+            for (var i = 0; i < levels.length; i++) {
+                if (lastClose <= fib.high && lastClose >= fib.levels[levels[i]]) {
+                    nearestLevel = levels[i];
+                    nearestVal = fib.levels[levels[i]];
+                    break;
+                }
+            }
+
+            var devColor = lastDev > 2 ? '#ef5350' : (lastDev < -2 ? '#26a69a' : '#ffb74d');
+            document.getElementById('tech-analysis-summary').innerHTML =
+                '<div class="row"><div class="col"><p><b>EMA20偏离度：</b><span style="color:'+devColor+'">' + lastDev + '%</span> — ' +
+                (lastDev > 3 ? '显著偏离，注意回调风险' : (lastDev > 1 ? '小幅偏离，趋势偏强' : (lastDev < -3 ? '显著偏离，存在反弹机会' : '在均线附近，趋势平稳'))) +
+                '</p><p><b>斐波那契位置：</b>当前 ' + lastClose + '，处于 Fib ' + nearestLevel + ' (' + nearestVal + ') 附近</p></div>' +
+                '<div class="col"><p><b>斐波那契关键位：</b></p>' +
+                levels.map(function(k) {
+                    var l = fib.levels[k];
+                    var isNear = Math.abs(lastClose - l) / l < 0.02;
+                    return '<p style="margin-left:16px;' + (isNear ? 'color:#ffb74d;font-weight:bold;' : '') + '">Fib ' + k + ': <b>' + l + '</b>' + (isNear ? ' ← 当前附近' : '') + '</p>';
+                }).join('') +
+                '</div></div>' +
+                '<p style="color:#8892b0;font-size:12px;margin-top:8px;">* 以上数据基于最近20个交易日，盘中预估仅供参考</p>';
+        });
+}
+
+// 默认加载
+document.addEventListener('DOMContentLoaded', function() {
+    renderValHistory();
+    renderValWatchlist();
+    var w = getWatchlist();
+    if (w.length) {
+        loadStockVal(w[0].code, w[0].name);
+    } else {
+        loadStockVal('600519', '贵州茅台');
+    }
+});
+</script>
+{% endblock %}

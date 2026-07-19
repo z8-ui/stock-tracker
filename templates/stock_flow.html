@@ -1,0 +1,246 @@
+{% extends "base.html" %}
+{% block title %}个股资金追踪{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col" style="flex:2">
+        <!-- 搜索栏 -->
+        <div class="card">
+            <div class="card-header">查询个股</div>
+            <div class="search-bar">
+                <input type="text" id="stock-search" placeholder="输入股票名称，如：贵州茅台" class="search-input">
+                <button onclick="searchStock()" class="btn">搜索</button>
+            </div>
+            <div id="search-results" class="search-results"></div>
+        </div>
+    </div>
+    <div class="col" style="flex:1">
+        <!-- 搜索历史 -->
+        <div class="card">
+            <div class="card-header">
+                搜索历史
+                <button onclick="clearHistory()" style="background:none;border:none;color:#8892b0;cursor:pointer;font-size:12px;">清空</button>
+            </div>
+            <div id="search-history" class="chip-group"></div>
+        </div>
+    </div>
+</div>
+
+<!-- 个股实时行情 -->
+<div class="card" id="stock-quote-card">
+    <div class="card-header">
+        <span id="stock-name-display" style="font-size:18px; font-weight:600;">贵州茅台 (600519)</span>
+        <div>
+            <button onclick="toggleWatchlist()" id="watchlist-btn" class="btn" style="background:#ffb74d;padding:6px 14px;font-size:13px;">☆ 加入自选</button>
+            <span id="stock-price-display" style="font-size:28px; font-weight:700; color:#ef5350; margin-left:16px;">--</span>
+        </div>
+    </div>
+    <div class="row" id="stock-quote-grid" style="display:none;">
+        <div class="col">
+            <div class="summary-row"><span class="label">涨跌幅</span><span class="value" id="q-change-pct">--</span></div>
+            <div class="summary-row"><span class="label">涨跌额</span><span class="value" id="q-change">--</span></div>
+            <div class="summary-row"><span class="label">今开</span><span class="value" id="q-open">--</span></div>
+            <div class="summary-row"><span class="label">昨收</span><span class="value" id="q-pre-close">--</span></div>
+        </div>
+        <div class="col">
+            <div class="summary-row"><span class="label">最高</span><span class="value" id="q-high">--</span></div>
+            <div class="summary-row"><span class="label">最低</span><span class="value" id="q-low">--</span></div>
+            <div class="summary-row"><span class="label">成交额</span><span class="value" id="q-turnover">--</span></div>
+            <div class="summary-row"><span class="label">换手率</span><span class="value" id="q-turnover-rate">--</span></div>
+        </div>
+    </div>
+</div>
+
+<!-- 自选股池 -->
+<div class="card" id="watchlist-section">
+    <div class="card-header">
+        自选股池
+        <span class="hint">点击快速切换</span>
+    </div>
+    <div id="watchlist-stocks" class="chip-group">
+        <p class="loading-hint">暂无自选股，搜索股票后点击☆添加</p>
+    </div>
+</div>
+
+<!-- 资金流向图 -->
+<div class="card">
+    <div class="card-header">
+        资金流向（超大单/大单/中单/小单）
+        <span class="hint">非交易日为估算趋势</span>
+    </div>
+    <div id="chart-stock-flow" class="chart-box chart-large"></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// ========== 搜索历史（localStorage） ==========
+function getHistory() {
+    try { return JSON.parse(localStorage.getItem('stockSearchHistory') || '[]'); } catch(e) { return []; }
+}
+function addHistory(code, name) {
+    var h = getHistory();
+    h = h.filter(function(i) { return i.code !== code; });
+    h.unshift({code: code, name: name});
+    if (h.length > 10) h = h.slice(0, 10);
+    localStorage.setItem('stockSearchHistory', JSON.stringify(h));
+    renderHistory();
+}
+function clearHistory() {
+    localStorage.setItem('stockSearchHistory', '[]');
+    renderHistory();
+}
+function renderHistory() {
+    var h = getHistory();
+    var el = document.getElementById('search-history');
+    if (!h.length) { el.innerHTML = '<p class="hint">暂无搜索记录</p>'; return; }
+    el.innerHTML = h.map(function(i) {
+        return '<button class="chip" onclick="loadStock(\'' + i.code + '\',\'' + i.name + '\')">' + i.name + '</button>';
+    }).join('');
+}
+
+// ========== 自选股池（localStorage） ==========
+function getWatchlist() {
+    try { return JSON.parse(localStorage.getItem('stockWatchlist') || '[]'); } catch(e) { return []; }
+}
+function isInWatchlist(code) {
+    return getWatchlist().some(function(i) { return i.code === code; });
+}
+function toggleWatchlist() {
+    var code = currentCode;
+    var name = document.getElementById('stock-name-display').textContent.split(' (')[0];
+    var w = getWatchlist();
+    if (isInWatchlist(code)) {
+        w = w.filter(function(i) { return i.code !== code; });
+    } else {
+        w.push({code: code, name: name});
+    }
+    localStorage.setItem('stockWatchlist', JSON.stringify(w));
+    renderWatchlist();
+    updateWatchlistBtn();
+}
+function updateWatchlistBtn() {
+    var btn = document.getElementById('watchlist-btn');
+    if (isInWatchlist(currentCode)) {
+        btn.innerHTML = '★ 已自选';
+        btn.style.background = '#ef5350';
+    } else {
+        btn.innerHTML = '☆ 加入自选';
+        btn.style.background = '#ffb74d';
+    }
+}
+function renderWatchlist() {
+    var w = getWatchlist();
+    var el = document.getElementById('watchlist-stocks');
+    if (!w.length) {
+        el.innerHTML = '<p class="hint">暂无自选股，搜索股票后点击☆添加</p>';
+        return;
+    }
+    el.innerHTML = w.map(function(i) {
+        var active = i.code === currentCode ? ' active' : '';
+        return '<button class="chip' + active + '" onclick="loadStock(\'' + i.code + '\',\'' + i.name + '\')">' + i.name + ' <span onclick="event.stopPropagation();removeFromWatchlist(\'' + i.code + '\')" style="margin-left:4px;cursor:pointer;">✕</span></button>';
+    }).join('');
+}
+function removeFromWatchlist(code) {
+    var w = getWatchlist().filter(function(i) { return i.code !== code; });
+    localStorage.setItem('stockWatchlist', JSON.stringify(w));
+    renderWatchlist();
+}
+
+// ========== 核心加载函数 ==========
+var currentCode = '600519';
+
+function loadStock(code, name) {
+    currentCode = code;
+    addHistory(code, name);
+    updateWatchlistBtn();
+    renderWatchlist();
+
+    document.getElementById('stock-name-display').textContent = name + ' (' + code + ')';
+
+    fetch('/api/stock-quote?code=' + code)
+        .then(function(r) { return r.json(); })
+        .then(function(res) {
+            if (res.code !== 200) return;
+            var q = res.data;
+            var color = q.change >= 0 ? '#ef5350' : '#26a69a';
+            document.getElementById('stock-price-display').textContent = q.price.toFixed(2);
+            document.getElementById('stock-price-display').style.color = color;
+            document.getElementById('q-change-pct').textContent = (q.change_pct >= 0 ? '+' : '') + q.change_pct + '%';
+            document.getElementById('q-change-pct').style.color = color;
+            document.getElementById('q-change').textContent = (q.change >= 0 ? '+' : '') + q.change.toFixed(2);
+            document.getElementById('q-change').style.color = color;
+            document.getElementById('q-open').textContent = q.open.toFixed(2);
+            document.getElementById('q-pre-close').textContent = q.pre_close.toFixed(2);
+            document.getElementById('q-high').textContent = q.high.toFixed(2);
+            document.getElementById('q-low').textContent = q.low.toFixed(2);
+            document.getElementById('q-turnover').textContent = q.turnover + '亿';
+            document.getElementById('q-turnover-rate').textContent = q.turnover_rate + '%';
+            document.getElementById('stock-quote-grid').style.display = 'flex';
+        });
+
+    fetch('/api/stock-flow?code=' + code + '&name=' + name)
+        .then(function(r) { return r.json(); })
+        .then(function(res) {
+            if (res.code !== 200) {
+                document.getElementById('chart-stock-flow').innerHTML = '<div style="text-align:center;padding:80px;color:#8892b0;">' + res.msg + '</div>';
+                return;
+            }
+            renderStockFlow('chart-stock-flow', res.data);
+        });
+}
+
+function searchStock() {
+    var q = document.getElementById('stock-search').value;
+    if (!q) return;
+    fetch('/api/search-stock?q=' + encodeURIComponent(q))
+        .then(function(r) { return r.json(); })
+        .then(function(res) {
+            var el = document.getElementById('search-results');
+            if (res.code !== 200 || !res.data || !res.data.length) {
+                el.innerHTML = '<p class="hint">未找到匹配的股票</p>';
+                return;
+            }
+            el.innerHTML = res.data.map(function(s) {
+                return '<button class="chip" onclick="loadStockBySearch(\'' + s.code + '\',\'' + s.name + '\')">' + s.name + ' (' + s.code + ')</button>';
+            }).join('');
+        });
+}
+
+function loadStockBySearch(code, name) {
+    loadStock(code, name);
+    document.getElementById('search-results').innerHTML = '';
+    document.getElementById('stock-search').value = name;
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    renderHistory();
+    renderWatchlist();
+    // 默认加载自选第一支，没有就按预设
+    var w = getWatchlist();
+    if (w.length) {
+        loadStock(w[0].code, w[0].name);
+    } else {
+        loadStock('600519', '贵州茅台');
+    }
+    // 个股行情每15秒刷新一次（盘中交易需要更频繁）
+    startAutoRefresh('stockQuote', function() {
+        if (currentCode) {
+            fetch('/api/stock-quote?code=' + currentCode)
+                .then(function(r) { return r.json(); })
+                .then(function(res) {
+                    if (res.code !== 200) return;
+                    var q = res.data;
+                    var color = q.change >= 0 ? '#ef5350' : '#26a69a';
+                    document.getElementById('stock-price-display').textContent = q.price.toFixed(2);
+                    document.getElementById('stock-price-display').style.color = color;
+                    document.getElementById('q-change-pct').textContent = (q.change_pct >= 0 ? '+' : '') + q.change_pct + '%';
+                    document.getElementById('q-change-pct').style.color = color;
+                    document.getElementById('q-change').textContent = (q.change >= 0 ? '+' : '') + q.change.toFixed(2);
+                    document.getElementById('q-change').style.color = color;
+                });
+        }
+    }, 15000);
+});
+</script>
+{% endblock %}

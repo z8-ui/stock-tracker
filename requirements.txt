@@ -1,0 +1,4 @@
+# 依赖清单
+# 安装: pip install -r requirements.txt
+flask>=3.0
+requests>=2.30

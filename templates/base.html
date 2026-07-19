@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ app_name }} - {% block title %}首页{% endblock %}</title>
+    <!-- ECharts 从 CDN 加载，不需要 npm -->
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+
+<!-- ========== 顶部导航栏 ========== -->
+<nav class="navbar">
+    <div class="nav-brand">{{ app_name }}</div>
+    <div class="nav-links">
+        <a href="/" class="nav-link {% if request.path == '/' %}active{% endif %}">
+            总览
+        </a>
+        <a href="/market-flow" class="nav-link {% if request.path == '/market-flow' %}active{% endif %}">
+            资金走向
+        </a>
+        <a href="/heatmap" class="nav-link {% if request.path == '/heatmap' %}active{% endif %}">
+            板块热力
+        </a>
+        <a href="/stock-flow" class="nav-link {% if request.path == '/stock-flow' %}active{% endif %}">
+            个股资金
+        </a>
+        <a href="/valuation" class="nav-link {% if request.path == '/valuation' %}active{% endif %}">
+            估值偏离
+        </a>
+        <span class="auto-refresh-indicator" id="refresh-indicator">● 自动刷新 30s</span>
+    </div>
+</nav>
+
+<!-- ========== 页面内容（子模板填充） ========== -->
+<main class="container">
+    {% block content %}{% endblock %}
+</main>
+
+<!-- ========== 底部 ========== -->
+<footer class="footer">
+    <p>数据来源：东方财富 | 仅供学习参考，不构成投资建议</p>
+</footer>
+
+<script src="/static/js/app.js"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

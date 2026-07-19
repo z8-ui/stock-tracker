@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}总览仪表盘{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col">
+        <div class="card">
+            <div class="card-header">全市资金流向 <span class="hint" id="ts-market-flow">--</span></div>
+            <div id="chart-market-flow" class="chart-box"></div>
+        </div>
+    </div>
+    <div class="col">
+        <div class="card">
+            <div class="card-header">板块热度 TOP10 <span class="hint" id="ts-heatmap">--</span></div>
+            <div id="chart-heatmap-preview" class="chart-box"></div>
+        </div>
+    </div>
+</div>
+
+<div class="row">
+    <div class="col">
+        <div class="card">
+            <div class="card-header">快速入口</div>
+            <div class="quick-links">
+                <a href="/market-flow" class="quick-card">📊 全市资金走向</a>
+                <a href="/heatmap" class="quick-card">🔥 板块热力图</a>
+                <a href="/stock-flow" class="quick-card">💰 个股资金追踪</a>
+                <a href="/valuation" class="quick-card">📈 估值偏离分析</a>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function loadDashboardData() {
+    fetch('/api/market-flow')
+        .then(r => r.json())
+        .then(res => {
+            if (res.code !== 200) return;
+            const d = res.data;
+            renderPieChart('chart-market-flow', d.title, d.items, d.colors);
+            updateTimestamp('ts-market-flow');
+        });
+
+    fetch('/api/heatmap')
+        .then(r => r.json())
+        .then(res => {
+            if (res.code !== 200) return;
+            const top10 = res.data.slice(0, 10);
+            renderBarChart('chart-heatmap-preview', '板块涨跌幅 %', top10);
+            updateTimestamp('ts-heatmap');
+        });
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+    loadDashboardData();
+    startAutoRefresh('dashboard', loadDashboardData);
+});
+</script>
+{% endblock %}
