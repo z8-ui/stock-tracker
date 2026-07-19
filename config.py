@@ -65,3 +65,14 @@ HEATMAP_COLORS = ["#26a69a", "#66bb6a", "#ffb74d", "#ff8a65", "#ef5350", "#d32f2
 
 # 个股资金流向的维度名称
 MONEY_FLOW_DIMS = ["超大单净流入", "大单净流入", "中单净流入", "小单净流入"]
+
+# ==============================================================
+#  本地配置覆盖（自选池等，非公开）
+#  每个开发者创建自己的 config_local.py，已被 .gitignore 排除
+# ==============================================================
+try:
+    from config_local import *  # noqa: F401, F403
+except ImportError:
+    # 没有本地配置时使用空列表，别人 fork 不会看到你的自选
+    STOCK_WATCHLIST = {}
+    VALUATION_WATCHLIST = {}

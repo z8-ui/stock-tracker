@@ -24,3 +24,6 @@ Thumbs.db
 
 # 备份（如果有）
 *-backup-*.tar.gz
+
+# 个人本地配置（自选池、关注列表等，不被 fork 者看到）
+config_local.py
