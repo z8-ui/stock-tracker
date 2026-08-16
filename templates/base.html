@@ -29,7 +29,10 @@
         <a href="/valuation" class="nav-link {% if request.path == '/valuation' %}active{% endif %}">
             估值偏离
         </a>
-        <span class="auto-refresh-indicator" id="refresh-indicator">● 自动刷新 30s</span>
+        <a href="/ai" class="nav-link {% if request.path == '/ai' %}active{% endif %}">
+            AI分析
+        </a>
+        <span class="auto-refresh-indicator" id="refresh-indicator">● 自动刷新 <span id="refresh-secs">15</span>s</span>
     </div>
 </nav>
 

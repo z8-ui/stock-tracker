@@ -3,10 +3,12 @@
 """
 
 from flask import Blueprint, render_template, jsonify, request
+from datetime import datetime, timedelta
 from data_service import (
     get_market_flow, get_sector_flow,
     get_stock_money_flow, get_stock_valuation, search_stock,
     get_stock_quote, get_index_history, get_sector_valuation,
+    get_stock_real_money_flow,
     calc_ema, calc_fibonacci_levels, estimate_intrinsic_value
 )
 from chart_builder import (
@@ -48,7 +50,10 @@ def api_market_flow():
     data = get_market_flow()
     chart = build_market_flow_chart(data)
     if chart:
-        return jsonify({"code": 200, "data": chart})
+        resp = {"code": 200, "data": chart}
+        if data and "_market_status" in data:
+            resp["_market_status"] = data["_market_status"]
+        return jsonify(resp)
     return jsonify({"code": 500, "msg": "数据获取失败（非交易日或接口限制）"})
 
 
@@ -57,7 +62,10 @@ def api_heatmap():
     sectors = get_sector_flow()
     chart = build_heatmap_chart(sectors)
     if chart:
-        return jsonify({"code": 200, "data": chart})
+        # 附加市场状态
+        from data_service import _market_status as _ms
+        status, _ = _ms()
+        return jsonify({"code": 200, "data": chart, "_market_status": status})
     return jsonify({"code": 500, "msg": "数据获取失败"})
 
 
@@ -83,6 +91,16 @@ def api_stock_flow():
     return jsonify({"code": 500, "msg": "非交易日无详细资金流数据"})
 
 
+@bp.route("/api/stock-real-flow")
+def api_stock_real_flow():
+    """个股当日真实资金净流向 + 占比（大单净量等）"""
+    code = request.args.get("code", "600519")
+    data = get_stock_real_money_flow(code)
+    if data:
+        return jsonify({"code": 200, "data": data})
+    return jsonify({"code": 500, "msg": "获取资金流数据失败"})
+
+
 @bp.route("/api/valuation")
 def api_valuation():
     """个股估值"""
@@ -102,6 +120,24 @@ def api_search_stock():
         return jsonify({"code": 400, "msg": "请输入关键词"})
     result = search_stock(keyword)
     return jsonify({"code": 200, "data": result or []})
+
+
+@bp.route("/ai")
+def ai_page():
+    """AI 分析页面"""
+    return render_template("ai.html", app_name=APP_NAME)
+
+
+@bp.route("/api/ai-analysis")
+def api_ai_analysis():
+    """AI 技术分析: 拉K线 -> 算指标 -> DeepSeek 生成分析"""
+    code = request.args.get("code", "600519")
+    name = request.args.get("name", "贵州茅台")
+    from ai_analysis import analyze
+    result = analyze(code, name)
+    if not result:
+        return jsonify({"code": 500, "msg": "K线数据不足(可能休市或代码错误)"})
+    return jsonify({"code": 200, "data": result})
 
 
 @bp.route("/api/index-analysis")
@@ -164,3 +200,69 @@ def api_intrinsic_value():
         return jsonify({"code": 500, "msg": "获取数据失败"})
     iv = estimate_intrinsic_value(quote)
     return jsonify({"code": 200, "data": iv})
+
+
+@bp.route("/api/fibonacci")
+def api_fibonacci():
+    """个股斐波那契回调线（用于估值偏离界面）
+    使用真实K线数据计算近20日斐波那契回调位
+    """
+    code = request.args.get("code", "600519")
+    name = request.args.get("name", "")
+    
+    # 获取实时行情校准当前价
+    quote = get_stock_quote(code)
+    if not quote:
+        return jsonify({"code": 500, "msg": "获取个股数据失败"})
+    
+    # 获取个股真实K线数据（直接用腾讯接口，市场前缀要正确）
+    import requests as _req
+    market = "sh" if code.startswith("6") else "sz"
+    end = datetime.now().strftime("%Y-%m-%d")
+    start = (datetime.now() - timedelta(days=50)).strftime("%Y-%m-%d")
+    url = "http://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+    try:
+        resp = _req.get(url, params={"param": f"{market}{code},day,{start},{end},25,qfq"},
+                       headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        data = resp.json()
+        klines = data.get("data", {}).get(f"{market}{code}", {}).get("day", []) or \
+                 data.get("data", {}).get(f"{market}{code}", {}).get("qfqday", [])
+        if not klines or len(klines) < 5:
+            return jsonify({"code": 500, "msg": "K线数据不足"})
+    except Exception as e:
+        return jsonify({"code": 500, "msg": f"获取K线失败: {str(e)}"})
+    
+    closes = [round(float(k[2]), 2) for k in klines]
+    highs_v = [round(float(k[3]), 2) for k in klines]
+    lows_v = [round(float(k[4]), 2) for k in klines]
+    
+    # 近20日高低点计算斐波那契
+    recent_high = max(highs_v[-20:])
+    recent_low = min(lows_v[-20:])
+    fib = calc_fibonacci_levels(recent_high, recent_low)
+    
+    # 用实时行情替换最后一个收盘价（保证当前价准确）
+    current_price = quote["price"]
+    if closes:
+        closes[-1] = current_price
+    dates = [k[0] for k in klines]
+    # 找到当前价最接近的斐波那契位
+    nearest_level = None
+    nearest_diff = float("inf")
+    for k, v in fib["levels"].items():
+        diff = abs(current_price - v)
+        if diff < nearest_diff:
+            nearest_diff = diff
+            nearest_level = k
+    return jsonify({
+        "code": 200,
+        "data": {
+            "name": name,
+            "current_price": current_price,
+            "fibonacci": fib,
+            "dates": dates,
+            "closes": closes,
+            "nearest_level": nearest_level,
+            "deviation_pct": round((current_price - fib["levels"][nearest_level]) / fib["levels"][nearest_level] * 100, 2) if nearest_level else 0
+        }
+    })

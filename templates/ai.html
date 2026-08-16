@@ -1,0 +1,172 @@
+{% extends "base.html" %}
+{% block title %}AI 分析{% endblock %}
+
+{% block content %}
+<!-- ========== 搜索区 ========== -->
+<div class="row">
+    <div class="col" style="flex:2">
+        <div class="card">
+            <div class="card-header">AI 技术分析（K线 + 指标 + 大模型）</div>
+            <div class="search-bar">
+                <input type="text" id="ai-stock-search" placeholder="输入股票名称搜索，如 中钨高新" class="search-input">
+                <button onclick="searchAiStock()" class="btn">搜索</button>
+            </div>
+            <div id="ai-search-results" class="search-results"></div>
+        </div>
+    </div>
+    <div class="col" style="flex:1">
+        <div class="card">
+            <div class="card-header">搜索历史</div>
+            <div id="ai-search-history" class="chip-group"><p class="hint">暂无</p></div>
+        </div>
+    </div>
+</div>
+
+<!-- ========== 指标卡片 ========== -->
+<div class="row" id="ai-indicator-row" style="display:none;">
+    <div class="col"><div class="card"><div class="card-header">最新行情</div><div id="ai-quote" class="summary-box"></div></div></div>
+    <div class="col"><div class="card"><div class="card-header">均线 MA</div><div id="ai-ma" class="summary-box"></div></div></div>
+    <div class="col"><div class="card"><div class="card-header">MACD / RSI</div><div id="ai-macd" class="summary-box"></div></div></div>
+    <div class="col"><div class="card"><div class="card-header">量能</div><div id="ai-volume" class="summary-box"></div></div></div>
+</div>
+
+<div class="card" id="ai-fib-card" style="display:none;">
+    <div class="card-header">斐波那契回调位（近20日）</div>
+    <div id="ai-fib" class="summary-box"></div>
+</div>
+
+<!-- ========== AI 分析文本 ========== -->
+<div class="card">
+    <div class="card-header">AI 分析报告</div>
+    <div id="ai-analysis-box" class="summary-box">
+        <p class="hint">搜索并选择一只股票开始分析。分析基于真实K线数据 + 技术指标，由大模型生成，仅供参考，不构成投资建议。</p>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// ========== 搜索历史 ==========
+function getAiHistory() {
+    try { return JSON.parse(localStorage.getItem('aiSearchHistory') || '[]'); } catch(e) { return []; }
+}
+function addAiHistory(code, name) {
+    var h = getAiHistory();
+    h = h.filter(function(i) { return i.code !== code; });
+    h.unshift({code: code, name: name});
+    if (h.length > 10) h = h.slice(0, 10);
+    localStorage.setItem('aiSearchHistory', JSON.stringify(h));
+    renderAiHistory();
+}
+function renderAiHistory() {
+    var h = getAiHistory();
+    var el = document.getElementById('ai-search-history');
+    if (!h.length) { el.innerHTML = '<p class="hint">暂无</p>'; return; }
+    el.innerHTML = h.map(function(i) {
+        return '<button class="chip" onclick="loadAiAnalysis(\'' + i.code + '\',\'' + i.name + '\')">' + i.name + '</button>';
+    }).join('');
+}
+
+// ========== 搜索 ==========
+function searchAiStock() {
+    var q = document.getElementById('ai-stock-search').value;
+    if (!q) return;
+    fetch('/api/search-stock?q=' + encodeURIComponent(q))
+        .then(function(r) { return r.json(); })
+        .then(function(res) {
+            var el = document.getElementById('ai-search-results');
+            if (res.code !== 200 || !res.data || !res.data.length) {
+                el.innerHTML = '<p class="hint">未找到匹配的股票</p>';
+                return;
+            }
+            el.innerHTML = res.data.map(function(s) {
+                return '<button class="chip" onclick="loadAiBySearch(\'' + s.code + '\',\'' + s.name + '\')">' + s.name + ' (' + s.code + ')</button>';
+            }).join('');
+        });
+}
+function loadAiBySearch(code, name) {
+    loadAiAnalysis(code, name);
+    document.getElementById('ai-search-results').innerHTML = '';
+    document.getElementById('ai-stock-search').value = name;
+}
+
+// ========== 分析 ==========
+function loadAiAnalysis(code, name) {
+    addAiHistory(code, name);
+    var box = document.getElementById('ai-analysis-box');
+    box.innerHTML = '<p class="loading-hint">AI 分析中（拉取K线 + 计算指标 + 大模型生成，约10-30秒）...</p>';
+    document.getElementById('ai-indicator-row').style.display = 'none';
+    document.getElementById('ai-fib-card').style.display = 'none';
+
+    fetch('/api/ai-analysis?code=' + code + '&name=' + encodeURIComponent(name))
+        .then(function(r) { return r.json(); })
+        .then(function(res) {
+            if (res.code !== 200) {
+                box.innerHTML = '<p style="color:#ef5350;">' + res.msg + '</p>';
+                return;
+            }
+            var d = res.data;
+            renderIndicators(d.indicators);
+            box.innerHTML = renderAnalysisText(d.analysis);
+        })
+        .catch(function(err) {
+            box.innerHTML = '<p style="color:#ef5350;">请求失败: ' + err + '</p>';
+        });
+}
+
+// ========== 指标渲染 ==========
+function renderIndicators(ind) {
+    document.getElementById('ai-indicator-row').style.display = 'flex';
+    document.getElementById('ai-fib-card').style.display = 'block';
+
+    var chgColor = ind.chg_pct >= 0 ? '#ef5350' : '#26a69a';
+    document.getElementById('ai-quote').innerHTML =
+        '<div class="summary-row"><span class="label">收盘价</span><span class="value">' + ind.price + '</span></div>' +
+        '<div class="summary-row"><span class="label">当日涨跌</span><span class="value" style="color:' + chgColor + ';">' + (ind.chg_pct >= 0 ? '+' : '') + ind.chg_pct + '%</span></div>' +
+        '<div class="summary-row"><span class="label">日期</span><span class="value">' + ind.date + '</span></div>';
+
+    document.getElementById('ai-ma').innerHTML =
+        '<div class="summary-row"><span class="label">MA5</span><span class="value">' + ind.ma5 + '</span></div>' +
+        '<div class="summary-row"><span class="label">MA10</span><span class="value">' + ind.ma10 + '</span></div>' +
+        '<div class="summary-row"><span class="label">MA20</span><span class="value">' + ind.ma20 + '</span></div>' +
+        '<div class="summary-row"><span class="label">MA60</span><span class="value">' + ind.ma60 + '</span></div>';
+
+    var macdColor = ind.macd_hist >= 0 ? '#ef5350' : '#26a69a';
+    var rsiColor = ind.rsi14 > 70 ? '#ef5350' : (ind.rsi14 < 30 ? '#26a69a' : '#ffb74d');
+    document.getElementById('ai-macd').innerHTML =
+        '<div class="summary-row"><span class="label">DIF</span><span class="value">' + ind.macd_dif + '</span></div>' +
+        '<div class="summary-row"><span class="label">DEA</span><span class="value">' + ind.macd_dea + '</span></div>' +
+        '<div class="summary-row"><span class="label">MACD柱</span><span class="value" style="color:' + macdColor + ';">' + ind.macd_hist + '</span></div>' +
+        '<div class="summary-row"><span class="label">RSI14</span><span class="value" style="color:' + rsiColor + ';">' + ind.rsi14 + (ind.rsi14 > 70 ? ' (超买)' : (ind.rsi14 < 30 ? ' (超卖)' : '')) + '</span></div>';
+
+    var volColor = ind.vol_ratio >= 1.2 ? '#ef5350' : (ind.vol_ratio <= 0.8 ? '#26a69a' : '#ffb74d');
+    document.getElementById('ai-volume').innerHTML =
+        '<div class="summary-row"><span class="label">5日均量</span><span class="value">' + (ind.vol_ma5 / 10000).toFixed(1) + '万手</span></div>' +
+        '<div class="summary-row"><span class="label">20日均量</span><span class="value">' + (ind.vol_ma20 / 10000).toFixed(1) + '万手</span></div>' +
+        '<div class="summary-row"><span class="label">量比</span><span class="value" style="color:' + volColor + ';">' + ind.vol_ratio + (ind.vol_ratio >= 1.2 ? ' (放量)' : (ind.vol_ratio <= 0.8 ? ' (缩量)' : ' (平量)')) + '</span></div>' +
+        '<div class="summary-row"><span class="label">近20日</span><span class="value">涨' + ind.up_days_20 + '天 / 跌' + ind.down_days_20 + '天</span></div>';
+
+    var fib = ind.fib;
+    document.getElementById('ai-fib').innerHTML =
+        '<p><b>近20日高点：</b>' + ind.high_20 + ' &nbsp; <b>低点：</b>' + ind.low_20 + '</p>' +
+        Object.keys(fib.levels).sort(function(a,b){ return parseFloat(b) - parseFloat(a); }).map(function(k) {
+            var near = Math.abs(ind.price - fib.levels[k]) / fib.levels[k] < 0.02;
+            return '<span class="chip" style="' + (near ? 'background:#ffb74d;color:#fff;' : '') + '">Fib ' + k + ': ' + fib.levels[k] + (near ? ' ← 当前附近' : '') + '</span>';
+        }).join(' ');
+}
+
+// ========== 文本渲染(简单 markdown) ==========
+function renderAnalysisText(text) {
+    var html = String(text)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
+        .replace(/^---+$/gm, '<hr style="border-color:#233054;">')
+        .replace(/\n/g, '<br>');
+    return '<div style="line-height:1.9;font-size:14px;">' + html + '</div>' +
+           '<p style="color:#8892b0;font-size:12px;margin-top:12px;">* 本报告由 AI 基于技术指标生成，仅供学习参考，不构成投资建议。</p>';
+}
+
+// 默认加载历史
+document.addEventListener('DOMContentLoaded', renderAiHistory);
+</script>
+{% endblock %}

@@ -11,6 +11,9 @@ DEBUG = True               # 开发时开着，部署关掉
 # 页面标题
 APP_NAME = "A股追踪系统"
 
+# AI 分析 - DeepSeek API key(个人配置, 放 config_local.py, 不会上传 GitHub)
+DEEPSEEK_API_KEY = ""
+
 # 板块热力图 - 要显示的行业板块列表
 # 东方财富行业板块代码，想加板块就在这加
 SECTORS = [
