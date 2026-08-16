@@ -14,6 +14,10 @@ APP_NAME = "A股追踪系统"
 # AI 分析 - DeepSeek API key(个人配置, 放 config_local.py, 不会上传 GitHub)
 DEEPSEEK_API_KEY = ""
 
+# AI 分析接口可选 token(防滥用): 非空时 /api/ai-analysis 必须带 ?token=xxx
+# 自用可留空(不校验); 部署到公网时建议在 config_local.py 设置一个随机串
+AI_API_TOKEN = ""
+
 # 板块热力图 - 要显示的行业板块列表
 # 东方财富行业板块代码，想加板块就在这加
 SECTORS = [

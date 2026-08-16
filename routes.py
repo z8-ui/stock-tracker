@@ -4,6 +4,8 @@
 
 from flask import Blueprint, render_template, jsonify, request
 from datetime import datetime, timedelta
+from collections import defaultdict
+from time import time
 from data_service import (
     get_market_flow, get_sector_flow,
     get_stock_money_flow, get_stock_valuation, search_stock,
@@ -18,6 +20,33 @@ from chart_builder import (
 from config import APP_NAME, STOCK_WATCHLIST, VALUATION_WATCHLIST
 
 bp = Blueprint("main", __name__)
+
+
+# ========== AI 接口防护(限流 + 可选 token) ==========
+# 目的: 防止 AI 分析接口被脚本循环调用刷爆 DeepSeek API 额度
+# 限流: 每 IP 每分钟最多 AI_RATE_LIMIT 次(内存计数, 进程内有效)
+# token: config 里 AI_API_TOKEN 非空时, 调用 /api/ai-analysis 必须带 ?token=xxx
+_ai_call_log = defaultdict(list)
+AI_RATE_LIMIT = 10  # 次/分钟/IP
+
+
+def _ai_token_ok():
+    """可选 token 校验: AI_API_TOKEN 为空则不校验(默认)"""
+    from config import AI_API_TOKEN
+    if not AI_API_TOKEN:
+        return True
+    return request.args.get("token") == AI_API_TOKEN
+
+
+def _ai_rate_limited():
+    """内存限流, 返回 True 表示超限"""
+    ip = request.remote_addr or "unknown"
+    now = time()
+    _ai_call_log[ip] = [t for t in _ai_call_log[ip] if now - t < 60]
+    if len(_ai_call_log[ip]) >= AI_RATE_LIMIT:
+        return True
+    _ai_call_log[ip].append(now)
+    return False
 
 
 # ========== 页面路由 ==========
@@ -131,6 +160,10 @@ def ai_page():
 @bp.route("/api/ai-analysis")
 def api_ai_analysis():
     """AI 技术分析: 拉K线 -> 算指标 -> DeepSeek 生成分析"""
+    if not _ai_token_ok():
+        return jsonify({"code": 403, "msg": "token 错误"})
+    if _ai_rate_limited():
+        return jsonify({"code": 429, "msg": f"调用过于频繁, 限流 {AI_RATE_LIMIT} 次/分钟, 请稍后再试"})
     code = request.args.get("code", "600519")
     name = request.args.get("name", "贵州茅台")
     from ai_analysis import analyze
