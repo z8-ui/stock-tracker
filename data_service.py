@@ -6,12 +6,95 @@
 import requests
 import json
 import random
+import os
+import time
+import threading
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Referer": "https://data.eastmoney.com/"
 }
+
+# ==============================================================
+#  文件持久化缓存（重启不丢数据，休盘时段显示定格快照）
+# ==============================================================
+
+_CACHE_FILE = os.path.join(os.path.dirname(__file__), "_data_cache.json")
+
+def _load_cache():
+    """从文件加载缓存"""
+    if not os.path.exists(_CACHE_FILE):
+        return {}
+    try:
+        with open(_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except:
+        return {}
+
+_CACHE_LOCK = threading.Lock()  # 文件缓存写锁（原子替换，防多线程并发写坏）
+
+def _save_cache(cache_dict):
+    """保存缓存到文件（临时文件 + 原子替换，后台 SWR 线程并发安全）"""
+    try:
+        with _CACHE_LOCK:
+            tmp = _CACHE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(cache_dict, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, _CACHE_FILE)
+    except:
+        pass
+
+
+# ==============================================================
+#  Short-lived in-memory cache（交易时段 8 秒 TTL，减少重复外部调用）
+#  2026-08 升级：SWR(过期先返回旧数据后台重建) + single-flight(并发只建一次)
+# ==============================================================
+
+_IN_MEMORY_CACHE = {}   # key -> {"data": ..., "time": fetched_at}
+_IN_MEMORY_TTL = 8      # seconds
+_IN_FLIGHT = {}         # key -> threading.Event，正在构建中的请求（single-flight）
+_LAST_SUCCESS = {}      # key -> float，最后成功构建时间（/api/ready 硬过期判断用）
+
+
+def _get_from_cache(key):
+    """交易时段内存缓存：TTL 内返回已有结果，不调外部 API"""
+    cached = _IN_MEMORY_CACHE.get(key)
+    if cached and (time.time() - cached['time']) < _IN_MEMORY_TTL:
+        return cached['data']
+    return None
+
+
+def _set_in_cache(key, data):
+    _IN_MEMORY_CACHE[key] = {'data': data, 'time': time.time()}
+
+
+def _spawn_refresh(cache_key, fetcher, validate_fn):
+    """SWR 后台刷新：不阻塞当前请求，重建成功后更新内存+文件缓存
+    single-flight：同 key 已在刷新则直接跳过
+    """
+    def _refresh():
+        if cache_key in _IN_FLIGHT:
+            return
+        evt = threading.Event()
+        _IN_FLIGHT[cache_key] = evt
+        try:
+            fresh = fetcher()
+            if validate_fn is None or validate_fn(fresh):
+                ts = time.time()
+                _IN_MEMORY_CACHE[cache_key] = {"data": fresh, "time": ts}
+                _LAST_SUCCESS[cache_key] = ts
+                cache = _load_cache()
+                cache[cache_key] = fresh
+                _save_cache(cache)
+        except Exception:
+            pass
+        finally:
+            _IN_FLIGHT.pop(cache_key, None)
+            evt.set()
+
+    threading.Thread(target=_refresh, daemon=True).start()
 
 
 def _get(url, params=None, timeout=8):
@@ -21,6 +104,139 @@ def _get(url, params=None, timeout=8):
         return resp.text
     except:
         return None
+
+
+# ==============================================================
+#  市场交易时段检测 + 文件持久化缓存
+# ==============================================================
+
+def _market_status():
+    """判断当前 A 股交易状态
+    返回: ('交易中'|'午间休盘'|'已收盘'|'周末休市', is_trading)
+    """
+    now = datetime.now()
+    if now.weekday() >= 5:
+        return ("周末休市", False)
+    h, m = now.hour, now.minute
+    minutes = h * 60 + m
+    if 9*60+15 <= minutes < 9*60+30:
+        return ("集合竞价", True)
+    if 9*60+30 <= minutes < 11*60+30:
+        return ("交易中", True)
+    if 11*60+30 <= minutes < 13*60:
+        return ("午间休盘", False)
+    if 13*60 <= minutes < 15*60:
+        return ("交易中", True)
+    return ("已收盘", False)
+
+
+def _has_valid_data(data):
+    """检查 dict 数据是否有真实值（非全零/全空）"""
+    if not data:
+        return False
+    # 对于市场资金流：必须有真实的 fund flow 数据（主力资金非零或拆分项非零）
+    if "main_force" in data:
+        # 检查任意一项 fund flow 是否为真实值
+        flow_fields = ["main_force", "super_large", "large_order", "middle_order", "small_order"]
+        has_flow = any(abs(data.get(f, 0)) > 0.01 for f in flow_fields)
+        has_index = abs(data.get("index_price", 0)) > 0.01
+        # 必须有 index 数据（腾讯稳定返回）且最好有 flow 数据
+        # 若完全没有 flow 但 index 正常 → 缓存不可用（非交易时段抓到的空数据）
+        return has_index and has_flow
+    return True
+
+
+def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None):
+    """统一的缓存读写（SWR + single-flight + 数据标注注入）
+
+    cache_key:    字符串标识
+    fetcher:      无参函数，返回可 JSON 序列化的数据
+    validate_fn:  可选，接收数据返回 bool，判断数据是否有效
+    source:       数据源名称（如 "tencent"/"eastmoney"），注入返回数据
+    ttl:          内存缓存秒数（默认 _IN_MEMORY_TTL）
+
+    行为：
+    - 交易时段：TTL 内命中内存直接返回；过期先返回旧数据并后台重建（SWR）；
+      并发同 key 只允许一次真实构建（single-flight）；构建失败降级文件缓存
+    - 非交易时段：优先文件缓存（定格快照），无缓存才抓一次
+    - 返回的 dict 自动注入 _asof(数据获取时间)/_market_status/_source
+    """
+    status, is_trading = _market_status()
+    ttl = ttl or _IN_MEMORY_TTL
+    now = time.time()
+    cache = _load_cache()
+
+    def _inject(value, asof):
+        if isinstance(value, dict):
+            value["_asof"] = asof
+            value["_market_status"] = status
+            if source:
+                value["_source"] = source
+        return value
+
+    def _store(value):
+        _IN_MEMORY_CACHE[cache_key] = {"data": value, "time": now}
+        _LAST_SUCCESS[cache_key] = now
+        cache[cache_key] = value
+        _save_cache(cache)
+        return value
+
+    def _file_cache():
+        val = cache.get(cache_key)
+        if val is not None:
+            return _inject(val, _LAST_SUCCESS.get(cache_key, now))
+        return None
+
+    if is_trading:
+        mem = _IN_MEMORY_CACHE.get(cache_key)
+        # 1) 新鲜内存 → 直接返回
+        if mem and (now - mem["time"]) < ttl:
+            return _inject(mem["data"], mem["time"])
+        # 2) 过期内存 → SWR：先返回旧数据，后台异步重建
+        if mem:
+            _spawn_refresh(cache_key, fetcher, validate_fn)
+            return _inject(mem["data"], mem["time"])
+        # 3) 无内存 → single-flight 同步构建（并发只建一次，检查+注册原子化）
+        with _CACHE_LOCK:
+            evt = _IN_FLIGHT.get(cache_key)
+            if evt:
+                waiting = True
+            else:
+                evt = threading.Event()
+                _IN_FLIGHT[cache_key] = evt
+                waiting = False
+        if waiting:
+            evt.wait(5)  # 别人正在构建：最多等 5 秒
+            mem = _IN_MEMORY_CACHE.get(cache_key)
+            if mem:
+                return _inject(mem["data"], mem["time"])
+            cached = _file_cache()
+            if cached is not None:
+                return cached
+            return None
+        try:
+            fresh = fetcher()
+            if validate_fn is None or validate_fn(fresh):
+                return _inject(_store(fresh), now)
+            # 构建失败 → 文件缓存兜底
+            cached = _file_cache()
+            if cached is not None:
+                return cached
+            return fresh
+        finally:
+            with _CACHE_LOCK:
+                _IN_FLIGHT.pop(cache_key, None)
+            evt.set()
+
+    # 非交易时段：优先文件缓存（定格快照）
+    cached = _file_cache()
+    if cached is not None:
+        return cached
+    # 无缓存（全新部署/首次启动在休盘）：试着抓一次
+    fresh = fetcher()
+    if validate_fn is None or validate_fn(fresh):
+        return _inject(_store(fresh), now)
+    return fresh
 
 
 # ==============================================================
@@ -45,34 +261,69 @@ def _tencent_quote(code):
 # ==============================================================
 
 def get_market_flow():
-    """全市资金流向"""
-    parts = _tencent_quote("000001")
-    date = datetime.now().strftime("%Y-%m-%d")
-    index_name = "上证指数"
-    index_price = 0
-    index_change = 0
+    """全市资金流向（基于东方财富真实数据 + 文件缓存）"""
+    def _fetch():
+        date = datetime.now().strftime("%Y-%m-%d")
+        index_name = "上证指数"
+        index_price = 0
+        index_change = 0
 
-    if parts:
-        index_name = parts[1] if parts[1] else "上证指数"
-        index_price = float(parts[3]) if parts[3] else 0
-        index_change = float(parts[32]) if len(parts) > 32 and parts[32] else 0
-        date = parts[30][:8] if len(parts) > 30 and parts[30] else date
+        # 并行调用腾讯（大盘行情） + 东方财富（资金流向）
+        parts = None
+        text = None
+        eastmoney_url = "https://push2.eastmoney.com/api/qt/ulist.np/get"
+        eastmoney_params = {
+            "fltt": "2",
+            "fields": "f62,f66,f69,f72,f75,f78,f81,f84,f87",
+            "secids": "1.000001,0.399001"
+        }
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            tencent_fut = pool.submit(_tencent_quote, "000001")
+            em_fut = pool.submit(_get, eastmoney_url, eastmoney_params)
+            parts = tencent_fut.result()
+            text = em_fut.result()
 
-    # 根据大盘涨跌模拟资金流向
-    sign = 1 if index_change > 0 else -1
-    base = abs(index_change) * random.uniform(1.5, 3.0)
-    
-    return {
-        "main_force": round(sign * base, 2),
-        "super_large": round(sign * base * 0.45, 2),
-        "large_order": round(sign * base * 0.25, 2),
-        "middle_order": round(-sign * base * 0.2, 2),
-        "small_order": round(-sign * base * 0.5, 2),
-        "date": date,
-        "index_name": index_name,
-        "index_price": index_price,
-        "index_change": index_change
-    }
+        if parts:
+            index_name = parts[1] if parts[1] else "上证指数"
+            index_price = float(parts[3]) if parts[3] else 0
+            index_change = float(parts[32]) if len(parts) > 32 and parts[32] else 0
+            date = parts[30][:8] if len(parts) > 30 and parts[30] else date
+        main_force = 0
+        super_large = 0
+        large_order = 0
+        middle_order = 0
+        small_order = 0
+
+        if text:
+            try:
+                data = json.loads(text)
+                diff = data.get("data", {}).get("diff", [])
+                for item in diff:
+                    def val2yi(v):
+                        if v is None: return 0
+                        v = float(v)
+                        return round(v / 1e8, 2) if abs(v) > 1e6 else round(v, 2)
+                    main_force += val2yi(item.get("f62", 0))
+                    super_large += val2yi(item.get("f66", 0))
+                    large_order += val2yi(item.get("f72", 0))
+                    middle_order += val2yi(item.get("f69", 0))
+                    small_order += val2yi(item.get("f75", 0))
+            except:
+                pass
+
+        return {
+            "main_force": main_force,
+            "super_large": super_large,
+            "large_order": large_order,
+            "middle_order": middle_order,
+            "small_order": small_order,
+            "date": date,
+            "index_name": index_name,
+            "index_price": index_price,
+            "index_change": index_change
+        }
+
+    return _cached_get("market_flow", _fetch, validate_fn=_has_valid_data)
 
 
 # ==============================================================
@@ -90,58 +341,70 @@ SECTOR_LIST = [
 ]
 
 def get_sector_flow():
-    """行业板块数据"""
-    result = []
-    
-    # 优先用东方财富真实数据
-    url = "https://push2.eastmoney.com/api/qt/clist/get"
-    params = {
-        "pn": "1", "pz": "60", "po": "1", "np": "1",
-        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-        "fltt": "2", "invt": "2", "fid": "f3",
-        "fs": "m:90+t:2",
-        "fields": "f14,f2,f3,f62"
-    }
-    text = _get(url, params)
-    
-    if text:
-        try:
-            data = json.loads(text)
-            if data.get("data") and data["data"].get("diff"):
-                for row in data["data"]["diff"]:
-                    name = row.get("f14", "")
-                    change = row.get("f3", 0)
-                    flow = row.get("f62", 0)
-                    if name and change is not None:
-                        result.append({
-                            "name": name,
-                            "change": round(float(change), 2),
-                            "flow": round(float(flow) / 1e8, 2)
-                        })
-        except:
-            pass
-    
-    # 兜底：基于真实大盘涨跌幅的模拟（不是完全随机）
-    if not result:
-        # 先拿真实大盘指数
-        market_change = _get_market_change()
-        random.seed(datetime.now().strftime("%Y%m%d"))
-        for name in SECTOR_LIST:
-            # 板块涨跌幅围绕大盘涨跌幅波动，幅度±2%
-            # 如大盘跌-3%，板块在 -5% ~ -1% 之间，少数防守板块可能微涨
-            offset = random.uniform(-2.0, 2.0)
-            change = round(market_change + offset, 2)
-            # 防守板块（银行、电力、食品饮料等）相对抗跌
-            defensive = ["银行", "电力", "食品饮料", "煤炭开采", "有色金属", "医药商业", "化学制药"]
-            if name in defensive and market_change < 0:
-                change = round(change + random.uniform(1.0, 3.0), 2)  # 抗跌溢价
-                change = min(change, 1.5)  # 最多微涨，不会大涨
-            # 资金流与涨跌幅正相关
-            flow = round(change * random.uniform(2, 6), 2)
-            result.append({"name": name, "change": change, "flow": flow})
-        result.sort(key=lambda x: x["change"], reverse=True)
-    
-    return result if result else None
+    """行业板块数据（带文件缓存，休盘时段返回定格数据）"""
+    def _fetch():
+        result = []
+        url = "https://push2.eastmoney.com/api/qt/clist/get"
+        params = {
+            "pn": "1", "pz": "60", "po": "1", "np": "1",
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            "fltt": "2", "invt": "2", "fid": "f3",
+            "fs": "m:90+t:2",
+            "fields": "f14,f2,f3,f62"
+        }
+        text = _get(url, params)
+        if text:
+            try:
+                data = json.loads(text)
+                if data.get("data") and data["data"].get("diff"):
+                    for row in data["data"]["diff"]:
+                        name = row.get("f14", "")
+                        change = row.get("f3", 0)
+                        flow = row.get("f62", 0)
+                        if name and change is not None:
+                            result.append({
+                                "name": name,
+                                "change": round(float(change), 2),
+                                "flow": round(float(flow) / 1e8, 2)
+                            })
+            except:
+                pass
+        # 兜底模拟：使用真实大盘涨跌幅 + 板块特性分布
+        if not result:
+            market_change = _get_market_change()
+            random.seed(datetime.now().strftime("%Y%m%d"))
+            # 板块分类：成长/周期/防御 各有不同弹性
+            growth = ["半导体", "软件开发", "通信设备", "光伏设备", "锂电池", "军工装备", "游戏"]
+            cyclical = ["证券", "有色金属", "煤炭开采", "钢铁", "水泥建材", "房地产开发", "汽车整车"]
+            defensive = ["银行", "电力", "食品饮料", "煤炭开采", "医药商业", "白酒", "保险"]
+            for name in SECTOR_LIST:
+                if name in growth:
+                    # 成长板块弹性更大：大盘涨+2%~4%，大盘跌-2%~0%
+                    offset = random.uniform(-2.0, 4.0)
+                elif name in cyclical:
+                    offset = random.uniform(-3.0, 3.0)
+                else:
+                    offset = random.uniform(-1.5, 2.0)
+                change = round(market_change + offset, 2)
+                # 防守板块在大盘跌时抗跌
+                if name in defensive and market_change < -1:
+                    change = round(change + random.uniform(1.0, 3.0), 2)
+                    change = min(change, 2.0)
+                flow = round(change * random.uniform(2, 6), 2)
+                result.append({"name": name, "change": change, "flow": flow})
+            result.sort(key=lambda x: x["change"], reverse=True)
+        return result if result else None
+
+    def _validate_sectors(data):
+        if not data or not isinstance(data, list):
+            return False
+        # 至少有一条数据有非零的 change 或 flow
+        for s in data:
+            if abs(s.get("change", 0)) > 0.01 or abs(s.get("flow", 0)) > 0.01:
+                return True
+        return False
+
+    return _cached_get("sector_flow", _fetch, validate_fn=_validate_sectors)
 
 
 def _get_market_change():
@@ -255,10 +518,79 @@ def get_stock_money_flow(stock_code):
 
 
 # ==============================================================
+#  4b. 个股当日资金净流向 + 占比（东方财富真实数据）
+# ==============================================================
+
+def get_stock_real_money_flow(stock_code):
+    """个股当日资金净流向及占比（东方财富真实数据）
+    返回：{main_force, super_large, large, middle, small} 均为亿元
+          {main_force_pct, super_large_pct, large_pct, middle_pct, small_pct} 均为 %
+    其中 large_pct 即 大单净量（大单净流入占成交额比例）
+    """
+    market = "1" if stock_code.startswith("6") else "0"
+    secid = f"{market}.{stock_code}"
+
+    # 1) 拿个股成交额（腾讯）
+    quote = get_stock_quote(stock_code)
+    if not quote:
+        return None
+    turnover_yi = max(quote.get("turnover", 0.1), 0.01)  # 亿元
+
+    # 2) 拿资金流向明细（东方财富 fflow API）
+    url = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
+    params = {
+        "secid": secid,
+        "fields1": "f1,f2,f3,f7",
+        "fields2": "f51,f52,f53,f54,f55",
+        "lmt": "1",
+        "klt": "101"
+    }
+    text = _get(url, params)
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+        klines = data.get("data", {}).get("klines", [])
+        if not klines:
+            return None
+        parts = klines[0].split(",")
+        # parts: date, 主力, 小单, 中单, 大单  (单位: 元)
+        main_force = float(parts[1]) if len(parts) > 1 else 0
+        small_order = float(parts[2]) if len(parts) > 2 else 0
+        middle_order = float(parts[3]) if len(parts) > 3 else 0
+        large_order = float(parts[4]) if len(parts) > 4 else 0
+        # 超大单 = 主力 - 大单
+        super_large = main_force - large_order
+
+        # 元 → 亿元
+        def yi(v):
+            return round(v / 1e8, 2)
+
+        # 计算占比% = 净流入额 / 成交额 * 100
+        def pct(v):
+            return round(v / (turnover_yi * 1e8) * 100, 2) if turnover_yi > 0 else 0
+
+        return {
+            "main_force": yi(main_force),
+            "super_large": yi(super_large),
+            "large": yi(large_order),
+            "middle": yi(middle_order),
+            "small": yi(small_order),
+            "main_force_pct": pct(main_force),
+            "super_large_pct": pct(super_large),
+            "large_pct": pct(large_order),       # 大单净量
+            "middle_pct": pct(middle_order),
+            "small_pct": pct(small_order),
+        }
+    except:
+        return None
+
+
+# ==============================================================
 #  5. 估值数据（腾讯真实PE + 行业对比）
 # ==============================================================
 
-# 行业平均PE对照表
+# 行业平均PE对照表（仅作 get_industry_pe 失败时的降级兜底）
 INDUSTRY_PE_MAP = {
     "600519": 35, "000858": 30,  # 白酒
     "300750": 40, "002594": 45,  # 新能源
@@ -272,6 +604,61 @@ INDUSTRY_PE_MAP = {
     "002415": 25, "000063": 30,  # 通信
 }
 
+
+def get_industry_pe(stock_code):
+    """动态获取行业平均 PE（东财三步链：个股→行业名 f127→suggest搜BK→板块PE f9×100）
+
+    失败自动降级：INDUSTRY_PE_MAP 硬编码 → 默认 25（返回 source=static_map 标记）
+    返回 {"pe": float, "industry": 行业名, "source": "eastmoney"|"static_map", ...}
+    """
+    def fetch():
+        market = "1" if stock_code.startswith(("6", "9")) else "0"
+        try:
+            # 1) 个股 → 行业名（f127，如"白酒Ⅱ"）
+            r = requests.get(
+                "https://push2.eastmoney.com/api/qt/stock/get",
+                params={"secid": f"{market}.{stock_code}", "fields": "f57,f127"},
+                headers=HEADERS, timeout=6)
+            d = r.json().get("data") or {}
+            ind_name = d.get("f127")
+            if not ind_name:
+                return None
+            # 2) 行业名 → 板块代码（suggest type=14 板块，取第一个 BK 开头）
+            r2 = requests.get(
+                "https://searchapi.eastmoney.com/api/suggest/get",
+                params={"input": ind_name, "type": "14", "count": "5"},
+                headers=HEADERS, timeout=6)
+            data = (r2.json().get("QuotationCodeTable") or {}).get("Data") or []
+            bk = next((it.get("Code") for it in data if str(it.get("Code") or "").startswith("BK")), None)
+            if not bk:
+                return None
+            # 3) 板块 → 动态 PE（f9，放大100倍）
+            r3 = requests.get(
+                "https://push2.eastmoney.com/api/qt/ulist.np/get",
+                params={"secids": f"90.{bk}", "fields": "f12,f14,f9"},
+                headers=HEADERS, timeout=6)
+            diff = (r3.json().get("data") or {}).get("diff") or []
+            if not diff:
+                return None
+            pe = diff[0].get("f9")
+            if not pe or pe <= 0:
+                return None
+            return {"pe": round(pe / 100, 2),
+                    "industry": ind_name,
+                    "source": "eastmoney"}
+        except Exception:
+            return None
+
+    result = _cached_get(f"industry_pe_{stock_code}", fetch,
+                         validate_fn=lambda x: x is not None and x.get("pe"),
+                         source="eastmoney", ttl=3600)
+    if result and result.get("pe"):
+        return result
+    # 降级：静态映射表（source 标记，前端可提示"估值为静态参考"）
+    return {"pe": INDUSTRY_PE_MAP.get(stock_code, 25),
+            "industry": "未知", "source": "static_map"}
+
+
 def get_stock_valuation(stock_code):
     """个股估值"""
     quote = get_stock_quote(stock_code)
@@ -280,7 +667,7 @@ def get_stock_valuation(stock_code):
 
     pe = quote.get("pe", 0)
     pb = quote.get("pb", 0)
-    industry_pe = INDUSTRY_PE_MAP.get(stock_code, 25)
+    industry_pe = get_industry_pe(stock_code)["pe"]
     
     if pe == 0:
         pe = industry_pe
@@ -303,12 +690,15 @@ def get_stock_valuation(stock_code):
 # ==============================================================
 
 def search_stock(keyword):
-    """搜索股票"""
+    """搜索股票（全市场: A股/港股/美股/指数/基金）
+    返回 [{code, name, market, tag}, ...], A股优先排序
+    market: sh/sz/bj/hk/us/idx/fund, 用于后续 K线/行情接口的前缀
+    """
     url = "https://searchadapter.eastmoney.com/api/suggest/get"
     params = {
         "input": keyword, "type": 14,
-        "token": "D43BF722C8E33BDC906FB84D85E326E8",
-        "count": 10
+        "token": "D43BF7DAA5C9D33F9AB8D13D8F05E26E8",
+        "count": 15
     }
     text = _get(url, params)
     if not text:
@@ -316,15 +706,57 @@ def search_stock(keyword):
     try:
         data = json.loads(text)
         result = []
+        seen = set()
         if data.get("QuotationCodeTable") and data["QuotationCodeTable"].get("Data"):
             for item in data["QuotationCodeTable"]["Data"]:
                 code = item.get("Code", "")
                 name = item.get("Name", "")
-                if code and name:
-                    result.append({"code": code, "name": name})
-        return result if result else None
+                classify = item.get("Classify", "")
+                mkt_num = item.get("MktNum")
+                if not code or not name:
+                    continue
+                market, tag = _classify_market(classify, code, mkt_num)
+                if market is None or code in seen:
+                    continue
+                seen.add(code)
+                result.append({"code": code, "name": name, "market": market, "tag": tag})
+        if not result:
+            return None
+        # A股优先, 其余按 港股 > 指数 > 基金 > 美股 排序
+        order = {"sh": 0, "sz": 0, "bj": 0, "hk": 1, "idx": 2, "fund": 3, "us": 4}
+        result.sort(key=lambda x: order.get(x["market"], 9))
+        return result[:12]
     except:
         return None
+
+
+def _classify_market(classify, code, mkt_num):
+    """根据东方财富 suggest 接口的 Classify/MktNum 判断市场
+    返回 (market前缀, 显示标签); 不支持的品种返回 (None, None)
+    """
+    if classify == "AStock":
+        if code.startswith(("4", "8", "92")):
+            return "bj", "北交所"
+        if code.startswith("6"):
+            return "sh", "A股"
+        return "sz", "A股"
+    if classify == "HK":
+        return "hk", "港股"
+    if classify == "Index":
+        if str(mkt_num) == "0":
+            return "sz", "指数"
+        return "sh", "指数"
+    if classify == "Fund":
+        if code.startswith(("5", "6")):
+            return "sh", "基金"
+        return "sz", "基金"
+    if classify == "UsStock":
+        return "us", "美股"
+    # 北证50等特殊指数
+    if code.startswith("899"):
+        return "bj", "指数"
+    # 其余(BK板块/KRX韩国/OTCFUND场外基金/UniversalIndex全球指数等)不支持
+    return None, None
 
 
 # ==============================================================
@@ -350,7 +782,7 @@ def get_index_history(index_code, days=30):
         
         return [{"date": k[0], "open": round(float(k[1]), 2), "close": round(float(k[2]), 2),
                  "high": round(float(k[3]), 2), "low": round(float(k[4]), 2),
-                 "volume": int(k[5]) if len(k) > 5 else 0} for k in klines]
+                 "volume": int(float(k[5])) if len(k) > 5 else 0} for k in klines]
     except:
         return _mock_index_history(index_code, days)
 
@@ -385,27 +817,6 @@ def _mock_index_history(index_code, days=30):
                       "volume": random.randint(5000000, 30000000)})
     return result
 
-
-# ==============================================================
-#  8. 技术分析
-# ==============================================================
-
-def calc_ema(prices, period=20):
-    """EMA指数移动平均线"""
-    if not prices or len(prices) < period: return [None] * len(prices) if prices else []
-    multiplier = 2 / (period + 1)
-    ema = [None] * (period - 1)
-    ema.append(sum(prices[:period]) / period)
-    for i in range(period, len(prices)):
-        ema.append(round(prices[i] * multiplier + ema[-1] * (1 - multiplier), 2))
-    return ema
-
-
-def calc_fibonacci_levels(high, low):
-    """斐波那契回调线"""
-    diff = high - low
-    return {"high": round(high, 2), "low": round(low, 2),
-            "levels": {str(k): round(high - diff * k, 2) for k in [0.236, 0.382, 0.5, 0.618, 0.786]}}
 
 
 def estimate_intrinsic_value(stock_quote):

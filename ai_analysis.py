@@ -10,27 +10,79 @@ AI 分析模块 - K线数据 + 技术指标 + DeepSeek 大模型分析
 API key 从 config_local.py 读取(DEEPSEEK_API_KEY), 不提交 GitHub
 """
 
+import os
+import json
 import requests
 from datetime import datetime, timedelta
 
 from config import DEEPSEEK_API_KEY
 from data_service import calc_fibonacci_levels
 
-# 腾讯 K线接口(与 routes.py 斐波那契接口同源)
+# 腾讯 K线接口(兜底)
 KLINE_URL = "http://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+# 东方财富 K线接口(主源, 数据最新; 腾讯 A股 qfq 经常滞后一天)
+EM_KLINE_URL = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
 
 # DeepSeek 官方接口
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_MODEL = "deepseek-chat"
 
 
-# ========== 1. 数据 ==========
+def _market_secid(code, market):
+    """market 前缀 -> 东方财富 secid
+    sh: 沪(股票/指数/基金)=1.x   sz/bj: 深/北=0.x   hk: 港股=116.x   us: 美股=105.x
+    """
+    if market == "hk":
+        return f"116.{code}"
+    if market == "sh":
+        return f"1.{code}"
+    if market == "us":
+        return f"105.{code}"
+    return f"0.{code}"
 
-def get_klines(code, days=150):
-    """拉取日K线, 返回 [{date, open, close, high, low, volume}, ...] 升序"""
-    market = "sh" if code.startswith("6") else "sz"
+
+def _get_klines_em(code, market, days):
+    """东方财富日K(前复权), 数据最新; 失败返回 []
+    注意: 该接口用 beg/end 指定区间, 用 lmt 会返回空
+    """
+    secid = _market_secid(code, market)
     end = datetime.now().strftime("%Y-%m-%d")
-    # 一次多拉一些, 保证 MA60/MACD 有足够预热数据
+    start = (datetime.now() - timedelta(days=days * 2)).strftime("%Y-%m-%d")
+    try:
+        resp = requests.get(
+            EM_KLINE_URL,
+            params={
+                "secid": secid,
+                "fields1": "f1,f2,f3",
+                "fields2": "f51,f52,f53,f54,f55,f56",
+                "klt": 101, "fqt": 1,
+                "beg": start, "end": end
+            },
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"}, timeout=10
+        )
+        data = resp.json()
+        klines = (data.get("data") or {}).get("klines") or []
+        if not klines:
+            return []
+        result = []
+        for line in klines:
+            p = line.split(",")
+            result.append({
+                "date": p[0],
+                "open": float(p[1]),
+                "close": float(p[2]),
+                "high": float(p[3]),
+                "low": float(p[4]),
+                "volume": float(p[5]) if len(p) > 5 else 0
+            })
+        return result
+    except Exception:
+        return []
+
+
+def _get_klines_tencent(code, market, days):
+    """腾讯日K(前复权), 作为兜底数据源"""
+    end = datetime.now().strftime("%Y-%m-%d")
     start = (datetime.now() - timedelta(days=days * 2)).strftime("%Y-%m-%d")
     try:
         resp = requests.get(
@@ -56,6 +108,77 @@ def get_klines(code, days=150):
         return result
     except Exception:
         return []
+
+
+def _get_realtime_quote(code, market):
+    """腾讯实时行情(qt.gtimg.cn), 返回 {date, open, close, high, low, volume} 或 None
+    盘中即有当日数据, 用于校准滞后一天的K线源
+    """
+    try:
+        resp = requests.get(
+            f"http://qt.gtimg.cn/q={market}{code}",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=8
+        )
+        resp.encoding = "gbk"
+        text = resp.text
+        start = text.find('="')
+        end = text.rfind('"')
+        if start < 0 or end <= start:
+            return None
+        fields = text[start + 2:end].split("~")
+        if len(fields) < 35:
+            return None
+        close = float(fields[3])
+        if close <= 0:
+            return None
+        date_str = fields[30].strip()
+        # A股: 20260817141542 ; 港股: 2026/08/17 14:00:33
+        if "/" in date_str:
+            date = date_str.split(" ")[0].replace("/", "-")
+        else:
+            date = f"{date_str[0:4]}-{date_str[4:6]}-{date_str[6:8]}"
+        return {
+            "date": date,
+            "open": float(fields[5]),
+            "close": close,
+            "high": float(fields[33]),
+            "low": float(fields[34]),
+            "volume": float(fields[6]),
+        }
+    except Exception:
+        return None
+
+
+def _append_realtime_kline(klines, code, market):
+    """若K线最后一根日期早于实时行情日期, 用实时行情补一根当日K线
+    解决盘中K线源(腾讯/新浪)滞后一天的问题, 保证日期/价格为最新
+    """
+    if not klines:
+        return klines
+    quote = _get_realtime_quote(code, market)
+    if not quote:
+        return klines
+    if quote["date"] > klines[-1]["date"]:
+        return klines + [quote]
+    return klines
+
+
+def get_klines(code, market=None, days=150):
+    """拉取日K线, 返回 [{date, open, close, high, low, volume}, ...] 升序
+    market: sh/sz/bj/hk 等前缀, 不传则按 A股代码规则推断
+    数据源: 东方财富(实时) -> 腾讯兜底, 最后用实时行情校准当日K线
+    """
+    if not market:
+        if code.startswith(("4", "8", "92")):
+            market = "bj"
+        elif code.startswith("6"):
+            market = "sh"
+        else:
+            market = "sz"
+    klines = _get_klines_em(code, market, days)
+    if not klines:
+        klines = _get_klines_tencent(code, market, days)
+    return _append_realtime_kline(klines, code, market)
 
 
 # ========== 2. 技术指标 ==========
@@ -261,12 +384,68 @@ def call_deepseek(prompt):
 
 # ========== 5. 对外主函数 ==========
 
-def analyze(code, name):
-    """输入代码+名称, 返回 {analysis, indicators}"""
-    klines = get_klines(code)
+# 分析结果缓存(本地JSON文件): 相同股票再次分析直接返回缓存, 避免重复调 DeepSeek
+CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ai_cache.json")
+CACHE_MAX = 20  # 最多保留条数
+
+
+def _load_cache():
+    try:
+        with open(CACHE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_cache(cache):
+    try:
+        # 只保留最近 CACHE_MAX 条
+        items = sorted(cache.items(), key=lambda kv: kv[1].get("created_at", ""), reverse=True)[:CACHE_MAX]
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(dict(items), f, ensure_ascii=False, indent=1)
+    except Exception:
+        pass
+
+
+def analyze(code, name, market=None, refresh=False):
+    """输入代码+名称(+市场前缀), 返回 {analysis, indicators, cached, cached_at, kline_date}
+    refresh=True 时强制重新分析并覆盖缓存
+    """
+    cache_key = f"{market or 'sz'}{code}"
+
+    # 命中缓存直接返回(秒开, 不调K线/DeepSeek)
+    if not refresh:
+        cache = _load_cache()
+        hit = cache.get(cache_key)
+        if hit and hit.get("analysis") and hit.get("indicators"):
+            return {
+                "analysis": hit["analysis"],
+                "indicators": hit["indicators"],
+                "cached": True,
+                "cached_at": hit.get("created_at", ""),
+                "kline_date": hit.get("kline_date", ""),
+            }
+
+    klines = get_klines(code, market)
     if len(klines) < 30:
         return None
     ind = compute_indicators(klines)
     prompt = build_prompt(name, code, ind)
     analysis = call_deepseek(prompt)
-    return {"analysis": analysis, "indicators": ind}
+
+    # 写缓存
+    cache = _load_cache()
+    cache[cache_key] = {
+        "code": code, "name": name, "market": market or "",
+        "analysis": analysis, "indicators": ind,
+        "kline_date": ind["date"],
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    _save_cache(cache)
+
+    return {
+        "analysis": analysis, "indicators": ind,
+        "cached": False, "cached_at": "",
+        "kline_date": ind["date"],
+    }

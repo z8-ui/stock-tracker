@@ -46,6 +46,7 @@ pip install flask requests
 
 # 3. 启动
 python app.py
+#    (本机快捷方式: start-stock, 等价于 cd /mnt/d/stock-tracker && python3 app.py)
 
 # 4. 浏览器打开
 # http://localhost:5000

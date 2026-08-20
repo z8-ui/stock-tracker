@@ -5,7 +5,7 @@
 <div class="row">
     <div class="col">
         <div class="card">
-            <div class="card-header">大盘指数</div>
+            <div class="card-header">大盘指数 <span id="status-market-flow-page" class="hint" style="color:#ffb74d;font-size:11px;"></span></div>
             <div id="index-summary" class="summary-box">
                 <p class="loading-hint">加载中...</p>
             </div>
@@ -85,6 +85,11 @@ function loadMarketFlowData() {
 
             // 4. 饼图
             renderPieChart('chart-flow-pie', '资金分布', d.items, d.colors);
+
+            // 5. 市场状态
+            if (res._market_status) {
+                document.getElementById('status-market-flow-page').textContent = res._market_status;
+            }
         });
 }
 

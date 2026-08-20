@@ -4,7 +4,8 @@
  */
 
 // ========== 全局配置 ==========
-var AUTO_REFRESH_INTERVAL = 30000;  // 30秒自动刷新一次
+var AUTO_REFRESH_INTERVAL = 15000;  // 15秒自动刷新一次（交易时段）
+var IDLE_REFRESH_INTERVAL = 60000; // 1分钟刷新一次（休盘时段）
 var refreshTimers = {};
 
 // ========== 自动刷新工具 ==========
@@ -13,6 +14,9 @@ function startAutoRefresh(name, fn, interval) {
     interval = interval || AUTO_REFRESH_INTERVAL;
     stopAutoRefresh(name);
     refreshTimers[name] = setInterval(fn, interval);
+    // 更新右上角刷新指示器
+    var secEl = document.getElementById('refresh-secs');
+    if (secEl) secEl.textContent = interval / 1000;
     console.log('[自动刷新] ' + name + ' 已启动，间隔 ' + (interval/1000) + '秒');
 }
 
@@ -51,10 +55,17 @@ function renderPieChart(domId, title, items, colors) {
     chart.setOption({
         tooltip: { trigger: 'item', formatter: '{b}: {c}亿 ({d}%)' },
         color: colors,
+        legend: {
+            data: items.map(i => i.name),
+            textStyle: { color: '#8892b0', fontSize: 12 },
+            bottom: 0,
+            itemWidth: 14,
+            itemHeight: 14
+        },
         series: [{
             type: 'pie',
-            radius: ['40%', '70%'],
-            center: ['50%', '50%'],
+            radius: ['35%', '55%'],
+            center: ['50%', '42%'],
             label: { color: '#e0e0e0', fontSize: 12 },
             data: items.map(i => ({ name: i.name, value: Math.abs(i.value) })),
             emphasis: { itemStyle: { shadowBlur: 10, shadowColor: 'rgba(0,0,0,0.3)' } }
@@ -68,10 +79,19 @@ function renderBarChart(domId, xLabel, data) {
     const chart = getChart(domId);
     if (!chart) return;
 
+    var suffix = '%';
+    if (xLabel.indexOf('亿') !== -1) suffix = '亿';
+
     chart.setOption({
         tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
-        grid: { left: '3%', right: '4%', bottom: '3%', containLabel: true },
-        xAxis: { type: 'value', axisLabel: { color: '#8892b0' }, splitLine: { lineStyle: { color: '#233054' } } },
+        grid: { left: '16%', right: '14%', bottom: '3%', containLabel: true },
+        xAxis: {
+            type: 'value',
+            name: xLabel,
+            nameTextStyle: { color: '#8892b0', fontSize: 11 },
+            axisLabel: { color: '#8892b0' },
+            splitLine: { lineStyle: { color: '#233054' } }
+        },
         yAxis: {
             type: 'category',
             data: data.map(d => d.name).reverse(),
@@ -87,7 +107,7 @@ function renderBarChart(domId, xLabel, data) {
             label: {
                 show: true,
                 position: 'right',
-                formatter: (p) => p.value + '%',
+                formatter: function(p) { return p.value + suffix; },
                 color: '#8892b0',
                 fontSize: 11
             }
@@ -138,11 +158,44 @@ function renderTreemap(domId, title, data) {
     const chart = getChart(domId);
     if (!chart) return;
 
+    // 转换数据：资金流向红绿着色，资金规模决定方块大小
+    var maxFlow = 1;
+    data.forEach(function(d) { var f = Math.abs(d.flow || 1); if (f > maxFlow) maxFlow = f; });
+
+    var treeData = data.map(function(d) {
+        var flow = d.flow || 0;
+        // 颜色按资金流向方向：红流入、绿流出，深浅随规模变化
+        var absFlow = Math.abs(flow);
+        var intensity = Math.min(absFlow / 10, 1);  // 10亿以上饱和度封顶
+        var r, g, b;
+        if (flow >= 0) {
+            // 流入：红~橙
+            r = Math.round(239 - (1 - intensity) * 60);
+            g = Math.round(83 - intensity * 70);
+            b = Math.round(80 - intensity * 70);
+        } else {
+            // 流出：浅绿~深绿
+            r = Math.round(102 - intensity * 90);
+            g = Math.round(187 - intensity * 140);
+            b = Math.round(106 - intensity * 90);
+        }
+        return {
+            name: d.name,
+            value: Math.max(absFlow, 0.5),
+            change: d.change,
+            flow: d.flow,
+            itemStyle: {
+                color: 'rgb(' + r + ',' + g + ',' + b + ')'
+            }
+        };
+    });
+
     chart.setOption({
         tooltip: {
             formatter: function(p) {
                 const d = p.data;
-                return `${d.name}<br/>涨跌幅: ${d.change}%<br/>资金流入: ${d.flow}亿`;
+                const direction = d.flow >= 0 ? '流入' : '流出';
+                return d.name + '<br/>涨跌幅: ' + d.change + '%<br/>资金' + direction + ': ' + Math.abs(d.flow).toFixed(2) + '亿';
             }
         },
         series: [{
@@ -155,7 +208,8 @@ function renderTreemap(domId, title, data) {
             label: {
                 show: true,
                 formatter: function(p) {
-                    return `${p.name}\n${p.data.change}%\n${p.data.flow}亿`;
+                    const direction = p.data.flow >= 0 ? '+' : '';
+                    return p.name + '\n' + p.data.change + '%\n' + direction + p.data.flow + '亿';
                 },
                 color: '#fff',
                 fontSize: 13,
@@ -165,10 +219,7 @@ function renderTreemap(domId, title, data) {
                 borderWidth: 2,
                 borderColor: '#1a1a2e'
             },
-            levels: [
-                { colorSaturation: [0.3, 0.7], colorMappingBy: 'value' }
-            ],
-            data: data
+            data: treeData
         }]
     });
 }
@@ -299,9 +350,13 @@ function renderFibonacci(domId, fib, klines) {
         title: { text: '斐波那契回调线', textStyle: { color: '#e0e0e0', fontSize: 14 } },
         tooltip: { trigger: 'axis' },
         legend: { data: ['收盘价'].concat(levelKeys.map(function(k) { return 'Fib ' + k; })), textStyle: { color: '#8892b0' }, top: 30 },
-        grid: { left: '3%', right: '4%', bottom: '3%', top: '20%', containLabel: true },
+        grid: { left: '3%', right: '4%', bottom: '12%', top: '20%', containLabel: true },
         xAxis: { type: 'category', data: dates, axisLabel: { color: '#8892b0', rotate: 45, fontSize: 10 } },
         yAxis: { type: 'value', axisLabel: { color: '#8892b0' }, splitLine: { lineStyle: { color: '#233054' } } },
+        dataZoom: [
+            { type: 'inside', start: 0, end: 100 },
+            { type: 'slider', start: 0, end: 100, height: 18, bottom: 2, textStyle: { color: '#8892b0' } }
+        ],
         series: series
     });
 }

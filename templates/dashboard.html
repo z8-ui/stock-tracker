@@ -3,16 +3,16 @@
 
 {% block content %}
 <div class="row">
-    <div class="col">
+    <div class="col" style="flex:0.45;min-width:0;">
         <div class="card">
-            <div class="card-header">全市资金流向 <span class="hint" id="ts-market-flow">--</span></div>
-            <div id="chart-market-flow" class="chart-box"></div>
+            <div class="card-header">全市资金流向 <span class="hint" id="ts-market-flow">--</span> <span id="status-market-flow" class="hint" style="color:#ffb74d;font-size:11px;"></span></div>
+            <div id="chart-market-flow" class="chart-box chart-large"></div>
         </div>
     </div>
-    <div class="col">
+    <div class="col" style="flex:1;min-width:0;">
         <div class="card">
-            <div class="card-header">板块热度 TOP10 <span class="hint" id="ts-heatmap">--</span></div>
-            <div id="chart-heatmap-preview" class="chart-box"></div>
+            <div class="card-header">板块热度 TOP10 <span class="hint" id="ts-heatmap">--</span> <span id="status-heatmap" class="hint" style="color:#ffb74d;font-size:11px;"></span></div>
+            <div id="chart-heatmap-preview" class="chart-box chart-large"></div>
         </div>
     </div>
 </div>
@@ -42,6 +42,9 @@ function loadDashboardData() {
             const d = res.data;
             renderPieChart('chart-market-flow', d.title, d.items, d.colors);
             updateTimestamp('ts-market-flow');
+            if (res._market_status) {
+                document.getElementById('status-market-flow').textContent = res._market_status;
+            }
         });
 
     fetch('/api/heatmap')
@@ -51,6 +54,9 @@ function loadDashboardData() {
             const top10 = res.data.slice(0, 10);
             renderBarChart('chart-heatmap-preview', '板块涨跌幅 %', top10);
             updateTimestamp('ts-heatmap');
+            if (res._market_status) {
+                document.getElementById('status-heatmap').textContent = res._market_status;
+            }
         });
 }
 

@@ -70,6 +70,41 @@
     </div>
     <div id="chart-stock-flow" class="chart-box chart-large"></div>
 </div>
+
+<!-- 当日真实资金流向一览 -->
+<div class="card" id="real-flow-card">
+    <div class="card-header">
+        当日资金流向（东方财富实时）
+        <span id="real-flow-status" class="hint" style="color:#8892b0;font-size:11px;"></span>
+    </div>
+    <div id="real-flow-grid" class="flow-grid">
+        <div class="flow-item">
+            <div class="flow-label">主力净流入</div>
+            <div class="flow-value" id="rf-main-val">--</div>
+            <div class="flow-pct" id="rf-main-pct">--</div>
+        </div>
+        <div class="flow-item">
+            <div class="flow-label">超大单</div>
+            <div class="flow-value" id="rf-super-val">--</div>
+            <div class="flow-pct" id="rf-super-pct">--</div>
+        </div>
+        <div class="flow-item highlight">
+            <div class="flow-label">大单净量</div>
+            <div class="flow-value" id="rf-large-val">--</div>
+            <div class="flow-pct" id="rf-large-pct">--</div>
+        </div>
+        <div class="flow-item">
+            <div class="flow-label">中单</div>
+            <div class="flow-value" id="rf-middle-val">--</div>
+            <div class="flow-pct" id="rf-middle-pct">--</div>
+        </div>
+        <div class="flow-item">
+            <div class="flow-label">小单</div>
+            <div class="flow-value" id="rf-small-val">--</div>
+            <div class="flow-pct" id="rf-small-pct">--</div>
+        </div>
+    </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -188,6 +223,43 @@ function loadStock(code, name) {
             }
             renderStockFlow('chart-stock-flow', res.data);
         });
+
+    // 加载当日真实资金流向（大单净量等）
+    loadRealMoneyFlow(code);
+}
+
+function loadRealMoneyFlow(code) {
+    fetch('/api/stock-real-flow?code=' + code)
+        .then(function(r) { return r.json(); })
+        .then(function(res) {
+            if (res.code !== 200) {
+                document.getElementById('real-flow-card').style.display = 'none';
+                return;
+            }
+            document.getElementById('real-flow-card').style.display = 'block';
+            var d = res.data;
+            // 红涨绿跌
+            var fields = [
+                {val: 'rf-main-val', pct: 'rf-main-pct', v: d.main_force, p: d.main_force_pct},
+                {val: 'rf-super-val', pct: 'rf-super-pct', v: d.super_large, p: d.super_large_pct},
+                {val: 'rf-large-val', pct: 'rf-large-pct', v: d.large, p: d.large_pct},
+                {val: 'rf-middle-val', pct: 'rf-middle-pct', v: d.middle, p: d.middle_pct},
+                {val: 'rf-small-val', pct: 'rf-small-pct', v: d.small, p: d.small_pct},
+            ];
+            fields.forEach(function(f) {
+                var elVal = document.getElementById(f.val);
+                var elPct = document.getElementById(f.pct);
+                var color = f.v >= 0 ? '#ef5350' : '#26a69a';
+                elVal.textContent = (f.v >= 0 ? '+' : '') + f.v.toFixed(2) + '亿';
+                elVal.style.color = color;
+                elPct.textContent = (f.p >= 0 ? '+' : '') + f.p.toFixed(2) + '%';
+                elPct.style.color = color;
+            });
+            document.getElementById('real-flow-status').textContent = '✓ 实时';
+        })
+        .catch(function() {
+            document.getElementById('real-flow-card').style.display = 'none';
+        });
 }
 
 function searchStock() {
@@ -239,6 +311,7 @@ document.addEventListener('DOMContentLoaded', function() {
                     document.getElementById('q-change').textContent = (q.change >= 0 ? '+' : '') + q.change.toFixed(2);
                     document.getElementById('q-change').style.color = color;
                 });
+            loadRealMoneyFlow(currentCode);
         }
     }, 15000);
 });

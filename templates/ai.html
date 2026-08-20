@@ -8,7 +8,7 @@
         <div class="card">
             <div class="card-header">AI 技术分析（K线 + 指标 + 大模型）</div>
             <div class="search-bar">
-                <input type="text" id="ai-stock-search" placeholder="输入股票名称搜索，如 中钨高新" class="search-input">
+                <input type="text" id="ai-stock-search" placeholder="输入股票名称或代码，如 中钨高新 / 00700 / AAPL（支持A股/港股/美股/指数/基金）" class="search-input" onkeydown="if(event.key==='Enter')searchAiStock()">
                 <button onclick="searchAiStock()" class="btn">搜索</button>
             </div>
             <div id="ai-search-results" class="search-results"></div>
@@ -19,6 +19,15 @@
             <div class="card-header">搜索历史</div>
             <div id="ai-search-history" class="chip-group"><p class="hint">暂无</p></div>
         </div>
+    </div>
+</div>
+
+<!-- ========== 当前分析标的横幅 ========== -->
+<div class="card" id="ai-stock-banner" style="display:none; border-left:4px solid #ffb74d;">
+    <div class="card-header">
+        <span id="ai-stock-name" style="font-size:16px; font-weight:bold;"></span>
+        <span id="ai-stock-code" style="color:#8892b0; margin-left:8px;"></span>
+        <span id="ai-stock-tag" style="margin-left:8px; font-size:12px;"></span>
     </div>
 </div>
 
@@ -37,9 +46,12 @@
 
 <!-- ========== AI 分析文本 ========== -->
 <div class="card">
-    <div class="card-header">AI 分析报告</div>
+    <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;">
+        <span>AI 分析报告</span>
+        <button id="ai-refresh-btn" class="btn" style="display:none;" onclick="refreshAiAnalysis()">🔄 重新分析</button>
+    </div>
     <div id="ai-analysis-box" class="summary-box">
-        <p class="hint">搜索并选择一只股票开始分析。分析基于真实K线数据 + 技术指标，由大模型生成，仅供参考，不构成投资建议。</p>
+        <p class="hint">搜索并选择一只股票开始分析（支持 A股/港股/指数/基金，美股暂不支持）。分析基于真实K线数据 + 技术指标，由大模型生成，仅供参考，不构成投资建议。</p>
     </div>
 </div>
 {% endblock %}
@@ -50,10 +62,10 @@
 function getAiHistory() {
     try { return JSON.parse(localStorage.getItem('aiSearchHistory') || '[]'); } catch(e) { return []; }
 }
-function addAiHistory(code, name) {
+function addAiHistory(code, name, market, tag) {
     var h = getAiHistory();
     h = h.filter(function(i) { return i.code !== code; });
-    h.unshift({code: code, name: name});
+    h.unshift({code: code, name: name, market: market || '', tag: tag || ''});
     if (h.length > 10) h = h.slice(0, 10);
     localStorage.setItem('aiSearchHistory', JSON.stringify(h));
     renderAiHistory();
@@ -63,11 +75,12 @@ function renderAiHistory() {
     var el = document.getElementById('ai-search-history');
     if (!h.length) { el.innerHTML = '<p class="hint">暂无</p>'; return; }
     el.innerHTML = h.map(function(i) {
-        return '<button class="chip" onclick="loadAiAnalysis(\'' + i.code + '\',\'' + i.name + '\')">' + i.name + '</button>';
+        var tag = i.tag ? ' <span style="color:#8892b0;font-size:11px;">[' + i.tag + ']</span>' : '';
+        return '<button class="chip" onclick="loadAiAnalysis(\'' + i.code + '\',\'' + String(i.name).replace(/'/g, "\\'") + '\',\'' + (i.market || '') + '\',\'' + (i.tag || '') + '\')">' + i.name + tag + '</button>';
     }).join('');
 }
 
-// ========== 搜索 ==========
+// ========== 搜索（全市场: A股/港股/美股/指数/基金） ==========
 function searchAiStock() {
     var q = document.getElementById('ai-stock-search').value;
     if (!q) return;
@@ -80,25 +93,48 @@ function searchAiStock() {
                 return;
             }
             el.innerHTML = res.data.map(function(s) {
-                return '<button class="chip" onclick="loadAiBySearch(\'' + s.code + '\',\'' + s.name + '\')">' + s.name + ' (' + s.code + ')</button>';
+                return '<button class="chip" onclick="loadAiBySearch(\'' + s.code + '\',\'' + String(s.name).replace(/'/g, "\\'") + '\',\'' + (s.market || '') + '\',\'' + (s.tag || '') + '\')">' + s.name + ' (' + s.code + ') <span style="color:#8892b0;font-size:11px;">[' + s.tag + ']</span></button>';
             }).join('');
         });
 }
-function loadAiBySearch(code, name) {
-    loadAiAnalysis(code, name);
+function loadAiBySearch(code, name, market, tag) {
+    loadAiAnalysis(code, name, market, tag);
     document.getElementById('ai-search-results').innerHTML = '';
-    document.getElementById('ai-stock-search').value = name;
+    document.getElementById('ai-stock-search').value = name + ' (' + code + ')';
 }
 
 // ========== 分析 ==========
-function loadAiAnalysis(code, name) {
-    addAiHistory(code, name);
+var currentStock = null;  // {code, name, market, tag} 当前分析的股票
+
+function loadAiAnalysis(code, name, market, tag, refresh) {
+    currentStock = {code: code, name: name, market: market || '', tag: tag || ''};
+    addAiHistory(code, name, market, tag);
+    // 顶部横幅: 显示当前分析的股票名称
+    var banner = document.getElementById('ai-stock-banner');
+    banner.style.display = 'block';
+    document.getElementById('ai-stock-name').textContent = name;
+    document.getElementById('ai-stock-code').textContent = code;
+    document.getElementById('ai-stock-tag').textContent = tag ? '[' + tag + ']' : '';
+
     var box = document.getElementById('ai-analysis-box');
-    box.innerHTML = '<p class="loading-hint">AI 分析中（拉取K线 + 计算指标 + 大模型生成，约10-30秒）...</p>';
     document.getElementById('ai-indicator-row').style.display = 'none';
     document.getElementById('ai-fib-card').style.display = 'none';
+    document.getElementById('ai-refresh-btn').style.display = 'none';
 
-    fetch('/api/ai-analysis?code=' + code + '&name=' + encodeURIComponent(name))
+    // 美股暂不支持（K线数据源限制）
+    if (market === 'us') {
+        box.innerHTML = '<p style="color:#ef5350;">美股暂不支持 AI 技术分析（K线数据源限制），可搜索 A股/港股/指数/基金。</p>';
+        return;
+    }
+
+    box.innerHTML = refresh
+        ? '<p class="loading-hint">AI 分析中（重新生成报告，约10-30秒）...</p>'
+        : '<p class="loading-hint">AI 分析中（拉取K线 + 计算指标 + 大模型生成，约10-30秒）...</p>';
+
+    var url = '/api/ai-analysis?code=' + code + '&name=' + encodeURIComponent(name);
+    if (market) url += '&market=' + encodeURIComponent(market);
+    if (refresh) url += '&refresh=1';
+    fetch(url)
         .then(function(r) { return r.json(); })
         .then(function(res) {
             if (res.code !== 200) {
@@ -108,10 +144,32 @@ function loadAiAnalysis(code, name) {
             var d = res.data;
             renderIndicators(d.indicators);
             box.innerHTML = renderAnalysisText(d.analysis);
+            // 缓存/时间信息
+            var today = new Date().toISOString().slice(0, 10);
+            var meta = '';
+            if (d.cached) {
+                meta = '<p style="color:#8892b0;font-size:12px;margin-bottom:8px;">⚡ 历史结论（缓存）· 分析于 ' +
+                    (d.cached_at || '-') + ' · 数据截至 ' + (d.kline_date || '-');
+                if (d.kline_date && d.kline_date < today) {
+                    meta += ' <span style="color:#ffb74d;">行情已更新，建议点右上角重新分析</span>';
+                }
+                meta += '</p>';
+            } else {
+                meta = '<p style="color:#26a69a;font-size:12px;margin-bottom:8px;">✅ 最新结论 · 数据截至 ' +
+                    (d.kline_date || '-') + '（' + (d.cached_at || '刚刚') + '）</p>';
+            }
+            box.innerHTML = meta + box.innerHTML;
+            document.getElementById('ai-refresh-btn').style.display = 'inline-block';
         })
         .catch(function(err) {
             box.innerHTML = '<p style="color:#ef5350;">请求失败: ' + err + '</p>';
         });
+}
+
+// ========== 强制重新分析 ==========
+function refreshAiAnalysis() {
+    if (!currentStock) return;
+    loadAiAnalysis(currentStock.code, currentStock.name, currentStock.market, currentStock.tag, true);
 }
 
 // ========== 指标渲染 ==========

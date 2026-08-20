@@ -40,24 +40,29 @@ def build_heatmap_chart(sectors):
 
     tree_data = []
     for s in sectors:
-        # 颜色深浅按涨跌幅
+        flow = s["flow"]
         change = s["change"]
-        if change > 3:
-            color = HEATMAP_COLORS[4]
-        elif change > 1:
-            color = HEATMAP_COLORS[3]
-        elif change > 0:
-            color = HEATMAP_COLORS[2]
-        elif change > -1:
-            color = HEATMAP_COLORS[1]
+
+        # 双向热力图：颜色按资金流向方向标色
+        # 流入 → 红/橙色系，流出 → 绿/蓝冷色系
+        if flow > 3:
+            color = "#ef5350"        # 强流入 → 深红
+        elif flow > 1:
+            color = "#ff8a65"        # 中流入 → 浅红
+        elif flow > 0:
+            color = "#ffb74d"        # 弱流入 → 橙
+        elif flow > -1:
+            color = "#66bb6a"        # 弱流出 → 浅绿
+        elif flow > -3:
+            color = "#26a69a"        # 中流出 → 绿
         else:
-            color = HEATMAP_COLORS[0]
+            color = "#00695c"        # 强流出 → 深绿
 
         tree_data.append({
             "name": s["name"],
-            "value": abs(s["flow"]),
+            "value": abs(flow),       # 方块面积 = 资金规模绝对值
             "change": change,
-            "flow": s["flow"],
+            "flow": flow,
             "itemStyle": {"color": color}
         })
 

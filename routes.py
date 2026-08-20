@@ -3,15 +3,21 @@
 """
 
 from flask import Blueprint, render_template, jsonify, request
-from datetime import datetime, timedelta
 from collections import defaultdict
 from time import time
+from datetime import datetime
 from data_service import (
     get_market_flow, get_sector_flow,
     get_stock_money_flow, get_stock_valuation, search_stock,
     get_stock_quote, get_index_history, get_sector_valuation,
     get_stock_real_money_flow,
-    calc_ema, calc_fibonacci_levels, estimate_intrinsic_value
+    estimate_intrinsic_value, INDUSTRY_PE_MAP, get_industry_pe,
+    _LAST_SUCCESS
+)
+# 技术分析纯函数独立模块（technical.py），与数据获取解耦
+from technical import (
+    calc_ema, calc_fibonacci_levels,
+    get_kline, zigzag, support_resistance, find_trendlines
 )
 from chart_builder import (
     build_market_flow_chart, build_heatmap_chart,
@@ -73,6 +79,31 @@ def valuation_page():
 
 
 # ========== 数据接口 ==========
+
+@bp.route("/api/health")
+def api_health():
+    """存活探针：进程活着就 200（即使数据降级）"""
+    return jsonify({"code": 200, "status": "ok", "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+
+
+@bp.route("/api/ready")
+def api_ready():
+    """就绪探针：关键数据硬过期时 503（用于部署/监控，本地可忽略）
+    判断标准：所有已构建数据距最后成功超过 READY_MAX_AGE 秒 → 不 ready
+    """
+    READY_MAX_AGE = 12 * 3600  # 12 小时硬过期
+    now = time()
+    if not _LAST_SUCCESS:
+        # 刚启动还没构建过 → 允许预热期（health 200 即可）
+        return jsonify({"code": 200, "ready": True, "msg": "预热中（尚无数据构建记录）"})
+    stale = [k for k, ts in _LAST_SUCCESS.items() if now - ts > READY_MAX_AGE]
+    if len(stale) == len(_LAST_SUCCESS):
+        return jsonify({"code": 503, "ready": False,
+                        "msg": "关键数据硬过期", "stale_keys": stale[:5]}), 503
+    return jsonify({"code": 200, "ready": True,
+                    "last_success_count": len(_LAST_SUCCESS),
+                    "stale_count": len(stale)})
+
 
 @bp.route("/api/market-flow")
 def api_market_flow():
@@ -136,8 +167,12 @@ def api_valuation():
     code = request.args.get("code", "600519")
     name = request.args.get("name", "未知")
     data = get_stock_valuation(code)
-    chart = build_valuation_chart(name, data)
+    # 动态行业 PE（东财板块实时，失败降级静态映射表）
+    ind = get_industry_pe(code)
+    chart = build_valuation_chart(name, data, industry_pe=ind["pe"])
     if chart:
+        chart["industry_name"] = ind.get("industry", "未知")
+        chart["industry_pe_source"] = ind.get("source", "unknown")
         return jsonify({"code": 200, "data": chart})
     return jsonify({"code": 500, "msg": "数据获取失败"})
 
@@ -166,10 +201,14 @@ def api_ai_analysis():
         return jsonify({"code": 429, "msg": f"调用过于频繁, 限流 {AI_RATE_LIMIT} 次/分钟, 请稍后再试"})
     code = request.args.get("code", "600519")
     name = request.args.get("name", "贵州茅台")
+    market = request.args.get("market", "")
+    refresh = request.args.get("refresh", "") == "1"
+    if market == "us":
+        return jsonify({"code": 400, "msg": "美股暂不支持 AI 技术分析（K线数据源限制），可搜索 A股/港股/指数/基金"})
     from ai_analysis import analyze
-    result = analyze(code, name)
+    result = analyze(code, name, market or None, refresh=refresh)
     if not result:
-        return jsonify({"code": 500, "msg": "K线数据不足(可能休市或代码错误)"})
+        return jsonify({"code": 500, "msg": "K线数据不足(可能休市、代码错误或该品种暂不支持)"})
     return jsonify({"code": 200, "data": result})
 
 
@@ -197,10 +236,10 @@ def api_index_analysis():
         else:
             deviation.append(None)
     
-    # 斐波那契
+    # 斐波那契（传入最新收盘价做自适应展宽）
     recent_high = max(highs[-10:])
     recent_low = min(lows[-10:])
-    fib = calc_fibonacci_levels(recent_high, recent_low)
+    fib = calc_fibonacci_levels(recent_high, recent_low, price=closes[-1] if closes else None)
     
     return jsonify({
         "code": 200,
@@ -210,7 +249,49 @@ def api_index_analysis():
             "closes": closes,
             "ema20": ema20,
             "deviation": deviation,
-            "fibonacci": fib
+            "fibonacci": fib,
+            "asof": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "source": "tencent"
+        }
+    })
+
+
+@bp.route("/api/swing-analysis")
+def api_swing_analysis():
+    """摆动点 · 支撑压力 · 趋势线（画线程序化，支持日线/周线级别）"""
+    code = request.args.get("code", "600519")
+    name = request.args.get("name", "")
+    level = request.args.get("level", "day")   # day / week
+    freq = "week" if level == "week" else "day"
+
+    klines = get_kline(code, days=90 if freq == "day" else 80, freq=freq)
+    if not klines or len(klines) < 10:
+        return jsonify({"code": 500, "msg": "K线数据不足（可能休市或代码错误）"})
+
+    closes = [k["close"] for k in klines]
+    highs = [k["high"] for k in klines]
+    lows = [k["low"] for k in klines]
+
+    # 级别越大摆动阈值越大（过滤小波动，只看大结构）
+    threshold = 0.03 if freq == "day" else 0.05
+    swings = zigzag(highs, lows, threshold_pct=threshold)
+    sr = support_resistance(swings, tol_pct=0.03)
+    trendlines = find_trendlines(swings)
+
+    return jsonify({
+        "code": 200,
+        "data": {
+            "name": name,
+            "level": level,
+            "threshold_pct": threshold,
+            "dates": [k["date"] for k in klines],
+            "klines": klines,                       # 完整 OHLC 供画 K 线
+            "swing_points": swings,
+            "support_resistance": sr,
+            "trendlines": trendlines,
+            "current_price": closes[-1],
+            "asof": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "source": "tencent"
         }
     })
 
@@ -248,37 +329,26 @@ def api_fibonacci():
     if not quote:
         return jsonify({"code": 500, "msg": "获取个股数据失败"})
     
-    # 获取个股真实K线数据（直接用腾讯接口，市场前缀要正确）
-    import requests as _req
-    market = "sh" if code.startswith("6") else "sz"
-    end = datetime.now().strftime("%Y-%m-%d")
-    start = (datetime.now() - timedelta(days=50)).strftime("%Y-%m-%d")
-    url = "http://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
-    try:
-        resp = _req.get(url, params={"param": f"{market}{code},day,{start},{end},25,qfq"},
-                       headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-        data = resp.json()
-        klines = data.get("data", {}).get(f"{market}{code}", {}).get("day", []) or \
-                 data.get("data", {}).get(f"{market}{code}", {}).get("qfqday", [])
-        if not klines or len(klines) < 5:
-            return jsonify({"code": 500, "msg": "K线数据不足"})
-    except Exception as e:
-        return jsonify({"code": 500, "msg": f"获取K线失败: {str(e)}"})
-    
-    closes = [round(float(k[2]), 2) for k in klines]
-    highs_v = [round(float(k[3]), 2) for k in klines]
-    lows_v = [round(float(k[4]), 2) for k in klines]
-    
-    # 近20日高低点计算斐波那契
-    recent_high = max(highs_v[-20:])
-    recent_low = min(lows_v[-20:])
-    fib = calc_fibonacci_levels(recent_high, recent_low)
-    
+    # 获取个股真实K线数据（统一走 data_service.get_kline，避免重复实现）
+    klines = get_kline(code, days=25, freq="day")
+    if not klines or len(klines) < 5:
+        return jsonify({"code": 500, "msg": "K线数据不足"})
+
+    closes = [k["close"] for k in klines]
+    highs_v = [k["high"] for k in klines]
+    lows_v = [k["low"] for k in klines]
+
     # 用实时行情替换最后一个收盘价（保证当前价准确）
     current_price = quote["price"]
     if closes:
         closes[-1] = current_price
-    dates = [k[0] for k in klines]
+
+    # 近20日高低点计算斐波那契（传入当前价做自适应展宽）
+    recent_high = max(highs_v[-20:])
+    recent_low = min(lows_v[-20:])
+    fib = calc_fibonacci_levels(recent_high, recent_low, price=current_price)
+
+    dates = [k["date"] for k in klines]
     # 找到当前价最接近的斐波那契位
     nearest_level = None
     nearest_diff = float("inf")
@@ -296,6 +366,8 @@ def api_fibonacci():
             "dates": dates,
             "closes": closes,
             "nearest_level": nearest_level,
-            "deviation_pct": round((current_price - fib["levels"][nearest_level]) / fib["levels"][nearest_level] * 100, 2) if nearest_level else 0
+            "deviation_pct": round((current_price - fib["levels"][nearest_level]) / fib["levels"][nearest_level] * 100, 2) if nearest_level else 0,
+            "asof": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "source": "tencent"
         }
     })
