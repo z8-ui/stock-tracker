@@ -454,7 +454,8 @@ def get_stock_quote(stock_code):
         low = float(parts[34]) if len(parts) > 34 and parts[34] else 0
         change = float(parts[31]) if parts[31] else 0
         change_pct = float(parts[32]) if parts[32] else 0
-        volume_lots = int(parts[6]) if parts[6] else 0
+        # ⚠️ 腾讯接口成交量可能带小数点(如 "43845.000"), 直接 int() 会 ValueError 被外层吞掉导致行情全挂
+        volume_lots = int(float(parts[6])) if parts[6] else 0
         pe = float(parts[39]) if len(parts) > 39 and parts[39] else 0
         pb = float(parts[46]) if len(parts) > 46 and parts[46] else 0
         turnover_rate = float(parts[38]) if len(parts) > 38 and parts[38] else 0
