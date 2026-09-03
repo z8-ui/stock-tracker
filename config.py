@@ -6,7 +6,9 @@
 # Flask 服务器配置
 SERVER_HOST = "0.0.0.0"   # 允许局域网访问
 SERVER_PORT = 5000
-DEBUG = True               # 开发时开着，部署关掉
+# ⚠️ 安全默认值: 仓库内 DEBUG=False(公网/局域网暴露时无 Werkzeug 调试器 RCE 风险)
+#    本地开发想开调试(自动重载+错误堆栈), 在 config_local.py 里加一行 DEBUG = True 即可
+DEBUG = False
 
 # 页面标题
 APP_NAME = "A股追踪系统"
