@@ -23,7 +23,7 @@ from chart_builder import (
     build_market_flow_chart, build_heatmap_chart,
     build_stock_flow_chart, build_valuation_chart
 )
-from config import APP_NAME, STOCK_WATCHLIST, VALUATION_WATCHLIST
+from config import APP_NAME, STOCK_WATCHLIST, VALUATION_WATCHLIST, DEEPSEEK_API_KEY
 
 bp = Blueprint("main", __name__)
 
@@ -196,6 +196,21 @@ def ai_page():
     return render_template("ai.html", app_name=APP_NAME)
 
 
+@bp.route("/api/ai-config")
+def api_ai_config():
+    """AI 配置状态(供页面判断是否需要显示 API Key 填写框)
+    只返回是否已配置, 绝不返回 key 本身
+    """
+    return jsonify({
+        "code": 200,
+        "data": {
+            "hasKey": bool((DEEPSEEK_API_KEY or "").strip()),
+            # 提示文案: 告诉用户去哪申请 key
+            "applyUrl": "https://platform.deepseek.com"
+        }
+    })
+
+
 @bp.route("/api/ai-analysis")
 def api_ai_analysis():
     """AI 技术分析: 拉K线 -> 算指标 -> DeepSeek 生成分析"""
@@ -207,10 +222,14 @@ def api_ai_analysis():
     name = request.args.get("name", "贵州茅台")
     market = request.args.get("market", "")
     refresh = request.args.get("refresh", "") == "1"
+    # 前端填入的临时 key(header 优先, 避免 key 出现在 URL/日志; 为空回退 config_local)
+    api_key = (request.headers.get("X-AI-Key") or "").strip()
+    if not api_key:
+        api_key = (request.args.get("api_key") or "").strip()
     if market == "us":
         return jsonify({"code": 400, "msg": "美股暂不支持 AI 技术分析（K线数据源限制），可搜索 A股/港股/指数/基金"})
     from ai_analysis import analyze
-    result = analyze(code, name, market or None, refresh=refresh)
+    result = analyze(code, name, market or None, refresh=refresh, api_key=api_key or None)
     if not result:
         return jsonify({"code": 500, "msg": "K线数据不足(可能休市、代码错误或该品种暂不支持)"})
     return jsonify({"code": 200, "data": result})

@@ -2,6 +2,21 @@
 {% block title %}AI 分析{% endblock %}
 
 {% block content %}
+<!-- ========== AI API Key 设置(仅服务端未配置 key 时显示; 本地自用可忽略) ========== -->
+<div class="card" id="ai-key-card" style="display:none; border-left:4px solid #ffb74d;">
+    <div class="card-header">🔑 AI API Key 设置</div>
+    <div class="search-bar" style="flex-wrap:wrap;">
+        <input type="password" id="ai-key-input" placeholder="粘贴你的 DeepSeek API Key (sk-...)，仅保存在当前浏览器" class="search-input" style="flex:1;min-width:260px;">
+        <button onclick="saveAiKey()" class="btn">保存并启用</button>
+        <button id="ai-key-clear-btn" onclick="clearAiKey()" class="btn" style="display:none; margin-left:8px;">清除</button>
+    </div>
+    <p class="hint" style="margin:8px 0 0;">
+        <span id="ai-key-status"></span>
+        没有 key？到 <a href="https://platform.deepseek.com" target="_blank" rel="noopener">platform.deepseek.com</a> 注册即可免费申请。
+        key 仅保存在当前浏览器(localStorage)，随请求发送后不落盘、不上传任何第三方。
+    </p>
+</div>
+
 <!-- ========== 搜索区 ========== -->
 <div class="row">
     <div class="col" style="flex:2">
@@ -58,6 +73,53 @@
 
 {% block scripts %}
 <script>
+// ========== AI API Key 前端配置 ==========
+// 服务端已配置 key(config_local.py)时不显示任何设置, 页面零打扰;
+// 未配置时显示填写框, key 存本浏览器 localStorage, 请求经 X-AI-Key header 发送
+var serverHasAiKey = false;
+
+function getAiKey() { try { return localStorage.getItem('ai_api_key') || ''; } catch(e) { return ''; } }
+
+function maskKey(k) { return k.length > 10 ? k.slice(0, 6) + '****' + k.slice(-4) : '****'; }
+
+function initAiKeyCard() {
+    fetch('/api/ai-config')
+        .then(function(r) { return r.json(); })
+        .then(function(res) {
+            serverHasAiKey = !!(res.data && res.data.hasKey);
+            if (serverHasAiKey) return;   // 服务端已配置: 保持隐藏, 用户无感
+            var card = document.getElementById('ai-key-card');
+            card.style.display = 'block';
+            var local = getAiKey();
+            var status = document.getElementById('ai-key-status');
+            if (local) {
+                status.innerHTML = '✅ 当前浏览器已保存 key(<b>' + maskKey(local) + '</b>)，可以直接分析。';
+                document.getElementById('ai-key-clear-btn').style.display = 'inline-block';
+            } else {
+                status.innerHTML = '⚠️ 服务端未配置 API Key，分析前请先填写。';
+            }
+        })
+        .catch(function() { /* 接口失败不打扰: 默认不显示 */ });
+}
+
+function saveAiKey() {
+    var input = document.getElementById('ai-key-input');
+    var key = (input.value || '').trim();
+    if (key.length < 10) { alert('key 格式不对: 应是以 sk- 开头的一长串字符'); return; }
+    localStorage.setItem('ai_api_key', key);
+    input.value = '';
+    document.getElementById('ai-key-status').innerHTML = '✅ 已保存并启用(<b>' + maskKey(key) + '</b>)，现在可以搜索股票分析了。';
+    document.getElementById('ai-key-clear-btn').style.display = 'inline-block';
+}
+
+function clearAiKey() {
+    localStorage.removeItem('ai_api_key');
+    document.getElementById('ai-key-status').innerHTML = '已清除本浏览器保存的 key。';
+    document.getElementById('ai-key-clear-btn').style.display = 'none';
+}
+
+initAiKeyCard();
+
 // ========== 搜索历史 ==========
 function getAiHistory() {
     try { return JSON.parse(localStorage.getItem('aiSearchHistory') || '[]'); } catch(e) { return []; }
@@ -134,7 +196,11 @@ function loadAiAnalysis(code, name, market, tag, refresh) {
     var url = '/api/ai-analysis?code=' + code + '&name=' + encodeURIComponent(name);
     if (market) url += '&market=' + encodeURIComponent(market);
     if (refresh) url += '&refresh=1';
-    fetch(url)
+    // 浏览器本地保存的 key 随请求头发送(不进 URL/日志); 服务端已配置时无需携带
+    var headers = {};
+    var localKey = getAiKey();
+    if (localKey && !serverHasAiKey) headers['X-AI-Key'] = localKey;
+    fetch(url, {headers: headers})
         .then(function(r) { return r.json(); })
         .then(function(res) {
             if (res.code !== 200) {

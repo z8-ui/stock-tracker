@@ -353,15 +353,18 @@ def build_prompt(name, code, ind):
 
 # ========== 4. DeepSeek 调用 ==========
 
-def call_deepseek(prompt):
-    """调用 DeepSeek chat API, 返回分析文本"""
-    if not DEEPSEEK_API_KEY:
-        return "未配置 DEEPSEEK_API_KEY: 请创建 config_local.py 并填写自己的 key(在 https://platform.deepseek.com 申请)"
+def call_deepseek(prompt, api_key=None):
+    """调用 DeepSeek chat API, 返回分析文本
+    api_key: 前端传入的临时 key(优先级最高); 为空时回退到 config_local 的 DEEPSEEK_API_KEY
+    """
+    key = (api_key or "").strip() or DEEPSEEK_API_KEY
+    if not key:
+        return "未配置 API Key: 请在页面顶部填入你的 DeepSeek key(在 https://platform.deepseek.com 申请), 或创建 config_local.py 填写 DEEPSEEK_API_KEY"
     try:
         resp = requests.post(
             DEEPSEEK_URL,
             headers={
-                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                "Authorization": f"Bearer {key}",
                 "Content-Type": "application/json"
             },
             json={
@@ -408,9 +411,10 @@ def _save_cache(cache):
         pass
 
 
-def analyze(code, name, market=None, refresh=False):
+def analyze(code, name, market=None, refresh=False, api_key=None):
     """输入代码+名称(+市场前缀), 返回 {analysis, indicators, cached, cached_at, kline_date}
     refresh=True 时强制重新分析并覆盖缓存
+    api_key: 页面传入的临时 key(为空时用 config_local 的 DEEPSEEK_API_KEY)
     """
     cache_key = f"{market or 'sz'}{code}"
 
@@ -432,7 +436,15 @@ def analyze(code, name, market=None, refresh=False):
         return None
     ind = compute_indicators(klines)
     prompt = build_prompt(name, code, ind)
-    analysis = call_deepseek(prompt)
+    analysis = call_deepseek(prompt, api_key=api_key)
+
+    # ⚠️ 调用失败/未配置 key 的结果不写缓存(否则错误会被缓存反复展示)
+    if not analysis or analysis.startswith(("AI 分析调用失败", "未配置")):
+        return {
+            "analysis": analysis, "indicators": ind,
+            "cached": False, "cached_at": "",
+            "kline_date": ind["date"],
+        }
 
     # 写缓存
     cache = _load_cache()
