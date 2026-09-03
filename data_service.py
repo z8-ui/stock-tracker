@@ -12,6 +12,8 @@ import threading
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from policy_notes import get_policy_notes
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Referer": "https://data.eastmoney.com/"
@@ -146,7 +148,7 @@ def _has_valid_data(data):
     return True
 
 
-def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None):
+def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force=False):
     """统一的缓存读写（SWR + single-flight + 数据标注注入）
 
     cache_key:    字符串标识
@@ -154,11 +156,13 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None):
     validate_fn:  可选，接收数据返回 bool，判断数据是否有效
     source:       数据源名称（如 "tencent"/"eastmoney"），注入返回数据
     ttl:          内存缓存秒数（默认 _IN_MEMORY_TTL）
+    force:        为 True 时跳过全部缓存，强制同步拉取并写回缓存（手动更新按钮用）
 
     行为：
     - 交易时段：TTL 内命中内存直接返回；过期先返回旧数据并后台重建（SWR）；
       并发同 key 只允许一次真实构建（single-flight）；构建失败降级文件缓存
     - 非交易时段：优先文件缓存（定格快照），无缓存才抓一次
+    - force=True：无视交易时段/缓存，直接抓取并写回（抓取失败仍降级文件缓存）
     - 返回的 dict 自动注入 _asof(数据获取时间)/_market_status/_source
     """
     status, is_trading = _market_status()
@@ -186,6 +190,16 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None):
         if val is not None:
             return _inject(val, _LAST_SUCCESS.get(cache_key, now))
         return None
+
+    # 强制刷新：跳过所有缓存层，同步拉取并写回
+    if force:
+        fresh = fetcher()
+        if validate_fn is None or validate_fn(fresh):
+            return _inject(_store(fresh), now)
+        cached = _file_cache()
+        if cached is not None:
+            return cached
+        return fresh
 
     if is_trading:
         mem = _IN_MEMORY_CACHE.get(cache_key)
@@ -605,7 +619,56 @@ INDUSTRY_PE_MAP = {
 }
 
 
-def get_industry_pe(stock_code):
+def get_latest_financials(stock_code, refresh=False):
+    """最新一期财报（东方财富 F10 主要财务指标）
+
+    返回 {report_date, report_name, eps, bps, revenue, revenue_yoy,
+          net_profit, profit_yoy, roe, notice_date} 或 None（失败降级）
+    2026-08 新增：估值偏离需结合最新季报（净利润/营收同比、EPS）综合判断
+    """
+    def fetch():
+        if stock_code.startswith(("4", "8", "92")):
+            suffix = ".BJ"
+        elif stock_code.startswith(("6", "9")):
+            suffix = ".SH"
+        else:
+            suffix = ".SZ"
+        try:
+            r = requests.get(
+                "https://datacenter-web.eastmoney.com/api/data/v1/get",
+                params={
+                    "reportName": "RPT_F10_FINANCE_MAINFINADATA",
+                    "columns": "ALL",
+                    "filter": f'(SECUCODE="{stock_code}{suffix}")',
+                    "pageNumber": "1", "pageSize": "1",
+                    "sortColumns": "REPORT_DATE", "sortTypes": "-1",
+                },
+                headers=HEADERS, timeout=8)
+            rows = ((r.json().get("result") or {}).get("data")) or []
+            if not rows:
+                return None
+            d = rows[0]
+            return {
+                "report_date": (d.get("REPORT_DATE") or "")[:10],
+                "report_name": d.get("REPORT_DATE_NAME") or "",
+                "eps": d.get("EPSJB"),                 # 基本每股收益
+                "bps": d.get("BPS"),                   # 每股净资产
+                "revenue": d.get("TOTALOPERATEREVE"),  # 营业总收入(元)
+                "revenue_yoy": d.get("TOTALOPERATEREVETZ"),   # 营收同比%
+                "net_profit": d.get("PARENTNETPROFIT"),       # 归母净利润(元)
+                "profit_yoy": d.get("PARENTNETPROFITTZ"),     # 净利润同比%
+                "roe": d.get("ROEJQ"),                 # 净资产收益率%
+                "notice_date": (d.get("NOTICE_DATE") or "")[:10],
+            }
+        except Exception:
+            return None
+
+    return _cached_get(f"fin_{stock_code}", fetch,
+                       validate_fn=lambda x: x is not None,
+                       source="eastmoney", ttl=6 * 3600, force=refresh)
+
+
+def get_industry_pe(stock_code, refresh=False):
     """动态获取行业平均 PE（东财三步链：个股→行业名 f127→suggest搜BK→板块PE f9×100）
 
     失败自动降级：INDUSTRY_PE_MAP 硬编码 → 默认 25（返回 source=static_map 标记）
@@ -651,7 +714,7 @@ def get_industry_pe(stock_code):
 
     result = _cached_get(f"industry_pe_{stock_code}", fetch,
                          validate_fn=lambda x: x is not None and x.get("pe"),
-                         source="eastmoney", ttl=3600)
+                         source="eastmoney", ttl=3600, force=refresh)
     if result and result.get("pe"):
         return result
     # 降级：静态映射表（source 标记，前端可提示"估值为静态参考"）
@@ -659,30 +722,39 @@ def get_industry_pe(stock_code):
             "industry": "未知", "source": "static_map"}
 
 
-def get_stock_valuation(stock_code):
-    """个股估值"""
+def get_stock_valuation(stock_code, refresh=False):
+    """个股估值（refresh=True 时强制穿透行业PE/财报缓存重新拉取）"""
     quote = get_stock_quote(stock_code)
     if not quote:
         return None
 
     pe = quote.get("pe", 0)
     pb = quote.get("pb", 0)
-    industry_pe = get_industry_pe(stock_code)["pe"]
-    
+    ind = get_industry_pe(stock_code, refresh=refresh)
+    industry_pe = ind["pe"]
+
     if pe == 0:
         pe = industry_pe
 
     deviation_pe = round((pe - industry_pe) / industry_pe * 100, 1)
 
-    return {
+    result = {
         "pe": round(pe, 2),
         "pb": round(pb, 2),
         "pe_ttm": round(pe, 2),
         "industry_pe": industry_pe,
+        "industry_name": ind.get("industry", "未知"),
+        "industry_pe_source": ind.get("source", "unknown"),
         "deviation_pe": deviation_pe,
         "level": "偏高" if deviation_pe > 20 else ("偏低" if deviation_pe < -20 else "合理"),
-        "date": datetime.now().strftime("%Y-%m-%d")
+        "date": datetime.now().strftime("%Y-%m-%d"),
     }
+
+    # 2026-08 新增：估值偏离结合最新季报财报 + 产业政策事件
+    # 财报（净利润/营收同比、EPS）动态拉取；政策事件手动维护在 policy_notes.py
+    result["financials"] = get_latest_financials(stock_code, refresh=refresh)
+    result["policy_notes"] = get_policy_notes(stock_code, result["industry_name"])
+    return result
 
 
 # ==============================================================
@@ -820,16 +892,46 @@ def _mock_index_history(index_code, days=30):
 
 
 def estimate_intrinsic_value(stock_quote):
-    """估算内在价值"""
+    """估算内在价值（2026-08 升级：结合最新季报 + 动态行业PE）
+
+    EPS 优先取最新财报并按报告期年化（年报×1 / 三季报×4/3 / 中报×2 / 一季报×4），
+    取不到财报才退回 价格/PE 反推；
+    行业PE 优先东财动态板块PE，失败退回 INDUSTRY_PE_MAP 静态映射表。
+    内在价值 = 年化EPS × 行业PE × 0.8（安全边际）
+    """
     pe = stock_quote.get("pe", 25) or 25
     price = stock_quote.get("price", 0)
     code = stock_quote.get("code", "")
-    industry_pe = INDUSTRY_PE_MAP.get(code, 25)
-    eps = price / pe if pe and price else 0
+
+    ind = get_industry_pe(code)
+    industry_pe = ind["pe"]
+    industry_name = ind.get("industry", "未知")
+
+    # EPS：优先最新财报（按报告期年化）
+    eps, eps_source = 0, "none"
+    fin = get_latest_financials(code)
+    if fin and fin.get("eps"):
+        try:
+            eps = float(fin["eps"])
+            month = int((fin.get("report_date") or "12")[5:7])
+            annual_factor = {3: 4, 6: 2, 9: 4 / 3, 12: 1}.get(month, 1)
+            eps = round(eps * annual_factor, 3)
+            eps_source = "quarterly_report"
+        except Exception:
+            eps = 0
+    if not eps and pe and price:
+        eps = round(price / pe, 3)
+        eps_source = "price_pe_derived"
+
     intrinsic = round(eps * industry_pe * 0.8, 2) if eps else price
-    return {"price": price, "intrinsic_value": intrinsic,
-            "gap": round((price - intrinsic) / intrinsic * 100, 1) if intrinsic else 0,
-            "pe": pe, "industry_pe": industry_pe, "eps": round(eps, 3) if eps else 0}
+    return {
+        "price": price, "intrinsic_value": intrinsic,
+        "gap": round((price - intrinsic) / intrinsic * 100, 1) if intrinsic else 0,
+        "pe": pe, "industry_pe": industry_pe,
+        "industry_name": industry_name,
+        "eps": eps, "eps_source": eps_source,
+        "financials": fin,
+    }
 
 
 # ==============================================================

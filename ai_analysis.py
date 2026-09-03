@@ -16,7 +16,7 @@ import requests
 from datetime import datetime, timedelta
 
 from config import DEEPSEEK_API_KEY
-from data_service import calc_fibonacci_levels
+from technical import calc_fibonacci_levels
 
 # 腾讯 K线接口(兜底)
 KLINE_URL = "http://web.ifzq.gtimg.cn/appstock/app/fqkline/get"

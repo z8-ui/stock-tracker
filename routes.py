@@ -163,16 +163,20 @@ def api_stock_real_flow():
 
 @bp.route("/api/valuation")
 def api_valuation():
-    """个股估值"""
+    """个股估值（refresh=1 时强制穿透行业PE/财报缓存重新拉取）"""
     code = request.args.get("code", "600519")
     name = request.args.get("name", "未知")
-    data = get_stock_valuation(code)
+    refresh = request.args.get("refresh", "") == "1"
+    data = get_stock_valuation(code, refresh=refresh)
     # 动态行业 PE（东财板块实时，失败降级静态映射表）
-    ind = get_industry_pe(code)
+    ind = get_industry_pe(code, refresh=refresh)
     chart = build_valuation_chart(name, data, industry_pe=ind["pe"])
     if chart:
         chart["industry_name"] = ind.get("industry", "未知")
         chart["industry_pe_source"] = ind.get("source", "unknown")
+        # 2026-08: 财报快照 + 政策事件（build_valuation_chart 会重建 dict，需手动补挂）
+        chart["financials"] = data.get("financials")
+        chart["policy_notes"] = data.get("policy_notes") or []
         return jsonify({"code": 200, "data": chart})
     return jsonify({"code": 500, "msg": "数据获取失败"})
 
