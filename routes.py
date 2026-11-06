@@ -393,3 +393,29 @@ def api_fibonacci():
             "source": "tencent"
         }
     })
+
+
+# ---------------------------------------------------------------- 政策事件中心
+
+@bp.route("/events")
+def events_page():
+    return render_template("events.html", app_name=APP_NAME)
+
+
+@bp.route("/api/event-timeline")
+def api_event_timeline():
+    """事件时间线：按月 × 行业聚合 + 方向分布 + 事件列表"""
+    try:
+        days = int(request.args.get("days", 365))
+    except ValueError:
+        days = 365
+    days = max(30, min(days, 3650))
+    industry = (request.args.get("industry") or "").strip() or None
+    try:
+        import events_store
+        data = events_store.timeline(days=days, industry=industry)
+    except Exception as e:
+        return jsonify({"code": 500, "msg": f"事件库读取失败: {type(e).__name__}: {e}"})
+    data["days"] = days
+    data["industry_filter"] = industry
+    return jsonify({"code": 200, "data": data})

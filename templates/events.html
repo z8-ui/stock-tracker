@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}政策事件时间线{% endblock %}
+
+{% block content %}
+<div class="card">
+    <div class="card-header">
+        政策事件时间线
+        <span class="hint">按月 × 行业 · 柱高 = 当月事件数（一条事件挂多只股票只记 1 次）</span>
+        <span id="status-events" class="hint" style="color:#ffb74d;font-size:11px;"></span>
+    </div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;padding:4px 0 10px;">
+        <span class="hint">时间范围</span>
+        <select id="events-days" style="background:#0f1729;color:#e6f1ff;border:1px solid #1b2740;border-radius:6px;padding:5px 8px;">
+            <option value="90">近 3 个月</option>
+            <option value="180">近 6 个月</option>
+            <option value="365" selected>近 1 年</option>
+            <option value="730">近 2 年</option>
+            <option value="1825">近 5 年</option>
+        </select>
+        <span class="hint">行业</span>
+        <select id="events-industry" style="background:#0f1729;color:#e6f1ff;border:1px solid #1b2740;border-radius:6px;padding:5px 8px;">
+            <option value="">全部</option>
+        </select>
+        <button id="events-refresh" class="btn">刷新</button>
+        <span class="hint" id="events-asof"></span>
+    </div>
+    <div id="events-stats" style="display:flex;gap:12px;flex-wrap:wrap;"></div>
+</div>
+
+<div class="row">
+    <div class="col">
+        <div class="card">
+            <div class="card-header">月度事件密度（按行业堆叠）</div>
+            <div id="chart-events-timeline" class="chart-box chart-large"></div>
+        </div>
+    </div>
+    <div class="col">
+        <div class="card">
+            <div class="card-header">行业分布</div>
+            <div id="chart-events-industry" class="chart-box chart-large"></div>
+        </div>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header">
+        事件列表
+        <span class="hint" id="events-count"></span>
+    </div>
+    <div id="events-table" style="overflow-x:auto;"></div>
+</div>
+
+<div class="card">
+    <div class="card-header">口径说明</div>
+    <div class="summary-box" style="color:#8892b0;font-size:12px;line-height:1.8;">
+        <p><b>事件从哪来</b>：<code>scripts/events_cli.py</code> 录入。手动 <code>add</code>；
+        或 <code>feed</code> 抓东财快讯 / 新浪财经 → 关键词粗筛 → <code>--pick</code> 让模型抽成结构化 JSON →
+        人看预览 → <code>--yes</code> 才写库。没有全自动入库，避免把标题党写成政策。</p>
+        <p><b>为什么不按关联数统计</b>：「美国禁止废钨出口」挂在 4 只钨股上，按关联数会数成 4 次，
+        所以行业维度用 <code>COUNT(DISTINCT event_id)</code>，一条事件只算一次。</p>
+        <p><b>方向</b>：<span style="color:#ef5350;">■ 利好</span>
+        <span style="color:#26a69a;">■ 利空</span>
+        <span style="color:#8892b0;">■ 中性</span>　由录入时判定（AI 抽取只给初稿，需人工确认）。</p>
+        <p><b>归档</b>：过期或有误的事件用 <code>events_cli archive --id N</code> 归档，图上立即消失，数据可追溯。</p>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/events.js"></script>
+{% endblock %}

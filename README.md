@@ -92,7 +92,7 @@ python app.py
 ## 🧪 测试与打包
 
 ```bash
-# 单元测试（38 个用例，纯离线，不依赖 pytest）
+# 单元测试（50 个用例，纯离线，不依赖 pytest）
 python3 -m unittest discover -s tests -v
 
 # 打发布包（排除 .git/.venv/__pycache__/config_local.py/*_cache.json，
@@ -167,6 +167,33 @@ python3 scripts/events_cli.py archive --id 5             # 归档（不删数据
    提示词明确要求「原文没有的数字一律不要编」。实测一条新闻：242 prompt + 78 completion token。
 
 库文件 `data/events.db`，已加入 `.gitignore`（本地数据不入库）。
+
+### 半自动采集：feed
+
+```bash
+python3 scripts/events_cli.py feed                    # 抓东财快讯 + 新浪财经 → 关键词粗筛 → 打印候选
+python3 scripts/events_cli.py feed --strong           # 只看政策/行业/自选股相关（丢掉公司面消息）
+python3 scripts/events_cli.py feed --pick 2,5 --stock 000657 --industry 小金属   # 预览抽取结果
+python3 scripts/events_cli.py feed --pick 2,5 --stock 000657 --industry 小金属 --yes   # 确认写库
+```
+
+- 两个源实测可用：东财快讯（JSONP，50 条/次，digest 即全文）、新浪财经（JSON，20 条/次，只有摘要）。
+  财联社 telegraph 接口需要 sign，直连 404，**没有硬编码 token 绕过**。
+- 分两级：`!` 强相关（出口管制/配额/关税/行业词/自选股代码命中）、`·` 弱相关（涨价/订单/立案/减持等公司面）。
+- 近似标题自动合并（"000520，被立案" / "000520，被证监会立案" → 留信息更全的一条，标 `x2`）。
+- 看过的候选记在 `feed_seen` 表，第二天不会再问同一批；`--all` 可回看，`--dry-run` 不记录。
+- **没有全自动入库**：AI 只出初稿，`--yes` 才写库。
+
+### 时间线视图：/events
+
+导航栏「政策事件」→ 按月 × 行业的堆叠柱状图 + 行业分布饼图 + 事件列表，支持 3 个月 ~ 5 年、按行业筛选。
+
+计数口径是 `COUNT(DISTINCT event_id)`：一条事件挂 4 只钨股，行业维度只算 1 次，不会把柱子撑大；
+没挂行业的事件归到「未分类」（可用 `events_cli link --id N --industry X` 补挂）。
+
+ECharts 已 vendor 到 `static/vendor/echarts.min.js`（1.0 MB）：原来只从 jsdelivr CDN 加载，
+在被墙/断网环境里 `echarts is not defined` 会让整页图表空白且后续渲染中断。现在本地优先、CDN 兜底，
+图表库缺失时只有图表降级、表格照常显示。
 
 ## 📡 数据来源（全部免费公开接口）
 

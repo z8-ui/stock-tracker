@@ -188,7 +188,7 @@ def seed_from_static(conn=None, verbose=False):
 
 # ---------------------------------------------------------------- 读
 
-def list_events(limit=50, code=None, industry=None, status="active", conn=None):
+def list_events(limit=50, code=None, industry=None, status="active", since=None, conn=None):
     own = conn is None
     conn = conn or connect()
     sql = ("SELECT e.*, GROUP_CONCAT(l.target_type || ':' || l.target_key) AS targets "
@@ -202,14 +202,16 @@ def list_events(limit=50, code=None, industry=None, status="active", conn=None):
         if industry:
             sub.append("(l.target_type='industry' AND l.target_key=?)")
             sub_args.append(str(industry))
-        sql += "WHERE e.id IN (SELECT event_id FROM event_links WHERE " + " OR ".join(sub) + ") "
+        where.append("e.id IN (SELECT event_id FROM event_links WHERE " + " OR ".join(sub) + ")")
         args.extend(sub_args)
-        if status:
-            sql += "AND e.status = ? "
-            args.append(status)
-    elif status:
-        sql += "WHERE e.status = ? "
+    if status:
+        where.append("e.status = ?")
         args.append(status)
+    if since:
+        where.append("e.event_date >= ?")
+        args.append(str(since))
+    if where:
+        sql += "WHERE " + " AND ".join(where) + " "
     sql += "GROUP BY e.id ORDER BY e.event_date DESC, e.id DESC LIMIT ?"
     args.append(int(limit))
     rows = [dict(r) for r in conn.execute(sql, args).fetchall()]
@@ -270,6 +272,79 @@ def notes_for(code, industry_name="", limit=20, conn=None):
         if len(out) >= limit:
             break
     return out
+
+
+def timeline(days=365, industry=None, max_months=24, conn=None):
+    """事件时间线：按月 × 行业聚合（给 /events 页面用）
+
+    计数口径：COUNT(DISTINCT event_id)——一条事件挂 4 只钨股 + 1 个行业，行业维度只记 1 次，
+    不会因为关联多而把柱子撑大。没有挂行业的事件单独归到「未分类」。
+    """
+    from datetime import date, timedelta
+
+    own = conn is None
+    conn = conn or connect()
+    init_db(conn)
+    today = date.today()
+    since = (today - timedelta(days=int(days))).isoformat()
+
+    per_ind = {}
+    for r in conn.execute(
+            "SELECT substr(e.event_date,1,7) ym, l.target_key ind, COUNT(DISTINCT e.id) n "
+            "FROM events e JOIN event_links l ON l.event_id=e.id "
+            "WHERE e.status='active' AND e.event_date>=? AND l.target_type='industry' "
+            + ("AND l.target_key=? " if industry else "") +
+            "GROUP BY ym, ind", ([since, industry] if industry else [since])).fetchall():
+        per_ind.setdefault(r["ind"], {})[r["ym"]] = r["n"]
+
+    if not industry:
+        unclassified = {}
+        for r in conn.execute(
+                "SELECT substr(event_date,1,7) ym, COUNT(*) n FROM events e "
+                "WHERE e.status='active' AND event_date>=? AND id NOT IN "
+                "(SELECT event_id FROM event_links WHERE target_type='industry') "
+                "GROUP BY ym", (since,)).fetchall():
+            unclassified[r["ym"]] = r["n"]
+        if unclassified:
+            per_ind["未分类"] = unclassified
+
+    dirs = {r["direction"]: r["n"] for r in conn.execute(
+        ("SELECT e.direction, COUNT(*) n FROM events e WHERE e.status='active' AND e.event_date>=? "
+         if not industry else
+         "SELECT e.direction, COUNT(DISTINCT e.id) n FROM events e "
+         "JOIN event_links l ON l.event_id=e.id WHERE e.status='active' AND e.event_date>=? "
+         "AND l.target_type='industry' AND l.target_key=? ")
+        + "GROUP BY e.direction",
+        ((since,) if not industry else (since, industry))).fetchall()}
+
+    # 月份轴：从 since 月起连续到今天；超过 max_months 时保留最近的月份（否则当月会被挤掉）
+    sy, sm = map(int, since[:7].split("-"))
+    ty, tm = today.year, today.month
+    months = []
+    y, m = sy, sm
+    while (y, m) <= (ty, tm):
+        months.append(f"{y:04d}-{m:02d}")
+        m += 1
+        if m == 13:
+            y, m = y + 1, 1
+    months = months[-max_months:]
+
+    series = []
+    for ind in sorted(per_ind, key=lambda k: -sum(per_ind[k].values())):
+        series.append({"name": ind, "data": [per_ind[ind].get(ym, 0) for ym in months]})
+
+    events = list_events(limit=80, industry=industry, since=since, conn=conn)
+    if own:
+        conn.close()
+    return {
+        "months": months,
+        "series": series,
+        "directions": {d: dirs.get(d, 0) for d in DIRECTIONS},
+        "total": sum(dirs.values()),
+        "industries": [{"name": s["name"], "total": sum(s["data"])} for s in series],
+        "events": events,
+        "since": since,
+    }
 
 
 def stats(conn=None):

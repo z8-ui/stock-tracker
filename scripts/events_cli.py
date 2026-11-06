@@ -125,6 +125,123 @@ def cmd_repair(args):
     return 0
 
 
+def cmd_link(args):
+    """给已有事件补挂标的（录入时忘了写行业/漏了某只股票）"""
+    conn = events_store.connect()
+    row = conn.execute("SELECT title FROM events WHERE id=?", (args.id,)).fetchone()
+    if not row:
+        print(f"[x] 没有 id={args.id} 的事件", file=sys.stderr)
+        conn.close()
+        return 1
+    added = 0
+    for ttype, keys in (("stock", args.stock or ()), ("industry", args.industry or ())):
+        for k in keys:
+            try:
+                conn.execute("INSERT INTO event_links (event_id,target_type,target_key) VALUES (?,?,?)",
+                             (args.id, ttype, str(k).strip()))
+                added += 1
+            except Exception:
+                pass
+    conn.commit()
+    conn.close()
+    print(f"  [v] event_id={args.id} 新增关联 {added} 条：{row['title'][:40]}")
+    return 0
+
+
+def cmd_feed(args):
+    """抓快讯 → 关键词筛 → 打印候选；--pick 选中后走 AI 抽取，--yes 才写库"""
+    import event_feed
+
+    items, errors = event_feed.fetch_headlines(sources=args.source or None, limit=args.limit)
+    for e in errors:
+        print(f"  [!] 抓取失败 {e}", file=sys.stderr)
+
+    cands = event_feed.screen(items, args.keyword)
+    cands, merged = event_feed.dedupe(cands)
+    if args.strong:
+        cands = [c for c in cands if c["weight"] >= 2]
+    if not args.all:
+        seen = event_feed.seen_fps()
+        cands = [c for c in cands if c["fp"] not in seen]
+    cands.sort(key=lambda x: x.get("published_at") or "", reverse=True)
+    cands.sort(key=lambda x: -x["weight"])          # 稳定排序：先强相关，再按时间倒序
+
+    strong_n = sum(1 for c in cands if c["weight"] >= 2)
+    print(f"  抓取 {len(items)} 条 | 候选 {len(cands)} 条"
+          f"（强相关 {strong_n} / 弱相关 {len(cands) - strong_n}，合并近似标题 {merged} 条）"
+          + ("" if args.all else "，已剔除看过的"))
+    if not cands:
+        print("  没有新候选。想重新看已筛过的加 --all；想换词加 --keyword。")
+        return 0
+
+    for i, it in enumerate(cands, 1):
+        tag = "!" if it["weight"] >= 2 else "·"
+        extra = f"  自选股 {','.join(it['codes'])}" if it.get("codes") else ""
+        dup = f"  x{it['dup_count']}" if it.get("dup_count", 1) > 1 else ""
+        print(f"  [{i}]{tag} {it['published_at']} {it['source']}  ← {','.join(it['hits'])}{extra}{dup}")
+        print(f"      {it['title']}")
+    print("  （! = 政策/行业/自选股相关，· = 公司或市场面）")
+
+    if not args.pick:
+        if args.dry_run:
+            print("\n  --dry-run：不记录看过状态。")
+        else:
+            n = event_feed.mark(cands, "shown")
+            print(f"\n  已记录 {n} 条为「看过」，下次默认不再出现（--all 可回看）。")
+        print("  要把某条转成事件：--pick 序号 --stock 代码 [--industry 行业] [--yes]")
+        return 0
+
+    idxs = []
+    for part in args.pick.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if not part.isdigit() or not (1 <= int(part) <= len(cands)):
+            print(f"[x] 序号越界: {part}", file=sys.stderr)
+            return 2
+        idxs.append(int(part))
+
+    chosen, failed = [], []
+    for idx in idxs:
+        it = cands[idx - 1]
+        print(f"\n  —— 抽取第 {idx} 条 ——")
+        print(f"  原标题: {it['title']}")
+        try:
+            event, usage = events_store.extract_event(event_feed.to_event_text(it))
+        except Exception as e:
+            print(f"  [x] 抽取失败: {e}", file=sys.stderr)
+            failed.append(it)
+            continue
+        print(f"  date     : {event['date']}")
+        print(f"  title    : {event['title']}")
+        print(f"  direction: {event['direction']}")
+        print(f"  source   : {event['source']}")
+        print(f"  summary  : {event['summary']}")
+        if usage:
+            print(f"  token    : {usage.get('prompt_tokens')} + {usage.get('completion_tokens')}")
+        chosen.append((it, event))
+
+    if not chosen:
+        return 1
+    if not args.yes:
+        print("\n  预览模式：确认无误后加 --yes 才会写库。")
+        return 0
+
+    for it, ev in chosen:
+        eid, created, links = events_store.add_event(
+            ev["date"], ev["title"], ev["summary"], ev["direction"], ev["source"], it["url"],
+            stocks=args.stock, industries=args.industry)
+        print(f"  [{'新建' if created else '已存在'}] event_id={eid} 关联 {links} 条 ← {it['title'][:30]}")
+
+    event_feed.mark([it for it, _ in chosen], "accepted")
+    used = {it["fp"] for it, _ in chosen}
+    rest = [c for c in cands if c["fp"] not in used]
+    if rest:
+        event_feed.mark(rest, "skipped")
+    print("  当前库:", events_store.stats())
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description="政策事件中心 CLI")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -167,6 +284,25 @@ def main():
 
     p = sub.add_parser("repair", help="清理孤儿关联（event 已删、link 残留）")
     p.set_defaults(func=cmd_repair)
+
+    p = sub.add_parser("link", help="给已有事件补挂标的")
+    p.add_argument("--id", type=int, required=True)
+    p.add_argument("--stock", action="append")
+    p.add_argument("--industry", action="append")
+    p.set_defaults(func=cmd_link)
+
+    p = sub.add_parser("feed", help="抓财经快讯 → 关键词筛 → 候选（--pick 转事件，--yes 才写库）")
+    p.add_argument("--source", action="append", choices=["eastmoney", "sina"], help="可重复；默认两个源")
+    p.add_argument("--limit", type=int, default=50)
+    p.add_argument("--keyword", action="append", help="额外筛词，可重复")
+    p.add_argument("--all", action="store_true", help="包含已看过的")
+    p.add_argument("--strong", action="store_true", help="只要政策/行业/自选股相关的")
+    p.add_argument("--dry-run", action="store_true", help="不记录看过状态")
+    p.add_argument("--pick", help="要转成事件的序号，如 2,5")
+    p.add_argument("--stock", action="append")
+    p.add_argument("--industry", action="append")
+    p.add_argument("--yes", action="store_true", help="确认写库")
+    p.set_defaults(func=cmd_feed)
 
     args = ap.parse_args()
     return args.func(args)

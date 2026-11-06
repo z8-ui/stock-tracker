@@ -4,8 +4,13 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{{ app_name }} - {% block title %}首页{% endblock %}</title>
-    <!-- ECharts 从 CDN 加载，不需要 npm -->
-    <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+    <!-- ECharts：优先用本地 vendor（离线/被墙也能出图），缺失时回退 CDN -->
+    <script src="/static/vendor/echarts.min.js"></script>
+    <script>
+        if (typeof echarts === "undefined") {
+            document.write('<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"><\/script>');
+        }
+    </script>
     <link rel="stylesheet" href="/static/css/style.css">
 </head>
 <body>
@@ -28,6 +33,9 @@
         </a>
         <a href="/valuation" class="nav-link {% if request.path == '/valuation' %}active{% endif %}">
             估值偏离
+        </a>
+        <a href="/events" class="nav-link {% if request.path == '/events' %}active{% endif %}">
+            政策事件
         </a>
         <a href="/ai" class="nav-link {% if request.path == '/ai' %}active{% endif %}">
             AI分析
