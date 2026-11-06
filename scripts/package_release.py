@@ -39,13 +39,19 @@ EXCLUDE_FILES = {
     "ai_cache.json",            # AI 分析结果缓存
     ".DS_Store", "Thumbs.db",
 }
+# 文件名前缀：剪掉（config_local.py.bak / config_local_backup.txt / .env.local 一律不带走）
+EXCLUDE_PREFIXES = ("config_local", ".env", ".netrc", "id_rsa")
 # 文件名后缀：剪掉
-EXCLUDE_SUFFIXES = (".pyc", ".pyo", ".bak", ".log", ".tmp", ".swp")
+EXCLUDE_SUFFIXES = (".pyc", ".pyo", ".bak", ".log", ".tmp", ".swp",
+                    ".db", ".sqlite", ".sqlite3", ".zip", ".pem", ".key", ".crt", ".p12")
 
 # 疑似密钥：sk- 开头 / ark- 开头（火山方舟）/ 常见 key= 赋值
 SECRET_PATTERNS = [
     ("deepseek/openai", re.compile(rb"sk-[A-Za-z0-9]{20,}")),
     ("volcengine-ark", re.compile(rb"ark-[A-Za-z0-9-]{20,}")),
+    ("key-assignment", re.compile(
+        rb"(?i)(api[_-]?key|access[_-]?token|secret[_-]?key|auth[_-]?token)"
+        rb"\s*[:=]\s*['\"]?[A-Za-z0-9_\-]{16,}")),
 ]
 MAX_SCAN_BYTES = 8 * 1024 * 1024   # 超过 8MB 的文件不整读（本项目没有这么大的源码）
 
@@ -55,7 +61,8 @@ def iter_files():
     for dirpath, dirnames, filenames in os.walk(ROOT):
         dirnames[:] = sorted(d for d in dirnames if d not in EXCLUDE_DIRS)
         for fn in sorted(filenames):
-            if fn in EXCLUDE_FILES or fn.endswith(EXCLUDE_SUFFIXES):
+            if fn in EXCLUDE_FILES or fn.startswith(EXCLUDE_PREFIXES) \
+                    or fn.lower().endswith(EXCLUDE_SUFFIXES):
                 continue
             abs_p = os.path.join(dirpath, fn)
             rel_p = os.path.relpath(abs_p, ROOT).replace(os.sep, "/")
