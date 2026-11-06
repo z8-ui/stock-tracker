@@ -39,6 +39,8 @@ def cmd_seed(args):
 def cmd_stats(args):
     s = events_store.stats()
     print(f"  事件 {s['events']} 条 | 关联 {s['links']} 条 | 覆盖个股 {s['stocks']} 只 | 行业 {s['industries']} 个")
+    if s.get("orphan_links"):
+        print(f"  [!] 孤儿关联 {s['orphan_links']} 条（event 已删但 link 残留，可跑 repair 清理）")
     print(f"  库文件: {s['db']}")
     return 0
 
@@ -114,6 +116,15 @@ def cmd_archive(args):
     return 0
 
 
+def cmd_repair(args):
+    conn = events_store.connect()
+    n = conn.execute("DELETE FROM event_links WHERE event_id NOT IN (SELECT id FROM events)").rowcount
+    conn.commit()
+    conn.close()
+    print(f"  [v] 清理孤儿关联 {n} 条")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description="政策事件中心 CLI")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -153,6 +164,9 @@ def main():
     p.add_argument("--id", type=int, required=True)
     p.add_argument("--status", default="archived", choices=["archived", "active"])
     p.set_defaults(func=cmd_archive)
+
+    p = sub.add_parser("repair", help="清理孤儿关联（event 已删、link 残留）")
+    p.set_defaults(func=cmd_repair)
 
     args = ap.parse_args()
     return args.func(args)

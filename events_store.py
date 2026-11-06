@@ -279,6 +279,9 @@ def stats(conn=None):
     s = {
         "events": conn.execute("SELECT COUNT(*) FROM events").fetchone()[0],
         "links": conn.execute("SELECT COUNT(*) FROM event_links").fetchone()[0],
+        # 孤儿关联：event 已被删但 link 还在（外部用裸 sqlite3 连接删数据时会漏掉 cascade）
+        "orphan_links": conn.execute(
+            "SELECT COUNT(*) FROM event_links WHERE event_id NOT IN (SELECT id FROM events)").fetchone()[0],
         "stocks": conn.execute("SELECT COUNT(DISTINCT target_key) FROM event_links WHERE target_type='stock'").fetchone()[0],
         "industries": conn.execute("SELECT COUNT(DISTINCT target_key) FROM event_links WHERE target_type='industry'").fetchone()[0],
         "db": db_path(),
