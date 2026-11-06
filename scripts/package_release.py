@@ -30,6 +30,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXCLUDE_DIRS = {
     ".git", ".venv", "venv", "stock-venv", "__pycache__", "dist", "build",
     ".idea", ".vscode", ".pytest_cache", "node_modules", ".mypy_cache",
+    "data",                     # 本地 SQLite（政策事件库），属于运行时数据
 }
 # 文件：按名剪掉
 EXCLUDE_FILES = {
