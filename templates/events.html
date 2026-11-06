@@ -2,6 +2,15 @@
 {% block title %}政策事件时间线{% endblock %}
 
 {% block content %}
+<style>
+    /* 本页表格有横向滚动容器，内容宽度会随筛选结果变化；
+       base 的 main 是 flex 子项，宽度会跟着内容收缩 → 点柱子筛完整页左右抖一下。
+       固定成 100% 后图表位置稳定，连点同一根柱子才不会点到旁边那根。 */
+    main.container { width: 100%; box-sizing: border-box; }
+    #events-table { width: 100%; max-width: 100%; }
+    #events-table table { min-width: 860px; }
+</style>
+
 <div class="card">
     <div class="card-header">
         政策事件时间线
@@ -22,6 +31,11 @@
             <option value="">全部</option>
         </select>
         <button id="events-refresh" class="btn">刷新</button>
+        <span id="events-month-chip" style="visibility:hidden;background:#16233d;border:1px solid #253656;
+              border-radius:14px;padding:2px 10px;font-size:12px;color:#a8b8d8;">
+            <span id="events-month-text"></span>
+            <a href="#" id="events-month-clear" style="color:#ef5350;text-decoration:none;margin-left:6px;">×</a>
+        </span>
         <span class="hint" id="events-asof"></span>
     </div>
     <div id="events-stats" style="display:flex;gap:12px;flex-wrap:wrap;"></div>

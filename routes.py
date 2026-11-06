@@ -6,6 +6,7 @@ from flask import Blueprint, render_template, jsonify, request
 from collections import defaultdict
 from time import time
 from datetime import datetime
+import re
 from data_service import (
     get_market_flow, get_sector_flow,
     get_stock_money_flow, get_stock_valuation, search_stock,
@@ -411,9 +412,12 @@ def api_event_timeline():
         days = 365
     days = max(30, min(days, 3650))
     industry = (request.args.get("industry") or "").strip() or None
+    month = (request.args.get("month") or "").strip() or None
+    if month and not re.fullmatch(r"\d{4}-\d{2}", month):
+        month = None
     try:
         import events_store
-        data = events_store.timeline(days=days, industry=industry)
+        data = events_store.timeline(days=days, industry=industry, month=month)
     except Exception as e:
         return jsonify({"code": 500, "msg": f"事件库读取失败: {type(e).__name__}: {e}"})
     data["days"] = days

@@ -167,5 +167,32 @@ class TestExtract(unittest.TestCase):
                 events_store.extract_event("x", api_key="", poster=lambda *a, **k: {})
 
 
+class TestMonthFilter(EventStoreCase):
+    def test_timeline_month_filters_events_only(self):
+        events_store.add_event("2026-08-27", "八月的事", stocks=["000657"], industries=["小金属"])
+        events_store.add_event("2026-06-10", "六月的事", stocks=["000657"], industries=["小金属"])
+        events_store.add_event("2025-02-04", "去年的事", stocks=["000657"], industries=["小金属"])
+
+        t = events_store.timeline(days=800, month="2026-08")
+        self.assertEqual(t["month"], "2026-08")
+        self.assertEqual(len(t["events"]), 1)
+        self.assertEqual(t["events"][0]["title"], "八月的事")
+        self.assertEqual(t["month_total"], 1)
+        self.assertEqual(t["total"], 3)          # 全局口径不受月份筛选影响
+        self.assertEqual(sum(t["series"][0]["data"]), 3)
+
+    def test_timeline_month_with_industry(self):
+        events_store.add_event("2026-08-27", "钨的事", stocks=["000657"], industries=["小金属"])
+        events_store.add_event("2026-08-28", "酒的事", stocks=["600519"], industries=["白酒"])
+        t = events_store.timeline(days=800, industry="小金属", month="2026-08")
+        self.assertEqual([e["title"] for e in t["events"]], ["钨的事"])
+
+    def test_list_events_month(self):
+        events_store.add_event("2026-08-27", "A", stocks=["000657"])
+        events_store.add_event("2026-09-01", "B", stocks=["000657"])
+        rows = events_store.list_events(month="2026-08", code="000657")
+        self.assertEqual([r["title"] for r in rows], ["A"])
+
+
 if __name__ == "__main__":
     unittest.main()

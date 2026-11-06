@@ -6,6 +6,20 @@ const EVT_COLORS = ['#ef5350', '#42a5f5', '#ffb74d', '#26a69a', '#ab47bc',
                     '#66bb6a', '#ff7043', '#5c6bc0', '#26c6da', '#d4e157'];
 let evtTimelineChart = null;
 let evtIndustryChart = null;
+let evtMonth = '';          // 点柱子选中的月份（YYYY-MM），空串=不筛
+let evtMonths = [];         // 当前图表的月份轴，供点击回查
+
+function evtRenderChip() {
+    const chip = document.getElementById('events-month-chip');
+    const text = document.getElementById('events-month-text');
+    if (!chip) return;
+    if (evtMonth) {
+        text.textContent = `已筛 ${evtMonth}`;
+        chip.style.visibility = 'visible';
+    } else {
+        chip.style.visibility = 'hidden';   // 用 visibility 占位，避免筛选时工具栏变高把图表顶走
+    }
+}
 
 function evtSetStatus(text, color) {
     const el = document.getElementById('status-events');
@@ -52,6 +66,7 @@ function evtRenderTimeline(data) {
     const dom = document.getElementById('chart-events-timeline');
     if (!dom) return;
     evtTimelineChart = evtTimelineChart || echarts.init(dom);
+    evtMonths = data.months || [];
     const series = data.series.map((s, i) => ({
         name: s.name,
         type: 'bar',
@@ -59,7 +74,13 @@ function evtRenderTimeline(data) {
         barMaxWidth: 26,
         emphasis: { focus: 'series' },
         itemStyle: { color: EVT_COLORS[i % EVT_COLORS.length] },
-        data: s.data,
+        // 选中某个月时，其它月份调暗，避免"筛了但看不出来"
+        data: evtMonth
+            ? s.data.map((v, j) => ({
+                value: v,
+                itemStyle: { opacity: evtMonths[j] === evtMonth ? 1 : 0.3 },
+            }))
+            : s.data,
     }));
     evtTimelineChart.setOption({
         backgroundColor: 'transparent',
@@ -80,6 +101,17 @@ function evtRenderTimeline(data) {
         },
         series: series.length ? series : [{ type: 'bar', data: [] }],
     }, true);
+
+    // 点柱子 → 筛该月事件；再点同一个月取消
+    if (!evtTimelineChart.__evtClickBound) {
+        evtTimelineChart.on('click', function (p) {
+            const m = evtMonths[p.dataIndex];
+            if (!m) return;
+            evtMonth = evtMonth === m ? '' : m;
+            evtLoad();
+        });
+        evtTimelineChart.__evtClickBound = true;
+    }
 }
 
 function evtRenderIndustry(data) {
@@ -108,10 +140,16 @@ function evtRenderIndustry(data) {
 function evtRenderTable(data) {
     const box = document.getElementById('events-table');
     const countEl = document.getElementById('events-count');
-    if (countEl) countEl.textContent = `共 ${data.events.length} 条（最近在前）`;
+    if (countEl) {
+        countEl.textContent = data.month
+            ? `${data.month} 共 ${data.events.length} 条（点柱子切换月份，或点 × 取消筛选）`
+            : `共 ${data.events.length} 条（最近在前 · 点柱子可只看某月）`;
+    }
     if (!box) return;
     if (!data.events.length) {
-        box.innerHTML = '<div style="color:#8892b0;padding:14px;font-size:13px;">该范围内没有事件。先用 events_cli.py 录入或 feed 抓取。</div>';
+        box.innerHTML = '<div style="color:#8892b0;padding:14px;font-size:13px;">' +
+            (data.month ? `${data.month} 没有事件（再点一次柱子可取消筛选）。`
+                        : '该范围内没有事件。先用 events_cli.py 录入或 feed 抓取。') + '</div>';
         return;
     }
     const rows = data.events.map(e => `
@@ -151,7 +189,8 @@ function evtLoad() {
     const industry = document.getElementById('events-industry').value;
     evtSetStatus('加载中…');
     const url = `/api/event-timeline?days=${encodeURIComponent(days)}` +
-                (industry ? `&industry=${encodeURIComponent(industry)}` : '');
+                (industry ? `&industry=${encodeURIComponent(industry)}` : '') +
+                (evtMonth ? `&month=${encodeURIComponent(evtMonth)}` : '');
     fetch(url)
         .then(r => r.json())
         .then(res => {
@@ -168,6 +207,7 @@ function evtLoad() {
             }
             evtRenderTable(data);
             if (!industry) evtRenderIndustryOptions(data);
+            evtRenderChip();
             document.getElementById('events-asof').textContent =
                 `统计区间 ${data.since} 起 · ${new Date().toLocaleTimeString('zh-CN')}`;
             if (typeof echarts === 'undefined') {
@@ -183,6 +223,11 @@ document.addEventListener('DOMContentLoaded', function () {
     document.getElementById('events-refresh').addEventListener('click', evtLoad);
     document.getElementById('events-days').addEventListener('change', evtLoad);
     document.getElementById('events-industry').addEventListener('change', evtLoad);
+    document.getElementById('events-month-clear').addEventListener('click', function (ev) {
+        ev.preventDefault();
+        evtMonth = '';
+        evtLoad();
+    });
     evtLoad();
     window.addEventListener('resize', function () {
         if (evtTimelineChart) evtTimelineChart.resize();

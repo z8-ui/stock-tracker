@@ -36,3 +36,6 @@ ai_cache.json
 
 # 政策事件中心 SQLite 库（本地数据，不入库）
 data/
+
+# 每日 feed 日志
+logs/

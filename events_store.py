@@ -188,7 +188,8 @@ def seed_from_static(conn=None, verbose=False):
 
 # ---------------------------------------------------------------- 读
 
-def list_events(limit=50, code=None, industry=None, status="active", since=None, conn=None):
+def list_events(limit=50, code=None, industry=None, status="active", since=None,
+                month=None, conn=None):
     own = conn is None
     conn = conn or connect()
     sql = ("SELECT e.*, GROUP_CONCAT(l.target_type || ':' || l.target_key) AS targets "
@@ -210,6 +211,9 @@ def list_events(limit=50, code=None, industry=None, status="active", since=None,
     if since:
         where.append("e.event_date >= ?")
         args.append(str(since))
+    if month:
+        where.append("substr(e.event_date,1,7) = ?")
+        args.append(str(month))
     if where:
         sql += "WHERE " + " AND ".join(where) + " "
     sql += "GROUP BY e.id ORDER BY e.event_date DESC, e.id DESC LIMIT ?"
@@ -274,7 +278,7 @@ def notes_for(code, industry_name="", limit=20, conn=None):
     return out
 
 
-def timeline(days=365, industry=None, max_months=24, conn=None):
+def timeline(days=365, industry=None, month=None, max_months=24, conn=None):
     """事件时间线：按月 × 行业聚合（给 /events 页面用）
 
     计数口径：COUNT(DISTINCT event_id)——一条事件挂 4 只钨股 + 1 个行业，行业维度只记 1 次，
@@ -333,7 +337,8 @@ def timeline(days=365, industry=None, max_months=24, conn=None):
     for ind in sorted(per_ind, key=lambda k: -sum(per_ind[k].values())):
         series.append({"name": ind, "data": [per_ind[ind].get(ym, 0) for ym in months]})
 
-    events = list_events(limit=80, industry=industry, since=since, conn=conn)
+    events = list_events(limit=200 if month else 80, industry=industry,
+                         since=since, month=month, conn=conn)
     if own:
         conn.close()
     return {
@@ -344,6 +349,8 @@ def timeline(days=365, industry=None, max_months=24, conn=None):
         "industries": [{"name": s["name"], "total": sum(s["data"])} for s in series],
         "events": events,
         "since": since,
+        "month": month,
+        "month_total": len(events),
     }
 
 
