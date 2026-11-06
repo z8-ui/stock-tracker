@@ -739,30 +739,48 @@ def get_industry_pe(stock_code, refresh=False):
 
 
 def get_stock_valuation(stock_code, refresh=False):
-    """个股估值（refresh=True 时强制穿透行业PE/财报缓存重新拉取）"""
+    """个股估值（refresh=True 时强制穿透行业PE/财报缓存重新拉取）
+
+    2026-11：PE 缺失不再用行业 PE 顶替。
+    原实现 pe == 0 时执行 pe = industry_pe，偏离度于是恒等于 0、结论永远"合理"——
+    等于把"算不出来"伪装成"估值正常"，亏损股会被判成最健康的那一类。
+    现在 PE <= 0 直接给 None + level="数据不可用" + valuation_available=False。
+    """
     quote = get_stock_quote(stock_code)
     if not quote:
         return None
 
-    pe = quote.get("pe", 0)
-    pb = quote.get("pb", 0)
+    pe = quote.get("pe", 0) or 0
+    pb = quote.get("pb", 0) or 0
     ind = get_industry_pe(stock_code, refresh=refresh)
     industry_pe = ind["pe"]
+    industry_name = ind.get("industry", "未知")
 
-    if pe == 0:
-        pe = industry_pe
-
-    deviation_pe = round((pe - industry_pe) / industry_pe * 100, 1)
+    if pe > 0 and industry_pe:
+        deviation_pe = round((pe - industry_pe) / industry_pe * 100, 1)
+        level = "偏高" if deviation_pe > 20 else ("偏低" if deviation_pe < -20 else "合理")
+        reason = ""
+        available = True
+    else:
+        deviation_pe = None
+        level = "数据不可用"
+        available = False
+        reason = ("PE 缺失（亏损股 / 停牌 / 行情源未返回），无法计算估值偏离"
+                  if pe <= 0 else "行业 PE 不可用，无法计算偏离度")
 
     result = {
-        "pe": round(pe, 2),
-        "pb": round(pb, 2),
-        "pe_ttm": round(pe, 2),
+        "pe": round(pe, 2) if pe > 0 else None,
+        "pb": round(pb, 2) if pb else 0,
+        "pe_ttm": round(pe, 2) if pe > 0 else None,
+        # 腾讯行情 f39 本身就是市盈率(TTM)，与 pe 同源同口径，这里显式说明，避免被当成两个独立指标
+        "pe_ttm_note": "与 PE 同源（腾讯行情 f39 = 市盈率TTM），非独立口径",
         "industry_pe": industry_pe,
-        "industry_name": ind.get("industry", "未知"),
+        "industry_name": industry_name,
         "industry_pe_source": ind.get("source", "unknown"),
         "deviation_pe": deviation_pe,
-        "level": "偏高" if deviation_pe > 20 else ("偏低" if deviation_pe < -20 else "合理"),
+        "level": level,
+        "level_reason": reason,
+        "valuation_available": available,
         "date": datetime.now().strftime("%Y-%m-%d"),
     }
 
@@ -914,8 +932,11 @@ def estimate_intrinsic_value(stock_quote):
     取不到财报才退回 价格/PE 反推；
     行业PE 优先东财动态板块PE，失败退回 INDUSTRY_PE_MAP 静态映射表。
     内在价值 = 年化EPS × 行业PE × 0.8（安全边际）
+
+    2026-11：原实现 EPS 取不到时 intrinsic = price，偏离度恒为 0 ——
+    等于用股价自证"合理"。现在直接返回 available=False + 原因，不再伪造一致。
     """
-    pe = stock_quote.get("pe", 25) or 25
+    pe = stock_quote.get("pe", 0) or 0
     price = stock_quote.get("price", 0)
     code = stock_quote.get("code", "")
 
@@ -923,27 +944,45 @@ def estimate_intrinsic_value(stock_quote):
     industry_pe = ind["pe"]
     industry_name = ind.get("industry", "未知")
 
-    # EPS：优先最新财报（按报告期年化）
+    # EPS：优先最新财报（按报告期年化）；亏损（EPS<=0）不适用 PE 估算法
     eps, eps_source = 0, "none"
     fin = get_latest_financials(code)
-    if fin and fin.get("eps"):
+    if fin and fin.get("eps") not in (None, ""):
         try:
-            eps = float(fin["eps"])
-            month = int((fin.get("report_date") or "12")[5:7])
-            annual_factor = {3: 4, 6: 2, 9: 4 / 3, 12: 1}.get(month, 1)
-            eps = round(eps * annual_factor, 3)
-            eps_source = "quarterly_report"
+            raw_eps = float(fin["eps"])
+            if raw_eps > 0:
+                month = int((fin.get("report_date") or "12")[5:7])
+                annual_factor = {3: 4, 6: 2, 9: 4 / 3, 12: 1}.get(month, 1)
+                eps = round(raw_eps * annual_factor, 3)
+                eps_source = "quarterly_report"
+            else:
+                eps_source = "report_nonpositive"
         except Exception:
             eps = 0
-    if not eps and pe and price:
+    if not eps and pe > 0 and price:
+        # 用当前 PE 反推 EPS：数学上等价于"比较个股PE与行业PE"，不是真实财报值，来源要标清
         eps = round(price / pe, 3)
         eps_source = "price_pe_derived"
 
-    intrinsic = round(eps * industry_pe * 0.8, 2) if eps else price
+    if not eps or not industry_pe:
+        reason = ("最新财报 EPS ≤ 0（亏损），PE 估算法不适用" if eps_source == "report_nonpositive"
+                  else "缺少可用的 EPS / 行业 PE，无法估算内在价值")
+        return {
+            "price": price, "intrinsic_value": None, "gap": None,
+            "available": False, "reason": reason,
+            "pe": round(pe, 2) if pe > 0 else None,
+            "industry_pe": industry_pe, "industry_name": industry_name,
+            "eps": None, "eps_source": eps_source,
+            "financials": fin,
+        }
+
+    intrinsic = round(eps * industry_pe * 0.8, 2)
     return {
         "price": price, "intrinsic_value": intrinsic,
-        "gap": round((price - intrinsic) / intrinsic * 100, 1) if intrinsic else 0,
-        "pe": pe, "industry_pe": industry_pe,
+        "gap": round((price - intrinsic) / intrinsic * 100, 1) if intrinsic else None,
+        "available": True, "reason": "",
+        "pe": round(pe, 2) if pe > 0 else None,
+        "industry_pe": industry_pe,
         "industry_name": industry_name,
         "eps": eps, "eps_source": eps_source,
         "financials": fin,

@@ -170,15 +170,22 @@ function loadStockVal(code, name, refresh) {
         if (valRes.code === 200) {
             var d = valRes.data;
             renderValuationGauge('chart-valuation', d);
-            var levelColor = d.level === '偏高' ? '#ef5350' : (d.level === '偏低' ? '#26a69a' : '#ffb74d');
+            // 2026-11: PE 缺失（亏损/停牌）时后端给 null，这里必须显示"不可用"而不是 null/0
+            var NA = '<span style="color:#8892b0;">不可用</span>';
+            var isNum = function(v) { return v !== null && v !== undefined; };
+            var levelColor = d.level === '偏高' ? '#ef5350' : (d.level === '偏低' ? '#26a69a' : (d.level === '数据不可用' ? '#8892b0' : '#ffb74d'));
+            var devTxt = isNum(d.deviation_pe)
+                ? '<span style="color:' + levelColor + ';font-weight:bold;">' + (d.deviation_pe > 0 ? '+' : '') + d.deviation_pe + '%</span>'
+                : NA;
             document.getElementById('valuation-detail').innerHTML = wlBtn + refreshBtn +
-                '<div class="summary-row"><span class="label">PE (市盈率)</span><span class="value">' + d.pe + '</span></div>' +
-                '<div class="summary-row"><span class="label">PB (市净率)</span><span class="value">' + d.pb + '</span></div>' +
-                '<div class="summary-row"><span class="label">PE-TTM</span><span class="value">' + d.pe_ttm + '</span></div>' +
-                '<div class="summary-row"><span class="label">行业平均 PE（' + (d.industry_name || '未知') + '）</span><span class="value">' + d.industry_pe + '</span></div>' +
+                '<div class="summary-row"><span class="label">PE (市盈率)</span><span class="value">' + (isNum(d.pe) ? d.pe : NA) + '</span></div>' +
+                '<div class="summary-row"><span class="label">PB (市净率)</span><span class="value">' + (isNum(d.pb) ? d.pb : NA) + '</span></div>' +
+                '<div class="summary-row"><span class="label">PE-TTM</span><span class="value">' + (isNum(d.pe_ttm) ? d.pe_ttm : NA) + '</span></div>' +
+                '<div class="summary-row"><span class="label">行业平均 PE（' + (d.industry_name || '未知') + '）</span><span class="value">' + (isNum(d.industry_pe) ? d.industry_pe : NA) + '</span></div>' +
                 '<hr>' +
-                '<div class="summary-row"><span class="label">偏离度</span><span class="value" style="color:'+levelColor+';font-weight:bold;">' + (d.deviation_pe > 0 ? '+' : '') + d.deviation_pe + '%</span></div>' +
-                '<div class="summary-row"><span class="label">结论</span><span class="value" style="color:'+levelColor+';font-weight:bold;">' + d.level + '</span></div>' +
+                '<div class="summary-row"><span class="label">偏离度</span><span class="value">' + devTxt + '</span></div>' +
+                '<div class="summary-row"><span class="label">结论</span><span class="value" style="color:' + levelColor + ';font-weight:bold;">' + d.level + '</span></div>' +
+                (d.level_reason ? '<p style="color:#ffb74d;font-size:12px;margin-top:6px;">' + d.level_reason + '</p>' : '') +
                 '<p style="color:#8892b0;font-size:12px;margin-top:6px;">行业PE来源：' + (d.industry_pe_source === 'eastmoney' ? '东财实时板块' : '静态参考（实时获取失败）') + '</p>';
 
             // 2026-08: 财报快照 + 政策事件（估值偏离需结合最新季报与产业政策）
@@ -189,14 +196,22 @@ function loadStockVal(code, name, refresh) {
         if (ivRes.code === 200) {
             var d = ivRes.data;
             renderIntrinsicValue('chart-intrinsic', d);
-            var gapColor = d.gap > 0 ? '#ef5350' : '#26a69a';
-            document.getElementById('intrinsic-detail').innerHTML =
-                '<div class="summary-row"><span class="label">当前股价</span><span class="value">' + d.price.toFixed(2) + '</span></div>' +
-                '<div class="summary-row"><span class="label">内在价值（估算）</span><span class="value">' + d.intrinsic_value.toFixed(2) + '</span></div>' +
-                '<div class="summary-row"><span class="label">每股收益 EPS</span><span class="value">' + d.eps + '</span></div>' +
-                '<hr>' +
-                '<div class="summary-row"><span class="label">偏离</span><span class="value" style="color:'+gapColor+';font-weight:bold;">' + (d.gap > 0 ? '+' : '') + d.gap + '%</span></div>' +
-                '<div class="summary-row"><span class="label">判断</span><span class="value" style="color:'+gapColor+';font-weight:bold;">' + (d.gap < -10 ? '低估' : (d.gap > 10 ? '高估' : '合理')) + '</span></div>';
+            var priceTxt = (d.price || 0).toFixed(2);
+            if (d.available === false || d.intrinsic_value === null || d.intrinsic_value === undefined) {
+                // 不再用股价顶替内在价值（否则偏离恒为 0，等于自证"合理"）
+                document.getElementById('intrinsic-detail').innerHTML =
+                    '<div class="summary-row"><span class="label">当前股价</span><span class="value">' + priceTxt + '</span></div>' +
+                    '<p style="color:#ffb74d;font-size:12px;margin-top:6px;">' + (d.reason || '缺少可用的 EPS / 行业 PE，无法估算内在价值') + '</p>';
+            } else {
+                var gapColor = d.gap > 0 ? '#ef5350' : '#26a69a';
+                document.getElementById('intrinsic-detail').innerHTML =
+                    '<div class="summary-row"><span class="label">当前股价</span><span class="value">' + priceTxt + '</span></div>' +
+                    '<div class="summary-row"><span class="label">内在价值（估算）</span><span class="value">' + d.intrinsic_value.toFixed(2) + '</span></div>' +
+                    '<div class="summary-row"><span class="label">每股收益 EPS</span><span class="value">' + d.eps + '</span></div>' +
+                    '<hr>' +
+                    '<div class="summary-row"><span class="label">偏离</span><span class="value" style="color:'+gapColor+';font-weight:bold;">' + (d.gap > 0 ? '+' : '') + d.gap + '%</span></div>' +
+                    '<div class="summary-row"><span class="label">判断</span><span class="value" style="color:'+gapColor+';font-weight:bold;">' + (d.gap < -10 ? '低估' : (d.gap > 10 ? '高估' : '合理')) + '</span></div>';
+            }
         }
 
         // 斐波那契回调线

@@ -116,16 +116,24 @@ def build_valuation_chart(stock_name, val_data, industry_pe=25):
     个股估值偏离 → 对比条图
     val_data: {"pe": 30, "pb": 5, "pe_ttm": 28}
     industry_pe: 行业平均 PE（后端直接拿不到就写固定值，后续可优化）
+    2026-11: pe 为 None（亏损/停牌）时不再拿行业 PE 顶替，偏离度给 None，
+    前端据此显示「数据不可用」而不是「合理」。
     """
     if not val_data:
         return None
 
-    pe = val_data.get("pe", 0)
+    pe = val_data.get("pe")
     pb = val_data.get("pb", 0)
-    pe_ttm = val_data.get("pe_ttm", 0)
+    pe_ttm = val_data.get("pe_ttm")
 
-    # 偏离度计算: (个股PE - 行业平均PE) / 行业平均PE * 100%
-    deviation_pe = round((pe - industry_pe) / industry_pe * 100, 1) if industry_pe else 0
+    if pe is None or not industry_pe:
+        deviation_pe = None
+        level = "数据不可用"
+    else:
+        # 偏离度计算: (个股PE - 行业平均PE) / 行业平均PE * 100%
+        deviation_pe = round((pe - industry_pe) / industry_pe * 100, 1)
+        # 偏离等级
+        level = "偏高" if deviation_pe > 20 else ("偏低" if deviation_pe < -20 else "合理")
 
     return {
         "title": f"{stock_name} 估值分析",
@@ -133,8 +141,10 @@ def build_valuation_chart(stock_name, val_data, industry_pe=25):
         "pe": pe,
         "pb": pb,
         "pe_ttm": pe_ttm,
+        "pe_ttm_note": val_data.get("pe_ttm_note", ""),
         "industry_pe": industry_pe,
         "deviation_pe": deviation_pe,
-        # 偏离等级
-        "level": "偏高" if deviation_pe > 20 else ("偏低" if deviation_pe < -20 else "合理")
+        "level": level,
+        "available": pe is not None,
+        "level_reason": val_data.get("level_reason", ""),
     }

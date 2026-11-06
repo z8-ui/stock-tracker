@@ -270,6 +270,21 @@ function renderValuationGauge(domId, data) {
     const chart = getChart(domId);
     if (!chart) return;
 
+    // 亏损股/停牌：PE 缺失时不再拿行业 PE 顶替，直接显式提示"数据不可用"
+    if (data.pe === null || data.pe === undefined || data.deviation_pe === null || data.deviation_pe === undefined) {
+        chart.clear();
+        chart.setOption({
+            title: {
+                text: '估值数据不可用',
+                subtext: data.level_reason || 'PE 缺失（亏损股 / 停牌），无法计算偏离度',
+                left: 'center', top: '38%',
+                textStyle: { color: '#ffb74d', fontSize: 15 },
+                subtextStyle: { color: '#8892b0', fontSize: 11 }
+            }
+        });
+        return;
+    }
+
     chart.setOption({
         title: { text: data.title, textStyle: { color: '#e0e0e0', fontSize: 14 } },
         tooltip: { trigger: 'axis' },
@@ -368,6 +383,21 @@ function renderFibonacci(domId, fib, klines) {
 function renderIntrinsicValue(domId, data) {
     const chart = getChart(domId);
     if (!chart) return;
+
+    // EPS/行业PE 不可得时后端返回 intrinsic_value=null（不再用股价顶替）
+    if (data.available === false || data.intrinsic_value === null || data.intrinsic_value === undefined) {
+        chart.clear();
+        chart.setOption({
+            title: {
+                text: '内在价值不可用',
+                subtext: data.reason || '缺少可用的 EPS / 行业 PE',
+                left: 'center', top: '38%',
+                textStyle: { color: '#ffb74d', fontSize: 15 },
+                subtextStyle: { color: '#8892b0', fontSize: 11 }
+            }
+        });
+        return;
+    }
 
     var color = data.gap > 0 ? '#ef5350' : '#26a69a';
     chart.setOption({
