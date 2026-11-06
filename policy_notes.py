@@ -153,7 +153,18 @@ def get_policy_notes(code, industry_name=""):
 
     code:            股票代码
     industry_name:   行业名（来自 get_industry_pe），用于附加行业级提示
+
+    2026-11：优先读 events_store（SQLite 事件中心），DB 不存在/为空/出错时回退下面的
+    静态字典——页面不会因为 DB 挂了变空白，但新事件应该录进 DB。
     """
+    try:
+        from events_store import notes_for
+        db_notes = notes_for(code, industry_name)
+        if db_notes:
+            return db_notes
+    except Exception:
+        pass
+
     notes = list(POLICY_NOTES.get(code, []))
     for kw, ind_notes in INDUSTRY_POLICY.items():
         if industry_name and kw in industry_name:

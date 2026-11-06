@@ -33,3 +33,6 @@ _data_cache.json
 
 # AI 分析结果缓存（本地文件，避免重复调用 DeepSeek）
 ai_cache.json
+
+# 政策事件中心 SQLite 库（本地数据，不入库）
+data/

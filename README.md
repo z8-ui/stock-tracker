@@ -92,7 +92,7 @@ python app.py
 ## 🧪 测试与打包
 
 ```bash
-# 单元测试（26 个用例，纯离线，不依赖 pytest）
+# 单元测试（38 个用例，纯离线，不依赖 pytest）
 python3 -m unittest discover -s tests -v
 
 # 打发布包（排除 .git/.venv/__pycache__/config_local.py/*_cache.json，
@@ -134,6 +134,39 @@ EPS 取不到时内在价值返回 `null`，不再用股价顶替。
 1. **抓取时间来自磁盘。** 缓存结构是 `{__data, fetched_at}`，重启后不会把几天前的快照标成"刚刚获取"；旧格式缓存条目会显示"抓取时间未知"，不猜。
 2. **模拟数据必须可识别。** 任何降级分支返回的数都带 `is_mock=true`，图表副标题显示"⚠️ 模拟数据（非真实成交）"；默认 `ALLOW_MOCK_FALLBACK=False`，接口挂了就显示"暂无数据"。
 3. **"算不出来"就说算不出来。** 亏损股的 PE、缺失的 EPS 一律返回 `null` + 原因，不用行业均值或股价凑一个"合理"出来——宁可空白，不给假结论。
+
+## 📰 政策事件中心（SQLite）
+
+估值页的「政策与事件」原来读 `policy_notes.py` 里的硬编码字典——加一条要改代码、重启服务，
+没来源 URL、没状态，同一条事件要在 4 只股票里各抄一份文案。现在改为 SQLite 两张表：
+
+```
+events        事件本体：event_date / title / summary / direction / source / source_url / fingerprint / status
+event_links   关联：target_type = stock | industry，target_key = 股票代码或行业名
+```
+
+一条「美国禁止废钨出口」只存一份文案，挂 4 只钨股 + 1 个行业（`event_links` 5 行），改一次全站生效。
+去重靠 `fingerprint = sha1(日期|标题)`，同一事件换个标的重录不会多一行。
+
+```bash
+python3 scripts/events_cli.py seed                       # 把老字典导入（幂等，已跑：4 事件 / 15 关联）
+python3 scripts/events_cli.py stats                      # 库内统计
+python3 scripts/events_cli.py list --code 000657          # 某只股票挂的事件
+python3 scripts/events_cli.py add --date 2026-11-07 --title "…" --summary "…" \
+        --direction 利好 --source "财联社" --stock 000657 --industry 小金属
+python3 scripts/events_cli.py add-text --file news.txt --stock 000657   # 粘新闻→模型抽→预览
+python3 scripts/events_cli.py add-text --file news.txt --stock 000657 --yes   # 确认写库
+python3 scripts/events_cli.py archive --id 5             # 归档（不删数据，页面立即不显示）
+```
+
+两条规则：
+
+1. **读写分离。** 页面永远先读 DB；DB 不存在/为空/出错时自动回退 `policy_notes.py` 静态字典，
+   DB 挂了页面不会变空白。所以 `policy_notes.py` 现在只是 fallback + seed 源，不用再手改。
+2. **AI 只做初稿。** `add-text` 调 DeepSeek 抽成 JSON 后只打印预览，加 `--yes` 才写库；
+   提示词明确要求「原文没有的数字一律不要编」。实测一条新闻：242 prompt + 78 completion token。
+
+库文件 `data/events.db`，已加入 `.gitignore`（本地数据不入库）。
 
 ## 📡 数据来源（全部免费公开接口）
 
