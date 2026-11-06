@@ -147,10 +147,17 @@ class TestWeightAndDedupe(FeedCase):
         self.assertEqual(by_title["某公司发布业绩预告"]["weight"], 1)
 
     def test_watchlist_code_marks_strong(self):
-        cands = event_feed.screen([self._item("000657 发布公告")], keywords=[])
+        # 不依赖 config_local（发布包里没有它），把自选池固定成 000657
+        with mock.patch.object(event_feed, "_watch_codes", return_value={"000657"}):
+            cands = event_feed.screen([self._item("000657 发布公告")], keywords=[])
         self.assertEqual(len(cands), 1)
         self.assertEqual(cands[0]["codes"], ["000657"])
         self.assertEqual(cands[0]["weight"], 2)      # 自选股代码命中 → 强相关
+
+    def test_watchlist_code_without_config(self):
+        with mock.patch.object(event_feed, "_watch_codes", return_value=set()):
+            cands = event_feed.screen([self._item("000657 发布公告")], keywords=[])
+        self.assertEqual(cands, [])
 
     def test_dedupe_near_duplicates(self):
         items = [
