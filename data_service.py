@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from policy_notes import get_policy_notes
+from config import ALLOW_MOCK_FALLBACK
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -384,7 +385,9 @@ def get_sector_flow():
             except:
                 pass
         # 兜底模拟：使用真实大盘涨跌幅 + 板块特性分布
-        if not result:
+        # ⚠️ 默认关闭（ALLOW_MOCK_FALLBACK=False）：失败就返回 None 让页面显示"暂无数据"，
+        #    不再把随机数当真实资金流展示
+        if not result and ALLOW_MOCK_FALLBACK:
             market_change = _get_market_change()
             random.seed(datetime.now().strftime("%Y%m%d"))
             # 板块分类：成长/周期/防御 各有不同弹性
@@ -481,55 +484,67 @@ def get_stock_quote(stock_code):
 
 
 # ==============================================================
-#  4. 个股资金流向（基于真实成交额的模拟趋势）
+#  4. 个股资金流向（东方财富 fflow/daykline 真实数据）
+#  2026-11 改造：原实现用 random.seed 按成交额编造一条"看起来像"的曲线，
+#  接口又不带任何 mock 标记，等于把模拟数据当真实数据展示。现改为真实逐日资金流。
 # ==============================================================
 
-def get_stock_money_flow(stock_code):
-    """个股资金流向趋势"""
-    quote = get_stock_quote(stock_code)
-    if not quote:
-        return None
+def _fflow_secid(stock_code):
+    """东财 secid：沪市(6/9) 用 1.，深市/北交所 用 0."""
+    return f"{'1' if stock_code.startswith(('6', '9')) else '0'}.{stock_code}"
 
-    turnover = max(quote.get("turnover", 1), 0.1)
-    random.seed(int(stock_code) + int(datetime.now().timestamp() / 86400))
 
-    dates = []
-    super_large = []
-    large = []
-    middle = []
-    small = []
+def get_stock_money_flow(stock_code, days=20):
+    """个股近 days 个交易日资金流向（东方财富 fflow/daykline，单位：亿元）
 
-    today = datetime.now()
-    for i in range(20):
-        day = today - timedelta(days=(19 - i))
-        while day.weekday() >= 5:
-            day -= timedelta(days=1)
-        dates.append(day.strftime("%m-%d"))
+    字段对应（东财返回，单位元）：
+      f51 日期 / f52 主力净额 / f53 小单 / f54 中单 / f55 大单 / f56 超大单
+    主力 = 大单 + 超大单（已对 13 只自选股逐日核对一致）
+    返回 {dates, flows:{super_large,large,middle,small}, unit, is_mock}
+    接口失败返回 None → 路由显示"暂无数据"，不再随机兜底
+    """
+    def fetch():
+        text = _get(
+            "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get",
+            {"lmt": "0", "klt": "101", "secid": _fflow_secid(stock_code),
+             "fields1": "f1,f2,f3,f7", "fields2": "f51,f52,f53,f54,f55,f56"},
+            timeout=10)
+        if not text:
+            return None
+        try:
+            klines = (json.loads(text).get("data") or {}).get("klines") or []
+        except Exception:
+            return None
+        if not klines:
+            return None
 
-        t = turnover / 20 * random.uniform(0.7, 1.3)
-        sl = round(t * random.uniform(0.15, 0.35), 2)
-        lg = round(t * random.uniform(0.1, 0.25), 2)
-        md = round(-t * random.uniform(0.1, 0.2), 2)
-        sm = round(-t * random.uniform(0.15, 0.3), 2)
+        def yi(v):
+            """元 → 亿元（前端 Y 轴/tooltip 都是亿元）"""
+            try:
+                return round(float(v) / 1e8, 2)
+            except (TypeError, ValueError):
+                return 0.0
 
-        # 趋势一致性：相邻日期不要突变
-        if super_large and abs(sl - super_large[-1]) > abs(super_large[-1]) * 0.5:
-            sl = round(super_large[-1] * random.uniform(0.7, 1.3), 2)
+        out = {"dates": [], "flows": {"super_large": [], "large": [], "middle": [], "small": []}}
+        for row in [k.split(",") for k in klines][-days:]:
+            if len(row) < 5:
+                continue
+            out["dates"].append(row[0][5:] if len(row[0]) >= 10 else row[0])  # YYYY-MM-DD → MM-DD
+            out["flows"]["small"].append(yi(row[2]))
+            out["flows"]["middle"].append(yi(row[3]))
+            out["flows"]["large"].append(yi(row[4]))
+            # 老接口可能只给到 f55，此时用 主力 - 大单 反推超大单
+            super_large = yi(row[5]) if len(row) > 5 else round(yi(row[1]) - yi(row[4]), 2)
+            out["flows"]["super_large"].append(super_large)
+        if not out["dates"]:
+            return None
+        out["unit"] = "亿元"
+        out["is_mock"] = False
+        return out
 
-        super_large.append(sl)
-        large.append(lg)
-        middle.append(md)
-        small.append(sm)
-
-    return {
-        "dates": dates,
-        "flows": {
-            "super_large": super_large,
-            "large": large,
-            "middle": middle,
-            "small": small
-        }
-    }
+    return _cached_get(f"stockflow_hist_{stock_code}", fetch,
+                       validate_fn=lambda x: bool(x and x.get("dates")),
+                       source="eastmoney", ttl=300)
 
 
 # ==============================================================
@@ -847,17 +862,17 @@ def get_index_history(index_code, days=30):
         resp = requests.get(url, params={"param": f"{market}{index_code},day,{start},{end},{days},qfq"},
                           headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
         data = resp.json()
-        if not data.get("data"): return _mock_index_history(index_code, days)
+        if not data.get("data"): return _mock_index_history(index_code, days) if ALLOW_MOCK_FALLBACK else None
         
         klines = (data["data"].get(f"{market}{index_code}", {}).get("day", []) or
                   data["data"].get(f"{market}{index_code}", {}).get("qfqday", []))
-        if not klines or len(klines) < 5: return _mock_index_history(index_code, days)
+        if not klines or len(klines) < 5: return _mock_index_history(index_code, days) if ALLOW_MOCK_FALLBACK else None
         
         return [{"date": k[0], "open": round(float(k[1]), 2), "close": round(float(k[2]), 2),
                  "high": round(float(k[3]), 2), "low": round(float(k[4]), 2),
                  "volume": int(float(k[5])) if len(k) > 5 else 0} for k in klines]
     except:
-        return _mock_index_history(index_code, days)
+        return _mock_index_history(index_code, days) if ALLOW_MOCK_FALLBACK else None
 
 
 def _mock_index_history(index_code, days=30):
@@ -947,7 +962,7 @@ def get_sector_valuation():
               "fltt": "2", "invt": "2", "fid": "f3",
               "fs": "m:90+t:2", "fields": "f14,f2,f3,f9,f20,f23,f25,f37"}
     text = _get(url, params)
-    if not text: return _mock_sector_valuation()
+    if not text: return _mock_sector_valuation() if ALLOW_MOCK_FALLBACK else None
     try:
         data = json.loads(text)
         result = []
@@ -961,9 +976,9 @@ def get_sector_valuation():
                                    "pb": round(float(pb), 2) if pb else 0,
                                    "change": round(float(change), 2) if change else 0,
                                    "market_cap": round(float(mc) / 1e8, 2) if mc else 0})
-        return result if result else _mock_sector_valuation()
+        return result if result else (_mock_sector_valuation() if ALLOW_MOCK_FALLBACK else None)
     except:
-        return _mock_sector_valuation()
+        return _mock_sector_valuation() if ALLOW_MOCK_FALLBACK else None
 
 
 def _mock_sector_valuation():

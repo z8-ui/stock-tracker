@@ -233,7 +233,9 @@ function renderStockFlow(domId, data) {
     chart.setOption({
         title: {
             text: data.title,
-            textStyle: { color: '#e0e0e0', fontSize: 14 }
+            subtext: data.subtitle || '',
+            textStyle: { color: '#e0e0e0', fontSize: 14 },
+            subtextStyle: { color: data.is_mock ? '#ffb74d' : '#8892b0', fontSize: 11 }
         },
         tooltip: { trigger: 'axis' },
         legend: {

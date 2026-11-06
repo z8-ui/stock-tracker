@@ -10,6 +10,11 @@ SERVER_PORT = 5000
 #    本地开发想开调试(自动重载+错误堆栈), 在 config_local.py 里加一行 DEBUG = True 即可
 DEBUG = False
 
+# 行情接口失败时，是否允许用随机数编造数据兜底
+# ⚠️ 默认 False：宁可页面显示「暂无数据」，也不把模拟数据当真实数据展示
+#    （做离线演示时可以临时改成 True，页面上会带「模拟数据」标记）
+ALLOW_MOCK_FALLBACK = False
+
 # 页面标题
 APP_NAME = "A股追踪系统"
 

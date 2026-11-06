@@ -4,6 +4,7 @@
 """
 
 from config import COLORS, HEATMAP_COLORS
+from datetime import datetime
 
 
 def build_market_flow_chart(flow_data):
@@ -72,12 +73,14 @@ def build_heatmap_chart(sectors):
 def build_stock_flow_chart(stock_name, flow_data):
     """
     个股资金流向 → 双柱状图数据（净流入/流出）
+    数据来自东方财富逐日资金流（单位亿元）；is_mock=True 时前端必须显式标注"模拟数据"
     """
     if not flow_data:
         return None
 
     dates = flow_data["dates"]
     f = flow_data["flows"]
+    is_mock = bool(flow_data.get("is_mock"))
 
     # 转为正负值：净流入为正，净流出为负
     series = [
@@ -87,11 +90,24 @@ def build_stock_flow_chart(stock_name, flow_data):
         {"name": "小单",   "data": [round(v, 2) for v in f["small"]]},
     ]
 
+    # 抓取时间（_cached_get 注入的 _asof 是 epoch 秒）
+    asof_txt = ""
+    try:
+        asof_txt = datetime.fromtimestamp(flow_data["_asof"]).strftime("%m-%d %H:%M")
+    except (KeyError, TypeError, ValueError, OSError):
+        pass
+    subtitle = "⚠️ 模拟数据（非真实成交）" if is_mock else "数据源：东方财富逐日资金流 · 亿元"
+    if asof_txt and not is_mock:
+        subtitle += f" · 抓取 {asof_txt}"
+
     return {
-        "title": f"{stock_name} 资金流向（近20日）",
+        "title": f"{stock_name} 资金流向（近{len(dates)}日）",
+        "subtitle": subtitle,
         "dates": dates,
         "series": series,
-        "colors": [COLORS["主力净流入"], COLORS["主力净流入"], COLORS["主力净流出"], COLORS["主力净流出"]]
+        "colors": [COLORS["主力净流入"], COLORS["主力净流入"], COLORS["主力净流出"], COLORS["主力净流出"]],
+        "is_mock": is_mock,
+        "data_date": dates[-1] if dates else "",
     }
 
 

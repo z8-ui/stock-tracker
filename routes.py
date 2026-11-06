@@ -148,7 +148,7 @@ def api_stock_flow():
     chart = build_stock_flow_chart(name, data)
     if chart:
         return jsonify({"code": 200, "data": chart})
-    return jsonify({"code": 500, "msg": "非交易日无详细资金流数据"})
+    return jsonify({"code": 500, "msg": "暂无资金流数据（东财逐日资金流接口未返回，非随机填充）"})
 
 
 @bp.route("/api/stock-real-flow")
