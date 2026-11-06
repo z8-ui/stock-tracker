@@ -97,8 +97,8 @@ def build_stock_flow_chart(stock_name, flow_data):
     except (KeyError, TypeError, ValueError, OSError):
         pass
     subtitle = "⚠️ 模拟数据（非真实成交）" if is_mock else "数据源：东方财富逐日资金流 · 亿元"
-    if asof_txt and not is_mock:
-        subtitle += f" · 抓取 {asof_txt}"
+    if not is_mock:
+        subtitle += f" · 抓取 {asof_txt}" if asof_txt else " · 抓取时间未知"
 
     return {
         "title": f"{stock_name} 资金流向（近{len(dates)}日）",

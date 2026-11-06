@@ -89,6 +89,29 @@ python app.py
 > 可选：想用 AI 分析，创建 `config_local.py` 写入
 > `DEEPSEEK_API_KEY = "sk-..."` 即可（该文件已被 .gitignore 排除，不会误传 GitHub）。
 
+## 🧪 测试与打包
+
+```bash
+# 单元测试（23 个用例，纯离线，不依赖 pytest）
+python3 -m unittest discover -s tests -v
+
+# 打发布包（排除 .git/.venv/__pycache__/config_local.py/*_cache.json，
+# 并在入包前 + 出包后各扫一次密钥，命中即中止）
+python3 scripts/package_release.py --dry-run
+python3 scripts/package_release.py          # 输出到 dist/
+```
+
+数据诚信相关的开关（`config.py`，可用 `config_local.py` 覆盖）：
+
+| 配置 | 默认 | 说明 |
+|------|------|------|
+| `ALLOW_MOCK_FALLBACK` | `False` | 行情接口失败时**不**用随机数编造数据，页面显示"暂无数据"；做离线演示才改 `True`（页面会标"模拟数据"） |
+| `DEBUG` | `False` | `True` 时服务强制只绑 `127.0.0.1`（Werkzeug 调试器等于任意代码执行入口，不随 `0.0.0.0` 暴露） |
+
+估值口径说明：个股 PE 缺失（亏损/停牌）时返回 `pe=null` + `level="数据不可用"`，
+**不再**用行业 PE 顶替（顶替会让偏离度恒为 0、结论永远"合理"）；
+EPS 取不到时内在价值返回 `null`，不再用股价顶替。
+
 ## 📡 数据来源（全部免费公开接口）
 
 | 接口 | 用途 | 稳定性 |
@@ -96,6 +119,7 @@ python app.py
 | 腾讯行情 qt.gtimg.cn | 个股/指数实时行情 | ⭐⭐⭐⭐⭐ |
 | 腾讯历史K线 web.ifzq.gtimg.cn | 指数/个股K线（EMA/斐波那契/画线） | ⭐⭐⭐⭐⭐ |
 | 东方财富 push2.eastmoney.com | 板块资金流向 / 行业实时PE / F10财报 | ⭐⭐⭐ |
+| 东方财富 fflow/daykline | 个股逐日资金流（近 20 日真实曲线） | ⭐⭐⭐⭐ |
 | DeepSeek API | AI 分析（可选，自备 key） | ⭐⭐⭐⭐ |
 
 ## ⚠️ 免责声明

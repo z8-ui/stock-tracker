@@ -173,7 +173,10 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
 
     def _inject(value, asof):
         if isinstance(value, dict):
+            # 浅拷贝：不把 _asof 写回缓存本体，否则同一份数据每读一次就把时间刷成"现在"
+            value = dict(value)
             value["_asof"] = asof
+            value["_asof_known"] = asof is not None
             value["_market_status"] = status
             if source:
                 value["_source"] = source
@@ -182,15 +185,25 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
     def _store(value):
         _IN_MEMORY_CACHE[cache_key] = {"data": value, "time": now}
         _LAST_SUCCESS[cache_key] = now
-        cache[cache_key] = value
+        # 2026-11: 落盘时连抓取时间一起存。原实现只存数据，
+        # 重启后 _LAST_SUCCESS 为空 → 旧数据被标成"刚刚获取"（前端显示的抓取时间全是假的）
+        cache[cache_key] = {"__data": value, "fetched_at": now}
         _save_cache(cache)
         return value
 
     def _file_cache():
-        val = cache.get(cache_key)
-        if val is not None:
-            return _inject(val, _LAST_SUCCESS.get(cache_key, now))
-        return None
+        raw = cache.get(cache_key)
+        if raw is None:
+            return None
+        if isinstance(raw, dict) and "__data" in raw:
+            val, fetched_at = raw["__data"], raw.get("fetched_at")
+        else:
+            # 旧格式（有数据、无时间戳）：不猜时间，asof=None 表示"抓取时间未知"
+            val, fetched_at = raw, None
+        if fetched_at:
+            # 重启后把落盘的抓取时间补回内存，/api/ready 与前端时间戳才有依据
+            _LAST_SUCCESS.setdefault(cache_key, fetched_at)
+        return _inject(val, fetched_at)
 
     # 强制刷新：跳过所有缓存层，同步拉取并写回
     if force:
