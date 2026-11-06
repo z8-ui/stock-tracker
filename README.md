@@ -92,7 +92,7 @@ python app.py
 ## 🧪 测试与打包
 
 ```bash
-# 单元测试（23 个用例，纯离线，不依赖 pytest）
+# 单元测试（26 个用例，纯离线，不依赖 pytest）
 python3 -m unittest discover -s tests -v
 
 # 打发布包（排除 .git/.venv/__pycache__/config_local.py/*_cache.json，
