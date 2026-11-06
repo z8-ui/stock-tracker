@@ -222,10 +222,9 @@ def api_ai_analysis():
     name = request.args.get("name", "贵州茅台")
     market = request.args.get("market", "")
     refresh = request.args.get("refresh", "") == "1"
-    # 前端填入的临时 key(header 优先, 避免 key 出现在 URL/日志; 为空回退 config_local)
+    # 页面传入的临时 key 只从 Header 取，不再接受 ?api_key=
+    # （URL 会落进浏览器历史 / 代理日志 / Flask access log，等于把 key 写进一堆明文文件）
     api_key = (request.headers.get("X-AI-Key") or "").strip()
-    if not api_key:
-        api_key = (request.args.get("api_key") or "").strip()
     if market == "us":
         return jsonify({"code": 400, "msg": "美股暂不支持 AI 技术分析（K线数据源限制），可搜索 A股/港股/指数/基金"})
     from ai_analysis import analyze
