@@ -16,6 +16,37 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import data_service as d  # noqa: E402
 
 
+class TestNum(unittest.TestCase):
+    """东财缺值 "-" 不能炸掉整批数据。"""
+
+    def test_dash_and_blank(self):
+        self.assertEqual(d._num("-"), 0.0)
+        self.assertEqual(d._num("--"), 0.0)
+        self.assertEqual(d._num(None), 0.0)
+        self.assertEqual(d._num(""), 0.0)
+        self.assertEqual(d._num("1.5"), 1.5)
+        self.assertEqual(d._num("bad", 7.0), 7.0)
+
+
+class TestSectorValuationParse(unittest.TestCase):
+    def test_dash_pb_does_not_kill_batch(self):
+        payload = {"data": {"diff": [
+            {"f14": "视频媒体", "f9": 153.49, "f23": "-", "f3": 6.25, "f20": 65157205000},
+            {"f14": "银行", "f9": 6.1, "f23": 0.7, "f3": 0.5, "f20": 1e12},
+        ]}}
+        with mock.patch.object(d, "_get", return_value=json.dumps(payload)):
+            rows = d.get_sector_valuation()
+        self.assertEqual(len(rows), 2)          # 以前整个循环会因 float("-") 抛异常
+        self.assertEqual(rows[0]["pb"], 0.0)
+        self.assertEqual(rows[1]["pb"], 0.7)
+
+    def test_loss_sector_skipped(self):
+        payload = {"data": {"diff": [{"f14": "亏损板块", "f9": -12.0, "f23": 2.0,
+                                      "f3": 1.0, "f20": 1e10}]}}
+        with mock.patch.object(d, "_get", return_value=json.dumps(payload)):
+            self.assertIsNone(d.get_sector_valuation())
+
+
 class TestSecid(unittest.TestCase):
     def test_market_prefix(self):
         self.assertEqual(d._fflow_secid("600519"), "1.600519")   # 沪市

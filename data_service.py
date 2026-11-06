@@ -358,6 +358,22 @@ def get_market_flow():
 #  2. 板块热力图（固定板块 + 模拟涨跌）
 # ==============================================================
 
+def _num(v, default=0.0):
+    """东财接口的缺值用 "-" / None / "" 表示，统一转 float。
+
+    2026-11：get_sector_valuation 原来对整个 diff 循环套一个 try，
+    只要有一行 f23（市净率）返回 "-"，float("-") 就抛异常，
+    整批 60 个板块直接掉进模拟兜底——模拟一关就变成整页 500。
+    现在逐字段安全转换，一行坏值只影响那一行。
+    """
+    if v is None or v == "" or v == "-" or v == "--":
+        return default
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
 # 固定板块列表（A股行业板块）
 SECTOR_LIST = [
     "银行", "保险", "证券", "房地产开发", "半导体",
@@ -387,13 +403,13 @@ def get_sector_flow():
                 if data.get("data") and data["data"].get("diff"):
                     for row in data["data"]["diff"]:
                         name = row.get("f14", "")
-                        change = row.get("f3", 0)
-                        flow = row.get("f62", 0)
-                        if name and change is not None:
+                        change = _num(row.get("f3"))
+                        flow = _num(row.get("f62"))
+                        if name:
                             result.append({
                                 "name": name,
-                                "change": round(float(change), 2),
-                                "flow": round(float(flow) / 1e8, 2)
+                                "change": round(change, 2),
+                                "flow": round(flow / 1e8, 2)
                             })
             except:
                 pass
@@ -1020,14 +1036,14 @@ def get_sector_valuation():
         result = []
         if data.get("data") and data["data"].get("diff"):
             for row in data["data"]["diff"]:
-                name = row.get("f14", ""); pe = row.get("f9", 0)
-                pb = row.get("f23", 0); change = row.get("f3", 0)
-                mc = row.get("f20", 0)
-                if name and pe:
-                    result.append({"name": name, "pe": round(float(pe), 2) if pe else 0,
-                                   "pb": round(float(pb), 2) if pb else 0,
-                                   "change": round(float(change), 2) if change else 0,
-                                   "market_cap": round(float(mc) / 1e8, 2) if mc else 0})
+                name = row.get("f14", "")
+                pe, pb = _num(row.get("f9")), _num(row.get("f23"))
+                change, mc = _num(row.get("f3")), _num(row.get("f20"))
+                if name and pe > 0:      # 亏损板块（PE 为 "-" / 负数）不进 PE 气泡图，否则会扭曲对比
+                    result.append({"name": name, "pe": round(pe, 2),
+                                   "pb": round(pb, 2),
+                                   "change": round(change, 2),
+                                   "market_cap": round(mc / 1e8, 2)})
         return result if result else (_mock_sector_valuation() if ALLOW_MOCK_FALLBACK else None)
     except:
         return _mock_sector_valuation() if ALLOW_MOCK_FALLBACK else None
