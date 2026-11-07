@@ -29,6 +29,7 @@ policy_notes.py 是硬编码字典：加一条事件要改代码 + 重启服务�
 import hashlib
 import json
 import os
+import re
 import sqlite3
 from datetime import datetime
 
@@ -48,6 +49,13 @@ CREATE TABLE IF NOT EXISTS events (
     source_url  TEXT NOT NULL DEFAULT '',
     fingerprint TEXT NOT NULL UNIQUE,
     status      TEXT NOT NULL DEFAULT 'active',
+    occurred_at TEXT,
+    published_at TEXT,
+    collected_at TEXT,
+    impact_level  TEXT NOT NULL DEFAULT '待确认',
+    mechanism     TEXT NOT NULL DEFAULT '',
+    evidence      TEXT NOT NULL DEFAULT '',
+    review_status TEXT NOT NULL DEFAULT 'pending',
     created_at  TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS event_links (
@@ -55,6 +63,7 @@ CREATE TABLE IF NOT EXISTS event_links (
     event_id    INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
     target_type TEXT NOT NULL,
     target_key  TEXT NOT NULL,
+    relation_type TEXT NOT NULL DEFAULT '',
     UNIQUE(event_id, target_type, target_key)
 );
 CREATE INDEX IF NOT EXISTS idx_events_date  ON events(event_date DESC);
@@ -81,9 +90,72 @@ def init_db(conn=None):
     own = conn is None
     conn = conn or connect()
     conn.executescript(SCHEMA)
+    _ensure_columns(conn)
     conn.commit()
     if own:
         conn.close()
+
+
+def _ensure_columns(conn):
+    """老库补列（SQLite 加列可空，不动历史数据）。
+
+    occurred_at  : 事件实际发生日期（YYYY-MM-DD）或 NULL —— 不知道就是 NULL
+    published_at : 来源发布时间（YYYY-MM-DD HH:MM）或 NULL
+    collected_at : 系统采集时间（YYYY-MM-DD HH:MM:SS），只在入库时写一次
+    impact_level / mechanism / evidence / review_status :
+                   个股政策分析所需的五个字段（2026-11 新增）。
+                   老数据的默认值是"待确认"/空，不是"利好"——宁可显示待确认，
+                   也不能凭空给一条没人核实过的结论。
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(events)").fetchall()}
+    for name, decl in (("occurred_at", "TEXT"), ("published_at", "TEXT"),
+                       ("collected_at", "TEXT"),
+                       ("impact_level", "TEXT NOT NULL DEFAULT '待确认'"),
+                       ("mechanism", "TEXT NOT NULL DEFAULT ''"),
+                       ("evidence", "TEXT NOT NULL DEFAULT ''"),
+                       ("review_status", "TEXT NOT NULL DEFAULT 'pending'")):
+        if name not in cols:
+            conn.execute(f"ALTER TABLE events ADD COLUMN {name} {decl}")
+    # 回填：老数据只有一个 event_date，只能视为“发生日期”（当时的口径）；
+    # collected_at 用 created_at；published_at 不知道，保持 NULL，不拿别的字段冒充。
+    conn.execute("UPDATE events SET occurred_at = event_date "
+                 "WHERE occurred_at IS NULL AND event_date <> ''")
+    conn.execute("UPDATE events SET collected_at = created_at WHERE collected_at IS NULL")
+
+    # event_links.relation_type：股票直连=direct，行业=industry（老数据按目标类型回填）
+    lcols = {r[1] for r in conn.execute("PRAGMA table_info(event_links)").fetchall()}
+    if "relation_type" not in lcols:
+        conn.execute("ALTER TABLE event_links ADD COLUMN relation_type TEXT NOT NULL DEFAULT ''")
+        conn.execute("UPDATE event_links SET relation_type='direct' "
+                     "WHERE relation_type='' AND target_type='stock'")
+        conn.execute("UPDATE event_links SET relation_type='industry' "
+                     "WHERE relation_type='' AND target_type='industry'")
+
+
+def _norm_date(value):
+    """只接受 YYYY-MM-DD；空/非法 → None（绝不返回今天）。"""
+    s = str(value or "").strip()[:10]
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        return None
+    try:
+        datetime.strptime(s, "%Y-%m-%d")
+        return s
+    except ValueError:
+        return None
+
+
+def _norm_datetime(value):
+    """接受 YYYY-MM-DD 或 YYYY-MM-DD HH:MM[[:SS]]；非法 → None。"""
+    s = str(value or "").strip()
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s[:len(s)], fmt).strftime(
+                "%Y-%m-%d %H:%M" if fmt != "%Y-%m-%d" else "%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
 
 
 def _fingerprint(event_date, title):
@@ -112,14 +184,31 @@ def _norm_targets(stocks=(), industries=()):
 
 # ---------------------------------------------------------------- 写
 
-def add_event(event_date, title, summary="", direction="中性", source="",
+def add_event(event_date=None, title=None, summary="", direction="中性", source="",
               source_url="", stocks=(), industries=(), status="active",
-              conn=None):
-    """新增一条事件并挂标的；已存在（同日期同标题）则只补挂缺失的标的。
+              occurred_at=None, published_at=None, collected_at=None, conn=None,
+              impact_level="待确认", mechanism="", evidence="", review_status="pending"):
+    """新增一条事件并挂标的；同日同标题已存在则只补挂缺失标的。
 
+    三个时间字段语义严格区分（2026-11 整改）：
+      occurred_at  : 事件发生时间，原文没写就是 None —— 绝不拿今天/采集时间补齐
+      published_at : 来源发布时间，可能只有日期，也可能是 None
+      collected_at : 入库时间，由本函数写，重启/重跑不变
+
+    impact_level / mechanism / evidence / review_status（2026-11 新增）：
+      没有可靠依据就保持 "待确认" / 空串 / "pending"，由人工或分析模块补，
+      这里不做任何推测性填充 —— 同行业 ≠ 直接受益。
+    审核状态只有人能改：CLI 里 --yes 入库的路径显式传 "approved"。
+
+    event_date 列保留为 NOT NULL 兼容老表：occurred_at 未知时写 ''，
+    绝不能为了满足约束塞今天。
     返回 (event_id, created: bool, new_links: int)
     """
-    event_date = (event_date or "").strip() or datetime.now().strftime("%Y-%m-%d")
+    occurred = _norm_date(occurred_at if occurred_at is not None else event_date)
+    published = _norm_datetime(published_at)
+    collected = _norm_datetime(collected_at) or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    legacy_date = occurred or ""
+
     title = (title or "").strip()
     if not title:
         raise ValueError("title 不能为空")
@@ -127,25 +216,44 @@ def add_event(event_date, title, summary="", direction="中性", source="",
     own = conn is None
     conn = conn or connect()
     init_db(conn)
-    fp = _fingerprint(event_date, title)
-    cur = conn.execute("SELECT id FROM events WHERE fingerprint = ?", (fp,))
+    # 指纹：有发生日期用发生日期，否则用发布时间；都没有就只按标题去重
+    fp = _fingerprint(occurred or (published or "")[:10], title)
+    cur = conn.execute("SELECT id, occurred_at, published_at, collected_at, "
+                       "event_date FROM events WHERE fingerprint = ?", (fp,))
     row = cur.fetchone()
     created = row is None
     if created:
         cur = conn.execute(
             "INSERT INTO events (event_date,title,summary,direction,source,source_url,"
-            "fingerprint,status,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-            (event_date, title, summary or "", _direction(direction), source or "",
-             source_url or "", fp, status, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+            "fingerprint,status,occurred_at,published_at,collected_at,"
+            "impact_level,mechanism,evidence,review_status,created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (legacy_date, title, summary or "", _direction(direction), source or "",
+             source_url or "", fp, status, occurred, published, collected,
+             impact_level or "待确认", mechanism or "", evidence or "",
+             review_status or "pending",
+             datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
         event_id = cur.lastrowid
     else:
         event_id = row["id"]
+        # 重复入库不覆盖已有信息：只补空字段（补出来的值也要有出处，否则不动）
+        updates = {}
+        if row["occurred_at"] is None and occurred:
+            updates["occurred_at"] = occurred
+            updates["event_date"] = occurred
+        if row["published_at"] is None and published:
+            updates["published_at"] = published
+        if updates:
+            sets = ",".join(f"{k}=?" for k in updates)
+            conn.execute(f"UPDATE events SET {sets} WHERE id=?",
+                         list(updates.values()) + [event_id])
 
     new_links = 0
     for ttype, tkey in _norm_targets(stocks, industries):
+        rel = "direct" if ttype == "stock" else "industry"
         try:
-            conn.execute("INSERT INTO event_links (event_id,target_type,target_key) VALUES (?,?,?)",
-                         (event_id, ttype, tkey))
+            conn.execute("INSERT INTO event_links (event_id,target_type,target_key,relation_type) "
+                         "VALUES (?,?,?,?)", (event_id, ttype, tkey, rel))
             new_links += 1
         except sqlite3.IntegrityError:
             pass    # 已挂过
@@ -168,7 +276,8 @@ def seed_from_static(conn=None, verbose=False):
             _, is_new, links = add_event(
                 n.get("date"), n.get("title"), n.get("impact", ""), n.get("direction"),
                 n.get("source", ""), n.get("source_url", ""),
-                stocks=[code], conn=conn)
+                stocks=[code], conn=conn,
+                evidence="静态策池（人工维护）", review_status="approved")
             created += int(is_new)
             linked += links
     for industry, notes in INDUSTRY_POLICY.items():
@@ -176,7 +285,8 @@ def seed_from_static(conn=None, verbose=False):
             _, is_new, links = add_event(
                 n.get("date"), n.get("title"), n.get("impact", ""), n.get("direction"),
                 n.get("source", ""), n.get("source_url", ""),
-                industries=[industry], conn=conn)
+                industries=[industry], conn=conn,
+                evidence="静态策池（行业级，非个股直连）", review_status="approved")
             created += int(is_new)
             linked += links
     if verbose:
@@ -189,9 +299,10 @@ def seed_from_static(conn=None, verbose=False):
 # ---------------------------------------------------------------- 读
 
 def list_events(limit=50, code=None, industry=None, status="active", since=None,
-                month=None, conn=None):
+                month=None, conn=None, include_undated=False):
     own = conn is None
     conn = conn or connect()
+    eff = _eff_date("e")
     sql = ("SELECT e.*, GROUP_CONCAT(l.target_type || ':' || l.target_key) AS targets "
            "FROM events e LEFT JOIN event_links l ON l.event_id = e.id ")
     where, args = [], []
@@ -209,14 +320,20 @@ def list_events(limit=50, code=None, industry=None, status="active", since=None,
         where.append("e.status = ?")
         args.append(status)
     if since:
-        where.append("e.event_date >= ?")
+        # 只看发生/发布时间（不再拿采集时间兜底）；未知日期的事件用 include_undated 单独放进来，
+        # 否则"不知道哪天发生"会被算成"今天刚发生"。
+        if include_undated:
+            where.append("(" + eff + " >= ? OR " + eff + " IS NULL)")
+        else:
+            where.append(eff + " >= ?")
         args.append(str(since))
     if month:
-        where.append("substr(e.event_date,1,7) = ?")
+        where.append("substr(" + eff + ",1,7) = ?")
         args.append(str(month))
     if where:
         sql += "WHERE " + " AND ".join(where) + " "
-    sql += "GROUP BY e.id ORDER BY e.event_date DESC, e.id DESC LIMIT ?"
+    sql += ("GROUP BY e.id ORDER BY COALESCE(NULLIF(e.occurred_at,''), "
+            "NULLIF(e.published_at,''), '') DESC, e.id DESC LIMIT ?")
     args.append(int(limit))
     rows = [dict(r) for r in conn.execute(sql, args).fetchall()]
     if own:
@@ -224,58 +341,153 @@ def list_events(limit=50, code=None, industry=None, status="active", since=None,
     return rows
 
 
-def notes_for(code, industry_name="", limit=20, conn=None):
-    """给估值页的接口：个股事件 + 行业事件（行业按关键词包含匹配，与老逻辑一致），去重后倒序。
+def db_state(conn=None):
+    """事件库状态：'unavailable'（没表/打不开）/ 'empty'（有表没数据）/ 'ok'
 
-    返回字段与 policy_notes 保持一致（date/title/impact/direction/source），前端零改动。
+    调用方靠这个区分"库挂了"和"库里确实没有事件"——两者的正确反应完全不同。
     """
+    own = conn is None
     try:
-        own = conn is None
         conn = conn or connect()
         has_table = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'").fetchone()
         if not has_table:
-            if own:
-                conn.close()
+            return "unavailable"
+        n = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        return "ok" if n else "empty"
+    except Exception:
+        return "unavailable"
+    finally:
+        if own and conn is not None:
+            conn.close()
+
+
+RELATION_LABEL = {
+    "direct": "直接影响",
+    "industry": "行业整体影响",
+    "industry_indirect": "产业链间接影响",
+    "news_only": "仅为一般新闻",
+}
+
+
+def policy_events_for(code, stock_name="", industry_name="", limit=30, conn=None):
+    """按个股返回政策事件（含关系类型 / 影响程度 / 机制 / 证据 / 审核状态）。
+
+    返回语义与 notes_for 一致：
+      None → 事件库不可用（没表/打不开）
+      []   → 库正常，但这只股票确实没有已关联的事件
+
+    关联优先级（高→低）：
+      1. direct            事件显式挂了这只股票的代码（人工/CLI 建立，最可靠）
+      2. industry          行业关键词命中该公司行业（行业级影响，**不是**个股直接受益）
+    不按"同行业"或"公司名出现在标题里"去凑关联：
+    两种都会把 A 公司的利好按到 B 公司头上，正是这次要绝掉的错误。
+
+    stock_name 只用于回显，不参与匹配；主营/产业链目前没有结构化字段，
+    因此不做产业链级别判定（宁可标 industry，也不编 indirect）。
+    """
+    own = conn is None
+    try:
+        conn = conn or connect()
+        has_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'").fetchone()
+        if not has_table:
             return None
 
-        rows = []
+        picked = {}
+
         if code:
-            rows += conn.execute(
-                "SELECT DISTINCT e.* FROM events e JOIN event_links l ON l.event_id=e.id "
-                "WHERE l.target_type='stock' AND l.target_key=? AND e.status='active'",
-                (str(code),)).fetchall()
+            for r in conn.execute(
+                    "SELECT e.*, l.target_key AS rel_key FROM events e "
+                    "JOIN event_links l ON l.event_id=e.id "
+                    "WHERE l.target_type='stock' AND l.target_key=? AND e.status='active'",
+                    (str(code),)).fetchall():
+                picked.setdefault(r["id"], ("direct", r))
+
         for r in conn.execute(
-                "SELECT DISTINCT e.* FROM events e JOIN event_links l ON l.event_id=e.id "
+                "SELECT e.*, l.target_key AS rel_key FROM events e "
+                "JOIN event_links l ON l.event_id=e.id "
                 "WHERE l.target_type='industry' AND e.status='active'").fetchall():
-            # 行业名是关键词（如"小金属"），行业全名可能是"小金属Ⅱ"
-            key = conn.execute("SELECT target_key FROM event_links WHERE event_id=? AND target_type='industry'",
-                               (r["id"],)).fetchone()
-            if key and industry_name and key["target_key"] in industry_name:
-                rows.append(r)
-        if own:
-            conn.close()
+            key = (r["rel_key"] or "")
+            if industry_name and key and key in industry_name:
+                picked.setdefault(r["id"], ("industry", r))
     except sqlite3.Error:
         return None
+    finally:
+        if own and conn is not None:
+            conn.close()
 
-    seen, out = set(), []
-    for r in sorted(rows, key=lambda x: (x["event_date"], x["id"]), reverse=True):
-        key = (r["event_date"], r["title"])
-        if key in seen:
-            continue
-        seen.add(key)
+    eff = lambda r: r["occurred_at"] or r["published_at"] or ""
+    order = {"direct": 0, "industry": 1, "industry_indirect": 2, "news_only": 3}
+
+    items = list(picked.values())
+    items.sort(key=lambda x: (eff(x[1]), x[1]["id"]), reverse=True)   # 先按时间倒序
+    items.sort(key=lambda x: order.get(x[0], 9))                      # 再按关系优先级（稳定排序）
+
+    out = []
+    for rel, r in items:
+        summary = r["summary"] or ""
+        if rel == "direct":
+            evidence = (r["evidence"] or
+                        f"关联依据：事件显式关联本股票（event_links.stock={r['rel_key']}）")
+        else:
+            evidence = (r["evidence"] or
+                        f"关联依据：行业关键词「{r['rel_key']}」命中公司行业「{industry_name}」"
+                        f"（行业级影响，不代表个股直接受益）")
         out.append({
-            "id": r["id"],
-            "date": r["event_date"],
+            "event_id": r["id"],
+            "id": r["id"],                 # 兼容老调用方（notes_for 原字段名）
             "title": r["title"],
-            "impact": r["summary"],
+            "summary": summary,
+            "occurred_at": r["occurred_at"],
+            "published_at": r["published_at"],
+            "collected_at": r["collected_at"],
+            "date_known": bool(r["occurred_at"]),
+            "date": r["occurred_at"],
+            "relation_type": rel,
+            "relation_label": RELATION_LABEL.get(rel, rel),
             "direction": r["direction"],
+            "impact_level": r["impact_level"] or "待确认",
+            "mechanism": r["mechanism"] or summary,
+            "evidence": evidence,
             "source": r["source"],
             "source_url": r["source_url"],
+            "review_status": r["review_status"] or "pending",
+            "impact": summary,
+            "origin": "db",
         })
-        if len(out) >= limit:
+        if len(out) >= int(limit):
             break
     return out
+
+
+def notes_for(code, industry_name="", limit=20, conn=None):
+    """给估值页的接口：个股事件 + 行业事件。
+
+    2026-11：改为 policy_events_for 的薄封装，字段保持 date/title/impact/direction/source
+    （前端零改动），同时多带关系类型/影响程度/机制/证据/审核状态。
+
+    返回 None 与 [] 语义不同（2026-11 整改）：
+      None → 事件库不可用（没有表/打不开）→ 调用方应回退静态字典
+      []   → 事件库正常，但这只股票确实没有有效事件（例如全部归档）→ 不得回退
+             否则归档掉的事件会从静态字典里"复活"到估值页面
+    """
+    evs = policy_events_for(code, industry_name=industry_name, limit=limit, conn=conn)
+    if evs is None:
+        return None
+    return evs
+
+
+def _eff_date(alias="e"):
+    """统计/筛选统一口径的 SQL 片段：发生时间 → 发布时间。
+
+    2026-11 修复：原来时间线用的是
+    COALESCE(occurred_at, published_at, collected_at)，把"我们知道这件事的时间"
+    当成"事件发生的时间"。后果是昨天抓到的、原文没写日期的新闻，会被统计成
+    "今天发生"，柱子位置和"事件总数"都对不上。
+    采集时间只在页面作为元信息展示，不参与任何日期统计。
+    """
+    return f"COALESCE(NULLIF({alias}.occurred_at,''), NULLIF({alias}.published_at,''))"
 
 
 def timeline(days=365, industry=None, month=None, max_months=24, conn=None):
@@ -283,6 +495,8 @@ def timeline(days=365, industry=None, month=None, max_months=24, conn=None):
 
     计数口径：COUNT(DISTINCT event_id)——一条事件挂 4 只钨股 + 1 个行业，行业维度只记 1 次，
     不会因为关联多而把柱子撑大。没有挂行业的事件单独归到「未分类」。
+    发生日期和发布日期都没有的事件不进任何月份，单独计入 undated（未知日期），
+    绝不因为 collected_at 是今天就记到本月。
     """
     from datetime import date, timedelta
 
@@ -291,12 +505,13 @@ def timeline(days=365, industry=None, month=None, max_months=24, conn=None):
     init_db(conn)
     today = date.today()
     since = (today - timedelta(days=int(days))).isoformat()
+    eff = _eff_date("e")
 
     per_ind = {}
     for r in conn.execute(
-            "SELECT substr(e.event_date,1,7) ym, l.target_key ind, COUNT(DISTINCT e.id) n "
+            "SELECT substr(" + eff + ",1,7) ym, l.target_key ind, COUNT(DISTINCT e.id) n "
             "FROM events e JOIN event_links l ON l.event_id=e.id "
-            "WHERE e.status='active' AND e.event_date>=? AND l.target_type='industry' "
+            "WHERE e.status='active' AND " + eff + ">=? AND l.target_type='industry' "
             + ("AND l.target_key=? " if industry else "") +
             "GROUP BY ym, ind", ([since, industry] if industry else [since])).fetchall():
         per_ind.setdefault(r["ind"], {})[r["ym"]] = r["n"]
@@ -304,8 +519,8 @@ def timeline(days=365, industry=None, month=None, max_months=24, conn=None):
     if not industry:
         unclassified = {}
         for r in conn.execute(
-                "SELECT substr(event_date,1,7) ym, COUNT(*) n FROM events e "
-                "WHERE e.status='active' AND event_date>=? AND id NOT IN "
+                "SELECT substr(" + eff + ",1,7) ym, COUNT(*) n FROM events e "
+                "WHERE e.status='active' AND " + eff + ">=? AND id NOT IN "
                 "(SELECT event_id FROM event_links WHERE target_type='industry') "
                 "GROUP BY ym", (since,)).fetchall():
             unclassified[r["ym"]] = r["n"]
@@ -313,13 +528,22 @@ def timeline(days=365, industry=None, month=None, max_months=24, conn=None):
             per_ind["未分类"] = unclassified
 
     dirs = {r["direction"]: r["n"] for r in conn.execute(
-        ("SELECT e.direction, COUNT(*) n FROM events e WHERE e.status='active' AND e.event_date>=? "
+        ("SELECT e.direction, COUNT(*) n FROM events e WHERE e.status='active' AND "
+         + eff + ">=? "
          if not industry else
          "SELECT e.direction, COUNT(DISTINCT e.id) n FROM events e "
-         "JOIN event_links l ON l.event_id=e.id WHERE e.status='active' AND e.event_date>=? "
+         "JOIN event_links l ON l.event_id=e.id WHERE e.status='active' AND " + eff + ">=? "
          "AND l.target_type='industry' AND l.target_key=? ")
         + "GROUP BY e.direction",
         ((since,) if not industry else (since, industry))).fetchall()}
+
+    # 未知日期桶：发生/发布时间都没有的事件（不进任何月份柱）
+    undated_sql = ("SELECT COUNT(DISTINCT e.id) FROM events e "
+                   + ("JOIN event_links l ON l.event_id=e.id " if industry else "")
+                   + "WHERE e.status='active' AND " + eff + " IS NULL "
+                   + ("AND l.target_type='industry' AND l.target_key=? " if industry else ""))
+    undated = conn.execute(undated_sql,
+                           ((industry,) if industry else ())).fetchone()[0]
 
     # 月份轴：从 since 月起连续到今天；超过 max_months 时保留最近的月份（否则当月会被挤掉）
     sy, sm = map(int, since[:7].split("-"))
@@ -338,7 +562,8 @@ def timeline(days=365, industry=None, month=None, max_months=24, conn=None):
         series.append({"name": ind, "data": [per_ind[ind].get(ym, 0) for ym in months]})
 
     events = list_events(limit=200 if month else 80, industry=industry,
-                         since=since, month=month, conn=conn)
+                         since=since, month=month, conn=conn,
+                         include_undated=not month)
     if own:
         conn.close()
     return {
@@ -346,6 +571,7 @@ def timeline(days=365, industry=None, month=None, max_months=24, conn=None):
         "series": series,
         "directions": {d: dirs.get(d, 0) for d in DIRECTIONS},
         "total": sum(dirs.values()),
+        "undated": undated,
         "industries": [{"name": s["name"], "total": sum(s["data"])} for s in series],
         "events": events,
         "since": since,
@@ -378,26 +604,35 @@ def stats(conn=None):
 EXTRACT_PROMPT = """你是财经新闻结构化助手。从用户提供的文字中抽取一条「产业政策 / 公司事件」，只输出一个 JSON 对象，不要解释、不要 markdown。
 
 字段要求：
-- date: 事件发生日期，格式 YYYY-MM-DD；原文没有明确日期就填今天（{today}）
+- occurred_at: 事件**实际发生**日期，格式 YYYY-MM-DD。原文没有明确写到事件发生时间就填 null，
+  绝对不要用今天、采集时间或发布时间代替；不知道就是不知道。
+- published_at: 来源**明确给出**的发布时间，格式 YYYY-MM-DD HH:MM（只有日期就写 YYYY-MM-DD）；
+  原文没说就填 null。
 - title: 事件标题，不超过 40 字，动词开头
 - summary: 对基本面/估值的影响，120 字以内；只能写原文有依据的内容，原文没有的数字一律不要编
 - direction: 只能是 "利好" / "利空" / "中性" 三者之一
-- source: 媒体名 + 日期（原文有就写，没有就空字符串）
-"""
+- source: 媒体名（原文有就写，没有就空字符串）
+
+注意：occurred_at 与 published_at 是两件事。政策"今天发布"不等于"今天实施"，
+不要把发布时间抄成发生时间。"""
 
 
-def extract_event(text, api_key=None, poster=None, today=None):
+def extract_event(text, api_key=None, poster=None, today=None, published_at=None,
+                  collected_at=None):
     """把一段新闻文字抽成结构化事件（不写库）。
 
     poster: 可注入的 HTTP 函数，签名 poster(url, headers, payload, timeout) -> dict，
             测试时用假函数即可离线跑。默认用 requests。
+    published_at: 采集时拿到的来源发布时间（作为提示，模型没给就用它）
+    collected_at: 采集时间（默认现在）
+    today: 仅为兼容旧调用方保留，**不参与任何日期填充**（防止“未知日期→今天”回归）
+
     返回 (event_dict, usage_dict)；失败抛 RuntimeError。
     """
     text = (text or "").strip()
     if not text:
         raise ValueError("待抽取的文字为空")
-    today = today or datetime.now().strftime("%Y-%m-%d")
-    prompt = EXTRACT_PROMPT.replace("{today}", today)
+    prompt = EXTRACT_PROMPT
 
     if api_key is None:
         try:
@@ -432,8 +667,17 @@ def extract_event(text, api_key=None, poster=None, today=None):
     except (KeyError, IndexError, json.JSONDecodeError) as e:
         raise RuntimeError(f"模型返回不是合法 JSON：{e}")
 
+    occurred = _norm_date(event.get("occurred_at"))
+    if occurred is None and "date" in event:
+        occurred = _norm_date(event.get("date"))
+    published = _norm_datetime(event.get("published_at")) or _norm_datetime(published_at)
+    collected = _norm_datetime(collected_at) or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
     cleaned = {
-        "date": str(event.get("date") or today)[:10],
+        "occurred_at": occurred,          # None = 原文没写，绝不补今天
+        "published_at": published,        # None = 来源没给
+        "collected_at": collected,        # 系统采集时间
+        "date": occurred,                 # 兼容老调用方（与 occurred_at 同值，可为 None）
         "title": str(event.get("title") or "").strip()[:80],
         "summary": str(event.get("summary") or "").strip()[:400],
         "direction": _direction(event.get("direction")),

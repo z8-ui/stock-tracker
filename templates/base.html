@@ -34,9 +34,6 @@
         <a href="/valuation" class="nav-link {% if request.path == '/valuation' %}active{% endif %}">
             估值偏离
         </a>
-        <a href="/events" class="nav-link {% if request.path == '/events' %}active{% endif %}">
-            政策事件
-        </a>
         <a href="/ai" class="nav-link {% if request.path == '/ai' %}active{% endif %}">
             AI分析
         </a>
@@ -54,6 +51,7 @@
     <p>数据来源：东方财富 | 仅供学习参考，不构成投资建议</p>
 </footer>
 
+<script src="/static/js/format.js"></script>
 <script src="/static/js/app.js"></script>
 {% block scripts %}{% endblock %}
 </body>

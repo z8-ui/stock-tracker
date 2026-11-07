@@ -6,6 +6,7 @@ from flask import Blueprint, render_template, jsonify, request
 from collections import defaultdict
 from time import time
 from datetime import datetime
+import hmac
 import re
 from data_service import (
     get_market_flow, get_sector_flow,
@@ -13,6 +14,7 @@ from data_service import (
     get_stock_quote, get_index_history, get_sector_valuation,
     get_stock_real_money_flow,
     estimate_intrinsic_value, INDUSTRY_PE_MAP, get_industry_pe,
+    cache_meta,
     _LAST_SUCCESS
 )
 # 技术分析纯函数独立模块（technical.py），与数据获取解耦
@@ -32,17 +34,52 @@ bp = Blueprint("main", __name__)
 # ========== AI 接口防护(限流 + 可选 token) ==========
 # 目的: 防止 AI 分析接口被脚本循环调用刷爆 DeepSeek API 额度
 # 限流: 每 IP 每分钟最多 AI_RATE_LIMIT 次(内存计数, 进程内有效)
-# token: config 里 AI_API_TOKEN 非空时, 调用 /api/ai-analysis 必须带 ?token=xxx
+# token: config 里 AI_API_TOKEN 非空时, 调用 /api/ai-analysis 必须带 Header `X-AI-Token`
+#        ⚠️ 不再接受 ?token=xxx（URL 会落进历史/代理日志/access log），比较用 hmac.compare_digest
 _ai_call_log = defaultdict(list)
 AI_RATE_LIMIT = 10  # 次/分钟/IP
 
 
+def _is_local_request():
+    """请求是否来自本机回环。
+
+    未配置 AI_API_TOKEN 时，AI 接口只允许本机调用：
+    这个项目默认绑 127.0.0.1，但用户完全可能改 SERVER_HOST 给局域网用，
+    那时"没配 token"就是任何人都能刷你的模型额度 —— 不能默认视为安全。
+    """
+    addr = (request.remote_addr or "").strip()
+    if not addr:
+        return False
+    return addr == "localhost" or addr == "::1" or addr.startswith("127.")
+
+
 def _ai_token_ok():
-    """可选 token 校验: AI_API_TOKEN 为空则不校验(默认)"""
-    from config import AI_API_TOKEN
-    if not AI_API_TOKEN:
-        return True
-    return request.args.get("token") == AI_API_TOKEN
+    """AI 接口访问策略（三层，从强到弱）：
+
+    1. 配置了 AI_API_TOKEN → 只认 Header `X-AI-Token`，hmac.compare_digest 定长比较
+    2. 没配 AI_API_TOKEN，但应用层开了局域网 Basic → Basic 凭据有效即放行
+       （页面不再需要另存一个容易和全局认证冲突的 token）
+    3. 都没有 → 仅允许本机（127.0.0.1/::1）；局域网/公网请求一律 403
+
+    注意：第 3 条不是“认证”，只是“没有远程暴露”。给局域网使用时必须配 AI_API_TOKEN
+    或 SERVER_AUTH_TOKEN。
+    """
+    from config import AI_API_TOKEN, SERVER_AUTH_TOKEN
+
+    supplied = (request.headers.get("X-AI-Token") or "").strip()
+    if AI_API_TOKEN:
+        return bool(supplied) and hmac.compare_digest(supplied, AI_API_TOKEN)
+
+    if SERVER_AUTH_TOKEN:
+        auth = request.authorization
+        try:
+            if auth and hmac.compare_digest(auth.username or "", "stock") \
+                    and hmac.compare_digest(auth.password or "", SERVER_AUTH_TOKEN):
+                return True
+        except Exception:
+            pass
+
+    return _is_local_request()
 
 
 def _ai_rate_limited():
@@ -83,8 +120,14 @@ def valuation_page():
 
 @bp.route("/api/health")
 def api_health():
-    """存活探针：进程活着就 200（即使数据降级）"""
-    return jsonify({"code": 200, "status": "ok", "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+    """存活探针：进程活着就 200（即使数据降级）
+
+    额外回显交易日历状态：configured=False 表示没有节假日表，节假日会被当交易日。
+    """
+    from data_service import calendar_info
+    return jsonify({"code": 200, "status": "ok",
+                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "calendar": calendar_info()})
 
 
 @bp.route("/api/ready")
@@ -114,6 +157,12 @@ def api_market_flow():
         resp = {"code": 200, "data": chart}
         if data and "_market_status" in data:
             resp["_market_status"] = data["_market_status"]
+        if isinstance(data, dict):
+            resp["is_mock"] = bool(data.get("is_mock"))
+        meta = cache_meta("market_flow")
+        # 数据自带 _stale（dict 型）时以它为准；格式化后的 asof 给前端显示
+        resp["is_stale"] = bool((data or {}).get("_stale")) if isinstance(data, dict) and "_stale" in (data or {}) else meta["is_stale"]
+        resp["asof"] = meta["asof"]
         return jsonify(resp)
     return jsonify({"code": 500, "msg": "数据获取失败（非交易日或接口限制）"})
 
@@ -126,7 +175,13 @@ def api_heatmap():
         # 附加市场状态
         from data_service import _market_status as _ms
         status, _ = _ms()
-        return jsonify({"code": 200, "data": chart, "_market_status": status})
+        is_mock = any(bool(s.get("is_mock")) for s in (sectors or []) if isinstance(s, dict))
+        meta = cache_meta("sector_flow")
+        return jsonify({"code": 200, "data": chart, "_market_status": status,
+                        "is_mock": is_mock, "is_stale": meta["is_stale"],
+                        "asof": meta["asof"], "stale_reason": meta["reason"]})
+    if sectors is None:
+        return jsonify({"code": 500, "msg": "暂无板块资金数据（接口未返回，未启用模拟兜底）"})
     return jsonify({"code": 500, "msg": "数据获取失败"})
 
 
@@ -175,6 +230,18 @@ def api_valuation():
     if chart:
         chart["industry_name"] = ind.get("industry", "未知")
         chart["industry_pe_source"] = ind.get("source", "unknown")
+        # 静态行业 PE 是人工估算，前端必须能标"参考值"，不能和东财实时值长得一样
+        chart["industry_pe_source_label"] = ind.get("source_label", "")
+        chart["industry_pe_is_static"] = bool(ind.get("is_static"))
+        chart["industry_pe_asof"] = ind.get("_asof")
+        # 透明化（P1-4）：行情时间/来源、财报期、偏离口径说明，全部随响应返回
+        chart["quote_asof"] = data.get("_asof")
+        chart["quote_source"] = data.get("_source", "")
+        chart["quote_stale"] = bool(data.get("_stale"))
+        chart["quote_stale_reason"] = data.get("_stale_reason", "")
+        chart["deviation_basis"] = (
+            "偏离度 = (个股PE − 行业PE) / 行业PE；两端均为 PE(TTM) 口径，"
+            "仅作横向参考，不直接等于高估/低估结论")
         # 2026-08: 财报快照 + 政策事件（build_valuation_chart 会重建 dict，需手动补挂）
         chart["financials"] = data.get("financials")
         chart["policy_notes"] = data.get("policy_notes") or []
@@ -202,12 +269,17 @@ def api_ai_config():
     """AI 配置状态(供页面判断是否需要显示 API Key 填写框)
     只返回是否已配置, 绝不返回 key 本身
     """
+    from config import AI_API_TOKEN
     return jsonify({
         "code": 200,
         "data": {
             "hasKey": bool((DEEPSEEK_API_KEY or "").strip()),
-            # 提示文案: 告诉用户去哪申请 key
-            "applyUrl": "https://platform.deepseek.com"
+            "applyUrl": "https://platform.deepseek.com",
+            # 明确访问策略：配了 token = 只认 Header；没配 = 仅本机可用
+            "tokenConfigured": bool(AI_API_TOKEN),
+            "tokenPolicy": "header" if AI_API_TOKEN else "local_only",
+            "tokenHint": ("请求头 X-AI-Token" if AI_API_TOKEN else
+                          "未配置 AI_API_TOKEN：AI 接口仅允许本机访问，局域网使用必须在 config_local.py 配置"),
         }
     })
 
@@ -216,9 +288,9 @@ def api_ai_config():
 def api_ai_analysis():
     """AI 技术分析: 拉K线 -> 算指标 -> DeepSeek 生成分析"""
     if not _ai_token_ok():
-        return jsonify({"code": 403, "msg": "token 错误"})
+        return jsonify({"code": 403, "msg": "AI 接口需要认证：请通过应用认证访问，或携带有效的 X-AI-Token"}), 403
     if _ai_rate_limited():
-        return jsonify({"code": 429, "msg": f"调用过于频繁, 限流 {AI_RATE_LIMIT} 次/分钟, 请稍后再试"})
+        return jsonify({"code": 429, "msg": f"调用过于频繁, 限流 {AI_RATE_LIMIT} 次/分钟, 请稍后再试"}), 429
     code = request.args.get("code", "600519")
     name = request.args.get("name", "贵州茅台")
     market = request.args.get("market", "")
@@ -232,6 +304,13 @@ def api_ai_analysis():
     result = analyze(code, name, market or None, refresh=refresh, api_key=api_key or None)
     if not result:
         return jsonify({"code": 500, "msg": "K线数据不足(可能休市、代码错误或该品种暂不支持)"})
+    analysis = (result.get("analysis") or "").strip()
+    if not analysis:
+        return jsonify({"code": 502, "msg": "AI 返回空内容，未写入缓存"}), 502
+    # AI 调用失败/未配置 key：明确返回 502，而不是 200 里塞一段"AI 分析调用失败"文本
+    # （前端和监控都看不出这是错误；而且错误流不该伪装成正常结果）
+    if analysis.startswith(("AI 分析调用失败", "未配置")):
+        return jsonify({"code": 502, "msg": analysis[:300]}), 502
     return jsonify({"code": 200, "data": result})
 
 
@@ -273,6 +352,7 @@ def api_index_analysis():
             "ema20": ema20,
             "deviation": deviation,
             "fibonacci": fib,
+            "is_mock": bool(any(k.get("is_mock") for k in klines)),
             "asof": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "source": "tencent"
         }
@@ -324,8 +404,9 @@ def api_sector_valuation():
     """板块估值数据"""
     data = get_sector_valuation()
     if data:
-        return jsonify({"code": 200, "data": data})
-    return jsonify({"code": 500, "msg": "获取板块估值失败"})
+        is_mock = any(bool(s.get("is_mock")) for s in data if isinstance(s, dict))
+        return jsonify({"code": 200, "data": data, "is_mock": is_mock})
+    return jsonify({"code": 500, "msg": "获取板块估值失败（接口未返回，未启用模拟兜底）"})
 
 
 @bp.route("/api/intrinsic-value")
@@ -396,30 +477,140 @@ def api_fibonacci():
     })
 
 
-# ---------------------------------------------------------------- 政策事件中心
+# ---------------------------------------------------------------- 政策事件中心（已下线）
+# 2026-11-07 按用户要求删除独立的「政策事件」页面：导航入口、/events 页面路由、
+# /api/event-timeline 接口，以及 templates/events.html、static/js/events.js 一并移除。
+# 事件数据层（events_store / event_feed / scripts/events_cli.py）保留 —— 个股估值页的
+# 政策区块和每日采集流程仍在用，删了会连带坏掉。
 
-@bp.route("/events")
-def events_page():
-    return render_template("events.html", app_name=APP_NAME)
 
+@bp.route("/api/data-health")
+def api_data_health():
+    """数据健康快照：只读缓存与事件库，不发任何外部请求（审查 3.3）。
 
-@bp.route("/api/event-timeline")
-def api_event_timeline():
-    """事件时间线：按月 × 行业聚合 + 方向分布 + 事件列表"""
+    单模块异常不会让整个接口 500 —— 返回哪块坏了、坏在哪。
+    """
     try:
-        days = int(request.args.get("days", 365))
-    except ValueError:
-        days = 365
-    days = max(30, min(days, 3650))
-    industry = (request.args.get("industry") or "").strip() or None
-    month = (request.args.get("month") or "").strip() or None
-    if month and not re.fullmatch(r"\d{4}-\d{2}", month):
-        month = None
+        import data_health
+        snap = data_health.snapshot()
+    except Exception as e:
+        return jsonify({"code": 500, "msg": f"数据健康统计失败: {type(e).__name__}: {str(e)[:120]}"}), 500
+    return jsonify({"code": 200, "data": snap})
+
+
+@bp.route("/api/policy-events")
+def api_policy_events():
+    """按个股检索政策与事件（关系类型 / 影响程度 / 机制 / 证据 / 审核状态）。
+
+    参数：stock_code（必填，5-6 位数字）、stock_name（仅回显）、industry（可选，
+    缺省时按代码查一次行业；查不到就只返回个股直连事件，不按同行业硬凑）。
+
+    data_status：
+      real        库正常且有关联事件
+      empty       库正常但这只股票确实没有已关联的事件（前端显示"暂无"）
+      unavailable 事件库不可用（没有表/打不开）—— 和 empty 必须分开，
+                  否则"库挂了"会被显示成"这只股票没有政策"，静默误导用户
+
+    live=1 时额外实时检索公开材料（公司公告 + 快讯标题命中）：
+      这些条目 origin='live'、review_status='pending'，只作线索，不是结论；
+      抓不到就静默跳过，不让外网故障影响已入库事件的展示。
+    """
+    code = (request.args.get("stock_code") or request.args.get("code") or "").strip()
+    if not re.fullmatch(r"\d{5,6}", code):
+        return jsonify({"code": 400, "msg": "stock_code 必须是 5-6 位数字代码"}), 400
+    name = (request.args.get("stock_name") or "").strip()[:40]
+    industry = (request.args.get("industry") or "").strip()[:40]
+    live = request.args.get("live", "") == "1"
+    refresh = request.args.get("refresh") == "1"
+
+    from datetime import datetime
+    meta = {"generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}  # type: dict
+    profile = {}
+
+    # ---- 0. 个股画像（仅 live）：行业 / 主营 / 关键词 ----
+    # 必须放在库查询之前：库内事件是按 (代码, 行业) 关联的，行业为空会直接漏掉
+    # 行业/产业链政策。旧实现先查库、后取行业，live 请求永远拿不到行业事件。
+    if live:
+        try:
+            import stock_profile
+            if refresh:
+                stock_profile.clear_cache()
+            profile = stock_profile.profile_for(code, industry=industry, refresh=refresh)
+            meta["profile_status"] = "ok" if not profile.get("missing") else "partial"
+            for m in profile.get("missing") or []:
+                meta.setdefault("profile_missing", []).append(m)
+        except Exception as e:
+            profile = {}
+            meta["profile_status"] = f"failed: {type(e).__name__}"
+
+    # ---- 1. 行业名：请求参数 → 东财行业 → 画像行业（便宜的在前，贵的在后）----
+    if not industry:
+        try:
+            industry = (get_industry_pe(code).get("industry") or "")
+        except Exception:
+            industry = ""
+    if not industry:
+        industry = profile.get("industry") or ""
+    meta["industry_source"] = ("request" if (request.args.get("industry") or "").strip()
+                               else ("eastmoney" if industry else "none"))
+
+    # ---- 2. 库内已关联事件（现在 industry 一定有值或明确为空）----
     try:
         import events_store
-        data = events_store.timeline(days=days, industry=industry, month=month)
+        # 先把表建好：新装环境里"表存在但没数据"应报 empty，
+        # 而不是把"还没初始化"显示成"事件库不可用"。
+        events_store.init_db()
+        events = events_store.policy_events_for(code, stock_name=name, industry_name=industry)
+        # 东财板块行业（工业金属）和 F10 行业链末级（黄金）是两套分类，
+        # 只查一个会漏掉另一个分类下的行业政策 —— 两个都查，按标题去重合并。
+        tail = (profile.get("industry_chain") or [""])[-1] if profile else ""
+        meta["industry_aliases"] = [industry] + ([tail] if tail and tail != industry else [])
+        if tail and tail != industry:
+            seen_titles = {e.get("title") for e in (events or [])}
+            for ev in events_store.policy_events_for(code, stock_name=name,
+                                                     industry_name=tail) or []:
+                if ev.get("title") not in seen_titles:
+                    seen_titles.add(ev.get("title"))
+                    events.append(ev)
     except Exception as e:
-        return jsonify({"code": 500, "msg": f"事件库读取失败: {type(e).__name__}: {e}"})
-    data["days"] = days
-    data["industry_filter"] = industry
-    return jsonify({"code": 200, "data": data})
+        return jsonify({"code": 500, "msg": f"事件库读取失败: {type(e).__name__}: {e}"}), 500
+
+    if events is None:
+        meta.update({"total": 0, "data_status": "unavailable"})
+        events = []
+    else:
+        meta.update({"total": len(events), "data_status": "real" if events else "empty"})
+
+    # ---- 3. 实时检索：成功/空/部分失败/全部失败 必须分开 ----
+    if live:
+        live_items = []
+        try:
+            import policy_live
+            if refresh:
+                policy_live.clear_cache()
+            live_items, live_status, live_detail = policy_live.search_with_status(
+                code, name, industry, limit=8, profile=profile)
+            meta["live_status"] = live_status          # success / empty / partial / failed
+            meta["live_status_detail"] = live_detail
+        except Exception as e:
+            meta["live_status"] = "failed"
+            meta["live_status_detail"] = {"error": f"{type(e).__name__}: {str(e)[:120]}"}
+        known = {e.get("title") for e in events}
+        added = [x for x in live_items if x.get("title") not in known]
+        events = events + added
+        meta["live_total"] = len(added)
+        if added and meta.get("data_status") in ("empty", "unavailable"):
+            meta["data_status"] = "real"
+        meta["relation_counts"] = {}
+        for ev in events:
+            rel = ev.get("relation_type") or "unconfirmed"
+            meta["relation_counts"][rel] = meta["relation_counts"].get(rel, 0) + 1
+
+    return jsonify({"code": 200, "data": {
+        "stock_code": code,
+        "stock_name": name or (profile.get("name") if live else "") or "",
+        "industry": industry,
+        "profile": profile if live else {},
+        "events": events,
+        "meta": meta,
+    }})

@@ -56,8 +56,16 @@ function loadHeatmapData() {
             const sortedByFlow = [...data].sort((a, b) => b.flow - a.flow);
             renderBarChart('chart-sector-flow', '资金流入（亿）', sortedByFlow);
 
-            // 4. 市场状态
-            if (res._market_status) {
+            // 4. 市场状态（模拟数据必须显式标出，不能让人当真实资金流用）
+            if (res.is_mock) {
+                const st = document.getElementById('status-heatmap-page');
+                st.textContent = '⚠ 模拟数据（非真实资金流，仅供界面演示）';
+                st.style.color = '#ef5350';
+            } else if (res.is_stale) {
+                const st = document.getElementById('status-heatmap-page');
+                st.textContent = '⚠ 缓存数据' + (res.asof ? '（' + res.asof + '）' : '（抓取时间未知）') + '，非实时';
+                st.style.color = '#ffb74d';
+            } else if (res._market_status) {
                 document.getElementById('status-heatmap-page').textContent = res._market_status;
             }
         });

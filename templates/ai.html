@@ -200,11 +200,40 @@ function loadAiAnalysis(code, name, market, tag, refresh) {
     var headers = {};
     var localKey = getAiKey();
     if (localKey && !serverHasAiKey) headers['X-AI-Key'] = localKey;
+    // AI 访问令牌（服务端配了 AI_API_TOKEN 时才需要）：只存 sessionStorage，
+    // 不写进页面/JS，不跟随 URL；通过 Basic 登录时服务端会直接放行，无需填。
+    var aiToken = '';
+    try { aiToken = sessionStorage.getItem('aiAccessToken') || ''; } catch (e) {}
+    if (aiToken) headers['X-AI-Token'] = aiToken;
     fetch(url, {headers: headers})
         .then(function(r) { return r.json(); })
         .then(function(res) {
             if (res.code !== 200) {
-                box.innerHTML = '<p style="color:#ef5350;">' + res.msg + '</p>';
+                if ((res.code === 401 || res.code === 403) && !aiToken) {
+                    var t = window.prompt('该 AI 接口需要访问令牌（服务端 AI_API_TOKEN）。\n令牌只保存在本浏览器标签页，不写入页面：');
+                    if (t) {
+                        try { sessionStorage.setItem('aiAccessToken', t); } catch (e) {}
+                        // 2026-11 修复：原来这里调用不存在的 askAI()，输对令牌后必抛
+                        // ReferenceError，页面停在 loading。走回完整加载流程即可——
+                        // loadAiAnalysis 每次进入都会重新读 sessionStorage 里的令牌。
+                        // 同时修正参数错位：原调用把 refresh 传进了 tag 位。
+                        return loadAiAnalysis(code, name, market, tag, refresh);
+                    }
+                    box.innerHTML = '<p style="color:#ffb74d;">未输入访问令牌，AI 分析没有执行。</p>';
+                    return;
+                }
+                if (res.code === 401 || res.code === 403) {
+                    // 已带令牌仍被拒 = 令牌本身无效：清掉它，别让用户卡在死路上
+                    try { sessionStorage.removeItem('aiAccessToken'); } catch (e) {}
+                    box.innerHTML = '<p style="color:#ef5350;">访问令牌无效或已过期（已清除本页保存的令牌）。' +
+                        '请刷新页面后重新输入，或改用应用认证（Basic）登录。</p>';
+                    return;
+                }
+                var p = document.createElement('p');
+                p.style.color = '#ef5350';
+                p.textContent = res.msg || '请求失败';
+                box.innerHTML = '';
+                box.appendChild(p);
                 return;
             }
             var d = res.data;

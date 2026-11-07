@@ -61,8 +61,11 @@ def cmd_list(args):
 
 def cmd_add(args):
     eid, created, links = events_store.add_event(
-        args.date, args.title, args.summary, args.direction, args.source,
-        args.source_url, stocks=args.stock, industries=args.industry)
+        occurred_at=args.date, title=args.title, summary=args.summary,
+        direction=args.direction, source=args.source, source_url=args.source_url,
+        stocks=args.stock, industries=args.industry,
+        published_at=getattr(args, "published_at", None),
+        review_status="approved")     # 人工手动录入 = 已审核
     print(f"  [{'新建' if created else '已存在(仅补关联)'}] event_id={eid} 新增关联 {links} 条")
     print("  当前库:", events_store.stats())
     return 0
@@ -78,13 +81,17 @@ def cmd_add_text(args):
         return 2
 
     try:
-        event, usage = events_store.extract_event(text)
+        event, usage = events_store.extract_event(
+            text, published_at=getattr(args, "published_at", None))
     except Exception as e:
         print(f"[x] 抽取失败: {e}", file=sys.stderr)
         return 1
 
     print("  —— 模型抽取结果（还没写库）——")
-    for k in ("date", "title", "direction", "source"):
+    print(f"  occurred_at : {event['occurred_at'] or '未知（原文未写明，不补今天）'}")
+    print(f"  published_at: {event['published_at'] or '未知'}")
+    print(f"  collected_at: {event['collected_at']}")
+    for k in ("title", "direction", "source"):
         print(f"  {k:<9}: {event[k]}")
     print(f"  summary  : {event['summary']}")
     print(f"  标的     : stock={args.stock or '-'} industry={args.industry or '-'}")
@@ -96,8 +103,11 @@ def cmd_add_text(args):
         return 0
 
     eid, created, links = events_store.add_event(
-        event["date"], event["title"], event["summary"], event["direction"],
-        event["source"], "", stocks=args.stock, industries=args.industry)
+        occurred_at=event["occurred_at"], title=event["title"], summary=event["summary"],
+        direction=event["direction"], source=event["source"], source_url="",
+        stocks=args.stock, industries=args.industry,
+        published_at=event["published_at"], collected_at=event["collected_at"],
+        review_status="approved")     # --yes 已人工确认
     print(f"\n  [{'新建' if created else '已存在'}] event_id={eid} 新增关联 {links} 条")
     return 0
 
@@ -152,17 +162,26 @@ def cmd_feed(args):
     """抓快讯 → 关键词筛 → 打印候选；--pick 选中后走 AI 抽取，--yes 才写库"""
     import event_feed
 
-    items, errors = event_feed.fetch_headlines(sources=args.source or None, limit=args.limit)
+    items, errors, ok_sources = event_feed.fetch_headlines(
+        sources=args.source or None, limit=args.limit)
     for e in errors:
         print(f"  [!] 抓取失败 {e}", file=sys.stderr)
+    if ok_sources == 0:
+        # 全部源都失败 ≠ “今天没新闻”：必须让 cron/人看到失败
+        print("[x] 所有新闻源都抓取失败，本次采集无有效结果", file=sys.stderr)
+        return 3
+    if errors:
+        print(f"  [!] {len(errors)} 个源失败，{ok_sources} 个源成功（继续处理）", file=sys.stderr)
 
     cands = event_feed.screen(items, args.keyword)
     cands, merged = event_feed.dedupe(cands)
     if args.strong:
         cands = [c for c in cands if c["weight"] >= 2]
     if not args.all:
-        seen = event_feed.seen_fps()
-        cands = [c for c in cands if c["fp"] not in seen]
+        # 只排除人工已处理（approved/rejected/ingested）；
+        # pending 与 extract_failed 必须继续出现在待审核列表里
+        done = event_feed.seen_fps()
+        cands = [c for c in cands if c["fp"] not in done]
     cands.sort(key=lambda x: x.get("published_at") or "", reverse=True)
     cands.sort(key=lambda x: -x["weight"])          # 稳定排序：先强相关，再按时间倒序
 
@@ -186,9 +205,23 @@ def cmd_feed(args):
         if args.dry_run:
             print("\n  --dry-run：不记录看过状态。")
         else:
-            n = event_feed.mark(cands, "shown")
-            print(f"\n  已记录 {n} 条为「看过」，下次默认不再出现（--all 可回看）。")
+            n = event_feed.mark(cands, process="pending")
+            print(f"\n  {n} 条已进入待审核队列；未审核的不会因为被展示就消失。")
         print("  要把某条转成事件：--pick 序号 --stock 代码 [--industry 行业] [--yes]")
+        return 0
+
+    if getattr(args, "reject", None):
+        idxs = []
+        for part in args.reject.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if not part.isdigit() or not (1 <= int(part) <= len(cands)):
+                print(f"[x] 序号越界: {part}", file=sys.stderr)
+                return 2
+            idxs.append(int(part))
+        n = event_feed.mark([cands[i - 1] for i in idxs], process="pending", review="rejected")
+        print(f"  {n} 条已标记为 rejected（人工驳回，不会自动入库）")
         return 0
 
     idxs = []
@@ -207,7 +240,8 @@ def cmd_feed(args):
         print(f"\n  —— 抽取第 {idx} 条 ——")
         print(f"  原标题: {it['title']}")
         try:
-            event, usage = events_store.extract_event(event_feed.to_event_text(it))
+            event, usage = events_store.extract_event(
+                event_feed.to_event_text(it), published_at=it.get("published_at"))
         except Exception as e:
             print(f"  [x] 抽取失败: {e}", file=sys.stderr)
             failed.append(it)
@@ -222,6 +256,9 @@ def cmd_feed(args):
         chosen.append((it, event))
 
     if not chosen:
+        # 抽取全失败：记 extract_failed，不记 skipped，下次还会提出来
+        if failed:
+            event_feed.mark(failed, "extract_failed")
         return 1
     if not args.yes:
         print("\n  预览模式：确认无误后加 --yes 才会写库。")
@@ -229,16 +266,22 @@ def cmd_feed(args):
 
     for it, ev in chosen:
         eid, created, links = events_store.add_event(
-            ev["date"], ev["title"], ev["summary"], ev["direction"], ev["source"], it["url"],
-            stocks=args.stock, industries=args.industry)
+            occurred_at=ev["occurred_at"], title=ev["title"], summary=ev["summary"],
+            direction=ev["direction"], source=ev["source"], source_url=it["url"],
+            stocks=args.stock, industries=args.industry,
+            published_at=ev["published_at"], collected_at=ev["collected_at"],
+            review_status="approved")  # --pick --yes = 人工通过
+        # 人工 --pick --yes = approved；process=ingested 带 event_id
+        event_feed.mark([it], process="ingested", review="approved", event_id=eid)
         print(f"  [{'新建' if created else '已存在'}] event_id={eid} 关联 {links} 条 ← {it['title'][:30]}")
 
-    event_feed.mark([it for it, _ in chosen], "accepted")
-    used = {it["fp"] for it, _ in chosen}
-    rest = [c for c in cands if c["fp"] not in used]
-    if rest:
-        event_feed.mark(rest, "skipped")
+    if failed:
+        event_feed.mark(failed, process="extract_failed")
+        print(f"  [!] {len(failed)} 条抽取失败，已记为 extract_failed（下次 feed 会重新出现）")
+
+    # 其余候选保持 pending：没被选中不代表被驳回，下次仍要出现
     print("  当前库:", events_store.stats())
+    print("  候选状态:", event_feed.decision_stats())
     return 0
 
 
@@ -259,7 +302,8 @@ def main():
     p.set_defaults(func=cmd_list)
 
     p = sub.add_parser("add", help="手动录入一条")
-    p.add_argument("--date", required=True, help="YYYY-MM-DD")
+    p.add_argument("--date", help="事件发生日期 YYYY-MM-DD；不知道就别填（不补今天）")
+    p.add_argument("--published-at", help="来源发布时间 YYYY-MM-DD[ HH:MM]")
     p.add_argument("--title", required=True)
     p.add_argument("--summary", default="")
     p.add_argument("--direction", default="中性", choices=list(events_store.DIRECTIONS))
@@ -274,6 +318,7 @@ def main():
     p.add_argument("--file")
     p.add_argument("--stock", action="append")
     p.add_argument("--industry", action="append")
+    p.add_argument("--published-at", help="来源发布时间 YYYY-MM-DD[ HH:MM]")
     p.add_argument("--yes", action="store_true", help="确认写库")
     p.set_defaults(func=cmd_add_text)
 
@@ -298,9 +343,11 @@ def main():
     p.add_argument("--all", action="store_true", help="包含已看过的")
     p.add_argument("--strong", action="store_true", help="只要政策/行业/自选股相关的")
     p.add_argument("--dry-run", action="store_true", help="不记录看过状态")
-    p.add_argument("--pick", help="要转成事件的序号，如 2,5")
+    p.add_argument("--pick", help="要转成事件的序号，如 2,5（= 人工通过，配合 --yes 入库）")
+    p.add_argument("--reject", help="人工驳回的序号，如 3,7")
     p.add_argument("--stock", action="append")
     p.add_argument("--industry", action="append")
+    p.add_argument("--published-at", help="来源发布时间 YYYY-MM-DD[ HH:MM]")
     p.add_argument("--yes", action="store_true", help="确认写库")
     p.set_defaults(func=cmd_feed)
 

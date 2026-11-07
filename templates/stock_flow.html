@@ -209,8 +209,8 @@ function loadStock(code, name) {
             document.getElementById('q-pre-close').textContent = q.pre_close.toFixed(2);
             document.getElementById('q-high').textContent = q.high.toFixed(2);
             document.getElementById('q-low').textContent = q.low.toFixed(2);
-            document.getElementById('q-turnover').textContent = q.turnover + '亿';
-            document.getElementById('q-turnover-rate').textContent = q.turnover_rate + '%';
+            document.getElementById('q-turnover').textContent = window.fmt.fixed(q.turnover) + '亿';
+            document.getElementById('q-turnover-rate').textContent = window.fmt.fixed(q.turnover_rate) + '%';
             document.getElementById('stock-quote-grid').style.display = 'flex';
         });
 
@@ -249,10 +249,11 @@ function loadRealMoneyFlow(code) {
             fields.forEach(function(f) {
                 var elVal = document.getElementById(f.val);
                 var elPct = document.getElementById(f.pct);
-                var color = f.v >= 0 ? '#ef5350' : '#26a69a';
-                elVal.textContent = (f.v >= 0 ? '+' : '') + f.v.toFixed(2) + '亿';
+                var color = (window.fmt.toNum(f.v) === null) ? '#8892b0' : (f.v >= 0 ? '#ef5350' : '#26a69a');
+                // 统一格式化：两位小数；null/无效显示 --（原来直接 .toFixed 会抛异常，整卡停在 --）
+                elVal.textContent = window.fmt.money(f.v, '亿');
                 elVal.style.color = color;
-                elPct.textContent = (f.p >= 0 ? '+' : '') + f.p.toFixed(2) + '%';
+                elPct.textContent = window.fmt.pct(f.p);
                 elPct.style.color = color;
             });
             document.getElementById('real-flow-status').textContent = '✓ 实时';

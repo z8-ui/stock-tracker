@@ -13,7 +13,8 @@ from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from policy_notes import get_policy_notes
-from config import ALLOW_MOCK_FALLBACK
+from config import ALLOW_MOCK_FALLBACK, STALE_AFTER_SEC, VALUATION_SAFETY_MARGIN
+from market_calendar import load_calendar, is_trading_day
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -36,10 +37,16 @@ def _load_cache():
     except:
         return {}
 
-_CACHE_LOCK = threading.Lock()  # 文件缓存写锁（原子替换，防多线程并发写坏）
+# 文件缓存锁：RLock 是因为 _cache_update() 内部还会调用 _save_cache()，
+# 同一线程要能重入；同时这把锁也保护 _IN_FLIGHT（见下面 _inflight_*）。
+_CACHE_LOCK = threading.RLock()
 
 def _save_cache(cache_dict):
-    """保存缓存到文件（临时文件 + 原子替换，后台 SWR 线程并发安全）"""
+    """保存整份缓存到文件（临时文件 + 原子替换）。
+
+    注意：写单 key 请用 _cache_update()。整份覆盖只适合"我已经持有最新全量快照"的场景，
+    否则并发下会把别人刚写进去的 key 覆盖掉。
+    """
     try:
         with _CACHE_LOCK:
             tmp = _CACHE_FILE + ".tmp"
@@ -50,6 +57,19 @@ def _save_cache(cache_dict):
         pass
 
 
+def _cache_update(cache_key, data, fetched_at):
+    """只更新一个 key：读-改-写全程持锁。
+
+    修复的问题：原实现的 _cached_get 在请求开始时 _load_cache() 拿一份快照，
+    请求结束再把整份快照写回。两个不同 cache_key 并发时，后写的会用旧快照
+    把先写的那个 key 抹掉（lost update）——表现为"刚刷新的数据过一会儿又变回旧值"。
+    """
+    with _CACHE_LOCK:
+        cache = _load_cache()
+        cache[cache_key] = {"__data": data, "fetched_at": fetched_at}
+        _save_cache(cache)
+
+
 # ==============================================================
 #  Short-lived in-memory cache（交易时段 8 秒 TTL，减少重复外部调用）
 #  2026-08 升级：SWR(过期先返回旧数据后台重建) + single-flight(并发只建一次)
@@ -57,6 +77,56 @@ def _save_cache(cache_dict):
 
 _IN_MEMORY_CACHE = {}   # key -> {"data": ..., "time": fetched_at}
 _IN_MEMORY_TTL = 8      # seconds
+
+# 外部数据源调用统计（进程内，重启清零）——只给"数据健康"面板用，不参与业务判断
+SOURCE_STATS = {}       # source -> {calls, ok, fail, ms_total, last_ok, last_error, last_error_at}
+_SOURCE_LOCK = threading.Lock()
+
+
+def record_source(source, ok, ms, error=""):
+    """记录一次外部数据源调用结果（成功/失败、耗时、最近错误）。"""
+    name = str(source or "unknown")
+    now = time.time()
+    try:
+        with _SOURCE_LOCK:
+            st = SOURCE_STATS.setdefault(name, {
+                "calls": 0, "ok": 0, "fail": 0, "ms_total": 0.0,
+                "last_ok": None, "last_error": "", "last_error_at": None})
+            st["calls"] += 1
+            st["ms_total"] += float(ms or 0)
+            if ok:
+                st["ok"] += 1
+                st["last_ok"] = now
+            else:
+                st["fail"] += 1
+                st["last_error"] = str(error or "")[:200]
+                st["last_error_at"] = now
+    except Exception:
+        pass   # 统计失败绝不能影响主流程
+
+
+def source_stats():
+    """给 /api/data-health 的快照（成功率、平均耗时、最近错误）。"""
+    out = {}
+    with _SOURCE_LOCK:
+        for name, st in SOURCE_STATS.items():
+            calls = st["calls"] or 1
+            out[name] = {
+                "calls": st["calls"],
+                "success_rate": round(st["ok"] / calls, 3),
+                "avg_ms": round(st["ms_total"] / calls, 1),
+                "last_ok_at": (_fmt_ts(st["last_ok"]) if st["last_ok"] else None),
+                "last_error": st["last_error"],
+                "last_error_at": (_fmt_ts(st["last_error_at"]) if st["last_error_at"] else None),
+            }
+    return out
+
+
+def _fmt_ts(ts):
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(ts)))
+    except Exception:
+        return None
 _IN_FLIGHT = {}         # key -> threading.Event，正在构建中的请求（single-flight）
 _LAST_SUCCESS = {}      # key -> float，最后成功构建时间（/api/ready 硬过期判断用）
 
@@ -73,29 +143,85 @@ def _set_in_cache(key, data):
     _IN_MEMORY_CACHE[key] = {'data': data, 'time': time.time()}
 
 
-def _spawn_refresh(cache_key, fetcher, validate_fn):
-    """SWR 后台刷新：不阻塞当前请求，重建成功后更新内存+文件缓存
-    single-flight：同 key 已在刷新则直接跳过
+def _inflight_acquire(cache_key):
+    """原子地"检查 + 登记"。返回 (my_event, other_event)：
+
+    - 抢到：返回 (Event, None)，调用方负责 release
+    - 别人在跑：返回 (None, 别人的 Event)，调用方只能等
     """
-    def _refresh():
-        if cache_key in _IN_FLIGHT:
-            return
+    with _CACHE_LOCK:
+        evt = _IN_FLIGHT.get(cache_key)
+        if evt is not None:
+            return None, evt
         evt = threading.Event()
         _IN_FLIGHT[cache_key] = evt
+        return evt, None
+
+
+def _inflight_release(cache_key, evt):
+    with _CACHE_LOCK:
+        _IN_FLIGHT.pop(cache_key, None)
+    evt.set()
+
+
+def _is_empty_result(value):
+    """空结果判定（只看容器，不猜业务含义）。"""
+    return value is None or (isinstance(value, (dict, list, tuple, str)) and len(value) == 0)
+
+
+def _refresh_is_valid(fresh, validate_fn, existing):
+    """后台刷新结果能不能覆盖现有缓存。
+
+    2026-11 P1 修复：原来只写 ``validate_fn is None or validate_fn(fresh)``，
+    validate_fn=None 时 ``None`` 也能过关 —— 一次失败的后台抓取会把内存缓存、
+    文件缓存和 _LAST_SUCCESS 同时刷成 None，页面从"有数据"变成"暂无数据"。
+    四条规则收在一处，和 _cached_get() 里的 _ok() 同口径：
+      1. None 永远无效
+      2. 有 validate_fn 以它为准；它自己抛异常也算无效
+      3. 空结果不许覆盖非空的旧缓存（SWR 的意义是保住最后一次好数据）
+      4. 其余放行
+    """
+    if fresh is None:
+        return False
+    if validate_fn is not None:
+        try:
+            if not validate_fn(fresh):
+                return False
+        except Exception:
+            return False
+    if _is_empty_result(fresh) and not _is_empty_result(existing):
+        return False
+    return True
+
+
+def _spawn_refresh(cache_key, fetcher, validate_fn):
+    """SWR 后台刷新：不阻塞当前请求，重建成功后更新内存 + 文件缓存。
+
+    2026-11 修复三件事：
+    1. 检查/登记/清理三者都走 _CACHE_LOCK（原来裸字典操作，两个请求可能同时刷新）
+    2. 文件缓存写入与 _store() 同构：{"__data": ..., "fetched_at": ...}
+       原来写成裸数据，重启后 _file_cache() 认不出来源时间 → 页面显示"抓取时间未知"
+    3. 同时更新 _LAST_SUCCESS（/api/ready 的硬过期判断依赖它）
+    """
+    evt, _ = _inflight_acquire(cache_key)
+    if evt is None:
+        return          # 已有刷新在跑，直接跳过
+
+    def _refresh():
         try:
             fresh = fetcher()
-            if validate_fn is None or validate_fn(fresh):
+            # 只有"确实拿到比旧缓存更好的数据"才允许写三处缓存
+            existing = _IN_MEMORY_CACHE.get(cache_key, {}).get("data")
+            if _refresh_is_valid(fresh, validate_fn, existing):
                 ts = time.time()
-                _IN_MEMORY_CACHE[cache_key] = {"data": fresh, "time": ts}
-                _LAST_SUCCESS[cache_key] = ts
-                cache = _load_cache()
-                cache[cache_key] = fresh
-                _save_cache(cache)
+                with _CACHE_LOCK:
+                    _IN_MEMORY_CACHE[cache_key] = {"data": fresh, "time": ts}
+                    _LAST_SUCCESS[cache_key] = ts
+                _cache_update(cache_key, fresh, ts)
         except Exception:
-            pass
+            pass          # 后台刷新失败不影响前台：旧内存/文件缓存原样保留
         finally:
-            _IN_FLIGHT.pop(cache_key, None)
-            evt.set()
+            _inflight_release(cache_key, evt)
 
     threading.Thread(target=_refresh, daemon=True).start()
 
@@ -115,11 +241,17 @@ def _get(url, params=None, timeout=8):
 
 def _market_status():
     """判断当前 A 股交易状态
-    返回: ('交易中'|'午间休盘'|'已收盘'|'周末休市', is_trading)
+    返回: ('交易中'|'午间休盘'|'已收盘'|'周末休市'|'节假日休市', is_trading)
+
+    2026-11：接入 market_calendar（法定节假日/调休补班）。
+    以前只判周末，国庆/春节期间会把上一交易日的快照当"交易中"返回。
+    没有日历文件时退回只判周末，但 calendar_info() 会明确标记未配置。
     """
     now = datetime.now()
-    if now.weekday() >= 5:
-        return ("周末休市", False)
+    cal = load_calendar()
+    trading_day, day_reason = is_trading_day(now.date(), cal)
+    if not trading_day:
+        return (day_reason, False)
     h, m = now.hour, now.minute
     minutes = h * 60 + m
     if 9*60+15 <= minutes < 9*60+30:
@@ -131,6 +263,19 @@ def _market_status():
     if 13*60 <= minutes < 15*60:
         return ("交易中", True)
     return ("已收盘", False)
+
+
+def calendar_info():
+    """给 /api/health 和测试用：日历配置状态（configured=False 说明节假日判断不完整）。"""
+    cal = load_calendar()
+    return {
+        "configured": cal["configured"],
+        "source": cal["source"],
+        "holidays": len(cal["holidays"]),
+        "extra_trading_days": len(cal["extra"]),
+        "error": cal["error"],
+        "path": os.path.basename(cal["path"]),
+    }
 
 
 def _has_valid_data(data):
@@ -169,7 +314,6 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
     status, is_trading = _market_status()
     ttl = ttl or _IN_MEMORY_TTL
     now = time.time()
-    cache = _load_cache()
 
     def _inject(value, asof):
         if isinstance(value, dict):
@@ -177,22 +321,34 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
             value = dict(value)
             value["_asof"] = asof
             value["_asof_known"] = asof is not None
+            age = (time.time() - asof) if asof else None
+            value["_age_sec"] = round(age, 1) if age is not None else None
+            # 陈旧判定：盘中 15 分钟；休盘时允许"最近一次收盘"的旧快照，
+            # 但超过 3 天（例如缓存停在两个月前）必须标出来，不能当最新行情。
+            if asof is None:
+                stale, why = True, "缓存没有抓取时间（旧格式），无法确认新鲜度"
+            else:
+                limit = STALE_AFTER_SEC if is_trading else 3 * 86400
+                stale = age > limit
+                why = "" if not stale else f"缓存已 {age/60:.0f} 分钟未更新"
+            value["_stale"] = stale
+            value["_stale_reason"] = why
             value["_market_status"] = status
             if source:
                 value["_source"] = source
         return value
 
-    def _store(value):
-        _IN_MEMORY_CACHE[cache_key] = {"data": value, "time": now}
-        _LAST_SUCCESS[cache_key] = now
-        # 2026-11: 落盘时连抓取时间一起存。原实现只存数据，
-        # 重启后 _LAST_SUCCESS 为空 → 旧数据被标成"刚刚获取"（前端显示的抓取时间全是假的）
-        cache[cache_key] = {"__data": value, "fetched_at": now}
-        _save_cache(cache)
+    def _store(value, ts=None):
+        ts = ts if ts is not None else now
+        _IN_MEMORY_CACHE[cache_key] = {"data": value, "time": ts}
+        _LAST_SUCCESS[cache_key] = ts
+        # 落盘结构与 _spawn_refresh 完全一致：{"__data": ..., "fetched_at": ...}
+        _cache_update(cache_key, value, ts)
         return value
 
     def _file_cache():
-        raw = cache.get(cache_key)
+        with _CACHE_LOCK:
+            raw = _load_cache().get(cache_key)
         if raw is None:
             return None
         if isinstance(raw, dict) and "__data" in raw:
@@ -205,10 +361,30 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
             _LAST_SUCCESS.setdefault(cache_key, fetched_at)
         return _inject(val, fetched_at)
 
+    def _ok(v):
+        """None 永远不算有效数据：宁可显示"暂无数据"，也不能把 null 存进缓存。"""
+        if v is None:
+            return False
+        return validate_fn is None or validate_fn(v)
+
+    def _timed_fetch():
+        """包一层计时：数据健康面板要"成功率 / 响应时间 / 最近错误"，只能在这里记。"""
+        t0 = time.time()
+        try:
+            v = fetcher()
+        except Exception as e:
+            record_source(source or cache_key, False, (time.time() - t0) * 1000,
+                          f"{type(e).__name__}: {str(e)[:120]}")
+            raise
+        good = _ok(v)
+        record_source(source or cache_key, good, (time.time() - t0) * 1000,
+                      "" if good else "返回空数据或未通过校验")
+        return v
+
     # 强制刷新：跳过所有缓存层，同步拉取并写回
     if force:
-        fresh = fetcher()
-        if validate_fn is None or validate_fn(fresh):
+        fresh = _timed_fetch()
+        if _ok(fresh):
             return _inject(_store(fresh), now)
         cached = _file_cache()
         if cached is not None:
@@ -222,18 +398,13 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
             return _inject(mem["data"], mem["time"])
         # 2) 过期内存 → SWR：先返回旧数据，后台异步重建
         if mem:
-            _spawn_refresh(cache_key, fetcher, validate_fn)
+            _spawn_refresh(cache_key, _timed_fetch, validate_fn)
             return _inject(mem["data"], mem["time"])
         # 3) 无内存 → single-flight 同步构建（并发只建一次，检查+注册原子化）
-        with _CACHE_LOCK:
-            evt = _IN_FLIGHT.get(cache_key)
-            if evt:
-                waiting = True
-            else:
-                evt = threading.Event()
-                _IN_FLIGHT[cache_key] = evt
-                waiting = False
+        evt, other = _inflight_acquire(cache_key)
+        waiting = evt is None
         if waiting:
+            evt = other
             evt.wait(5)  # 别人正在构建：最多等 5 秒
             mem = _IN_MEMORY_CACHE.get(cache_key)
             if mem:
@@ -243,28 +414,36 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
                 return cached
             return None
         try:
-            fresh = fetcher()
-            if validate_fn is None or validate_fn(fresh):
+            fresh = _timed_fetch()
+            if _ok(fresh):
                 return _inject(_store(fresh), now)
-            # 构建失败 → 文件缓存兜底
+            # 构建失败（含网络异常）→ 文件缓存兜底
             cached = _file_cache()
             if cached is not None:
                 return cached
             return fresh
+        except Exception:
+            # 抓取抛异常（超时/连接失败）不能把整个请求打成 500：
+            # 有旧缓存就返回旧缓存（带 _stale），没有就返回 None 让路由给"暂无数据"
+            cached = _file_cache()
+            return cached if cached is not None else None
         finally:
-            with _CACHE_LOCK:
-                _IN_FLIGHT.pop(cache_key, None)
-            evt.set()
+            _inflight_release(cache_key, evt)
 
     # 非交易时段：优先文件缓存（定格快照）
     cached = _file_cache()
-    if cached is not None:
+    # 注意：缓存值可能是 list（板块资金流），list 没有 _stale 字段，不能直接 .get()
+    if cached is not None and not (isinstance(cached, dict) and cached.get("_stale")):
         return cached
-    # 无缓存（全新部署/首次启动在休盘）：试着抓一次
-    fresh = fetcher()
-    if validate_fn is None or validate_fn(fresh):
+    # 无缓存，或缓存已经旧到不能代表"最近一次收盘"（例如停在两个月前）：
+    # 先尝试抓一次；抓到就存，抓不到才退回旧缓存并保留 _stale 标记。
+    try:
+        fresh = fetcher()
+    except Exception:
+        fresh = None
+    if _ok(fresh):
         return _inject(_store(fresh), now)
-    return fresh
+    return cached if cached is not None else fresh
 
 
 # ==============================================================
@@ -439,6 +618,9 @@ def get_sector_flow():
                 flow = round(change * random.uniform(2, 6), 2)
                 result.append({"name": name, "change": change, "flow": flow})
             result.sort(key=lambda x: x["change"], reverse=True)
+            # 模拟数据必须自带标记：调用方（图表/接口）据此显示"模拟数据"，不能混进真实分析
+            for row in result:
+                row["is_mock"] = True
         return result if result else None
 
     def _validate_sectors(data):
@@ -471,6 +653,27 @@ def _get_market_change():
 #  3. 个股行情（腾讯，最稳定）
 # ==============================================================
 
+def cache_meta(cache_key):
+    """给接口层用的缓存元信息：asof 是格式化字符串，is_stale 按交易/休盘分别判定。
+
+    list 型缓存（板块资金流）没法往数据里塞 _asof，只能从 _LAST_SUCCESS 反查。
+    """
+    ts = _LAST_SUCCESS.get(cache_key)
+    status, trading = _market_status()
+    if not ts:
+        return {"asof": None, "is_stale": True, "age_sec": None,
+                "reason": "没有成功的抓取记录", "market_status": status}
+    age = time.time() - ts
+    limit = STALE_AFTER_SEC if trading else 3 * 86400
+    return {
+        "asof": datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
+        "is_stale": age > limit,
+        "age_sec": round(age, 1),
+        "reason": "" if age <= limit else f"缓存已 {age/60:.0f} 分钟未更新",
+        "market_status": status,
+    }
+
+
 def get_stock_quote(stock_code):
     """个股实时行情"""
     parts = _tencent_quote(stock_code)
@@ -496,6 +699,10 @@ def get_stock_quote(stock_code):
         amplitude = float(parts[43]) if len(parts) > 43 and parts[43] else 0
         high_52w = float(parts[47]) if len(parts) > 47 and parts[47] else 0
         low_52w = float(parts[48]) if len(parts) > 48 and parts[48] else 0
+
+        # 价格缺失/为 0 不是"有效行情"：宁可让接口返回失败，也别让页面显示 0.00 元
+        if price <= 0:
+            return None
 
         return {
             "name": name, "code": stock_code,
@@ -716,8 +923,8 @@ def get_latest_financials(stock_code, refresh=False):
 def get_industry_pe(stock_code, refresh=False):
     """动态获取行业平均 PE（东财三步链：个股→行业名 f127→suggest搜BK→板块PE f9×100）
 
-    失败自动降级：INDUSTRY_PE_MAP 硬编码 → 默认 25（返回 source=static_map 标记）
-    返回 {"pe": float, "industry": 行业名, "source": "eastmoney"|"static_map", ...}
+    失败降级到 INDUSTRY_PE_MAP 静态表；**表里没有就是 None**（不再默认 25 倍）。
+    返回值带 source/source_label/is_static，页面必须把静态值标成"参考值"。
     """
     def fetch():
         market = "1" if stock_code.startswith(("6", "9")) else "0"
@@ -753,7 +960,9 @@ def get_industry_pe(stock_code, refresh=False):
                 return None
             return {"pe": round(pe / 100, 2),
                     "industry": ind_name,
-                    "source": "eastmoney"}
+                    "source": "eastmoney",
+                    "source_label": "东方财富行业板块动态 PE（实时接口）",
+                    "is_static": False}
         except Exception:
             return None
 
@@ -762,9 +971,23 @@ def get_industry_pe(stock_code, refresh=False):
                          source="eastmoney", ttl=3600, force=refresh)
     if result and result.get("pe"):
         return result
-    # 降级：静态映射表（source 标记，前端可提示"估值为静态参考"）
-    return {"pe": INDUSTRY_PE_MAP.get(stock_code, 25),
-            "industry": "未知", "source": "static_map"}
+    # 降级：静态映射表。⚠️ 只对表里有的股票生效；查不到就是 None，
+    # 不再默认 25 倍——用"全行业默认倍数"顶替，等于把"不知道"伪装成一个具体估值。
+    static_pe = INDUSTRY_PE_MAP.get(stock_code)
+    if static_pe:
+        return {"pe": static_pe,
+                "industry": "未知",
+                "source": "static_map",
+                "source_label": "内置静态行业 PE（人工估算，非实时，仅供参考）",
+                "is_static": True,
+                "asof": None}
+    return {"pe": None,
+            "industry": "未知",
+            "source": "unavailable",
+            "source_label": "行业 PE 不可用（东财接口失败，且该股票不在静态表内）",
+            "is_static": False,
+            "asof": None,
+            "reason": "没有真实行业 PE，不用默认倍数顶替"}
 
 
 def get_stock_valuation(stock_code, refresh=False):
@@ -795,7 +1018,7 @@ def get_stock_valuation(stock_code, refresh=False):
         level = "数据不可用"
         available = False
         reason = ("PE 缺失（亏损股 / 停牌 / 行情源未返回），无法计算估值偏离"
-                  if pe <= 0 else "行业 PE 不可用，无法计算偏离度")
+                  if pe <= 0 else "行业 PE 不可用（未取到实时板块 PE，且该股票不在静态表内），无法计算偏离度")
 
     result = {
         "pe": round(pe, 2) if pe > 0 else None,
@@ -806,6 +1029,9 @@ def get_stock_valuation(stock_code, refresh=False):
         "industry_pe": industry_pe,
         "industry_name": industry_name,
         "industry_pe_source": ind.get("source", "unknown"),
+        # 静态表是人工估算、不随时间变化，必须让页面能显示"参考值"标签
+        "industry_pe_source_label": ind.get("source_label", ""),
+        "industry_pe_is_static": bool(ind.get("is_static")),
         "deviation_pe": deviation_pe,
         "level": level,
         "level_reason": reason,
@@ -949,21 +1175,24 @@ def _mock_index_history(index_code, days=30):
                       "close": round(price, 2),
                       "high": round(price * (1 + abs(random.uniform(0, 0.02))), 2),
                       "low": round(price * (1 - abs(random.uniform(0, 0.02))), 2),
-                      "volume": random.randint(5000000, 30000000)})
+                      "volume": random.randint(5000000, 30000000),
+                      "is_mock": True})      # 模拟 K 线，禁止当真实行情用
     return result
 
 
 
 def estimate_intrinsic_value(stock_quote):
-    """估算内在价值（2026-08 升级：结合最新季报 + 动态行业PE）
+    """估算内在价值（PE 估算法）
 
-    EPS 优先取最新财报并按报告期年化（年报×1 / 三季报×4/3 / 中报×2 / 一季报×4），
-    取不到财报才退回 价格/PE 反推；
-    行业PE 优先东财动态板块PE，失败退回 INDUSTRY_PE_MAP 静态映射表。
-    内在价值 = 年化EPS × 行业PE × 0.8（安全边际）
+    内在价值 = 年化 EPS × 行业 PE × VALUATION_SAFETY_MARGIN
+    ├ EPS：只认「最新财报 EPS 按报告期年化」（年报×1 / 三季报×4/3 / 中报×2 / 一季报×4）
+    └ 行业 PE：东财动态板块 PE；失败退静态表；都没有 → 不算
 
-    2026-11：原实现 EPS 取不到时 intrinsic = price，偏离度恒为 0 ——
-    等于用股价自证"合理"。现在直接返回 available=False + 原因，不再伪造一致。
+    2026-11 整改（对应外部评审 P1-4）：
+    1. 0.8 从魔法数字改成 config.VALUATION_SAFETY_MARGIN，并在 model_params 里回显
+    2. price/PE 反推的 EPS 不再参与内在价值计算——那是用股价自证合理；
+       改成一个独立的 pe_reference（相对 PE 参考估值），明确标注不是财报口径
+    3. 行业 PE 拿不到就 available=False，不再有"默认 25 倍"
     """
     pe = stock_quote.get("pe", 0) or 0
     price = stock_quote.get("price", 0)
@@ -973,39 +1202,75 @@ def estimate_intrinsic_value(stock_quote):
     industry_pe = ind["pe"]
     industry_name = ind.get("industry", "未知")
 
-    # EPS：优先最新财报（按报告期年化）；亏损（EPS<=0）不适用 PE 估算法
-    eps, eps_source = 0, "none"
+    # EPS：只认最新财报（按报告期年化）；亏损（EPS<=0）不适用 PE 估算法
+    eps, eps_source = None, "report_missing"
+    raw_eps, report_date, annual_factor = None, "", None
     fin = get_latest_financials(code)
     if fin and fin.get("eps") not in (None, ""):
         try:
             raw_eps = float(fin["eps"])
+            report_date = str(fin.get("report_date") or "")
             if raw_eps > 0:
-                month = int((fin.get("report_date") or "12")[5:7])
+                month = int((report_date or "12")[5:7])
                 annual_factor = {3: 4, 6: 2, 9: 4 / 3, 12: 1}.get(month, 1)
                 eps = round(raw_eps * annual_factor, 3)
                 eps_source = "quarterly_report"
             else:
                 eps_source = "report_nonpositive"
-        except Exception:
-            eps = 0
-    if not eps and pe > 0 and price:
-        # 用当前 PE 反推 EPS：数学上等价于"比较个股PE与行业PE"，不是真实财报值，来源要标清
-        eps = round(price / pe, 3)
-        eps_source = "price_pe_derived"
+        except (TypeError, ValueError):
+            eps, eps_source = None, "report_unparsable"
+
+    model_params = {
+        "formula": "年化EPS × 行业PE × safety_margin",
+        "safety_margin": VALUATION_SAFETY_MARGIN,
+        "eps_source_rule": "仅财报 EPS，按报告期年化；不使用 price/PE 反推值",
+        # 透明化（P1-4）：财报期、原始 EPS、年化系数都回显，页面能核对
+        "report_date": report_date or None,
+        "raw_eps": raw_eps,
+        "annual_factor": annual_factor,
+        "ttm_used": False,
+        "basis": ("EPS 取 %s 报告期原始值 %s，按 %s 年化；TTM 未使用"
+                  % (report_date or "未知", raw_eps, annual_factor)
+                  if report_date else "无可用财报期，EPS 未参与计算"),
+    }
+
+    # 相对 PE 参考：个股 PE 回归行业 PE 时的理论价，用途是"横向比较"，不是内在价值
+    pe_reference = None
+    if pe > 0 and price and industry_pe:
+        pe_reference = {
+            "available": True,
+            "value": round(price * industry_pe / pe, 2),
+            "eps_derived": round(price / pe, 3),
+            "label": "相对PE参考（假设个股PE回归行业PE，非财报口径）",
+            "reference_only": True,
+            "industry_pe": industry_pe,
+            "industry_pe_source": ind.get("source", "unknown"),
+            "industry_pe_is_static": bool(ind.get("is_static")),
+        }
 
     if not eps or not industry_pe:
-        reason = ("最新财报 EPS ≤ 0（亏损），PE 估算法不适用" if eps_source == "report_nonpositive"
-                  else "缺少可用的 EPS / 行业 PE，无法估算内在价值")
+        if eps_source == "report_nonpositive":
+            reason = "最新财报 EPS ≤ 0（亏损），PE 估算法不适用"
+        elif eps_source == "report_unparsable":
+            reason = "财报 EPS 字段无法解析"
+        elif eps is None:
+            reason = "缺少真实财报 EPS（没有季报数据），不以内生价值口径估算（不再用股价/PE 反推）"
+        else:
+            reason = "行业 PE 不可用（实时板块 PE 未取到，且该股票不在静态表内）"
         return {
             "price": price, "intrinsic_value": None, "gap": None,
             "available": False, "reason": reason,
             "pe": round(pe, 2) if pe > 0 else None,
             "industry_pe": industry_pe, "industry_name": industry_name,
+            "industry_pe_source": ind.get("source", "unknown"),
+            "industry_pe_is_static": bool(ind.get("is_static")),
             "eps": None, "eps_source": eps_source,
+            "pe_reference": pe_reference,
+            "model_params": model_params,
             "financials": fin,
         }
 
-    intrinsic = round(eps * industry_pe * 0.8, 2)
+    intrinsic = round(eps * industry_pe * VALUATION_SAFETY_MARGIN, 2)
     return {
         "price": price, "intrinsic_value": intrinsic,
         "gap": round((price - intrinsic) / intrinsic * 100, 1) if intrinsic else None,
@@ -1013,7 +1278,11 @@ def estimate_intrinsic_value(stock_quote):
         "pe": round(pe, 2) if pe > 0 else None,
         "industry_pe": industry_pe,
         "industry_name": industry_name,
+        "industry_pe_source": ind.get("source", "unknown"),
+        "industry_pe_is_static": bool(ind.get("is_static")),
         "eps": eps, "eps_source": eps_source,
+        "pe_reference": pe_reference,
+        "model_params": model_params,
         "financials": fin,
     }
 
@@ -1060,4 +1329,5 @@ def _mock_sector_valuation():
     return [{"name": n, "pe": round(p * random.uniform(0.7,1.3), 2),
              "pb": round(q * random.uniform(0.8,1.2), 2),
              "change": round(random.uniform(-3,3), 2),
-             "market_cap": round(random.uniform(500,30000), 2)} for n, p, q in sectors]
+             "market_cap": round(random.uniform(500,30000), 2),
+             "is_mock": True} for n, p, q in sectors]   # 模拟估值，前端必须标"模拟数据"

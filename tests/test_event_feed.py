@@ -72,9 +72,10 @@ class TestParse(FeedCase):
             raise OSError("blocked")
 
         with mock.patch.object(event_feed, "_get", side_effect=boom):
-            items, errors = event_feed.fetch_headlines()
+            items, errors, ok = event_feed.fetch_headlines()
         self.assertEqual(items, [])
         self.assertEqual(len(errors), 2)                     # 两个源各自报错，不抛异常
+        self.assertEqual(ok, 0)                              # 全失败 → 成功源数 0
 
 
 class TestScreen(FeedCase):
@@ -109,20 +110,24 @@ class TestSeen(FeedCase):
                   "summary": "", "url": "", "published_at": ""}]
         kept = event_feed.screen(items, keywords=["A", "B"])
         self.assertEqual(len(kept), 2)
-        event_feed.mark(kept[:1], "shown")
+        event_feed.mark(kept[:1])                 # 只展示 → pending，不算已处理
+        self.assertNotIn(kept[0]["fp"], event_feed.seen_fps())
+        self.assertIn(kept[0]["fp"], event_feed.pending_fp())
+        event_feed.mark(kept[1:], review="rejected")   # 人工驳回 → 不再出现
         seen = event_feed.seen_fps()
-        self.assertIn(kept[0]["fp"], seen)
-        self.assertNotIn(kept[1]["fp"], seen)
+        self.assertIn(kept[1]["fp"], seen)
+        self.assertNotIn(kept[1]["fp"], event_feed.pending_fp())
 
     def test_mark_is_idempotent(self):
         item = {"source": "东财快讯", "source_key": "eastmoney", "title": "C",
                 "summary": "", "url": "", "published_at": ""}
         kept = event_feed.screen([item], keywords=["C"])
-        event_feed.mark(kept, "shown")
-        event_feed.mark(kept, "accepted")
+        event_feed.mark(kept)                                  # 展示
+        event_feed.mark(kept, process="ingested", review="approved")
         rows = event_feed.recent_seen(days=1)
         self.assertEqual(len(rows), 1)                        # 不重复插入
-        self.assertEqual(rows[0]["decision"], "accepted")     # decision 被更新
+        self.assertEqual(rows[0]["review_status"], "approved")
+        self.assertEqual(rows[0]["process_status"], "ingested")
 
     def test_to_event_text(self):
         text = event_feed.to_event_text(

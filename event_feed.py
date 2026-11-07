@@ -49,12 +49,15 @@ DEFAULT_KEYWORDS = POLICY_KEYWORDS + MARKET_KEYWORDS
 
 SEEN_SCHEMA = """
 CREATE TABLE IF NOT EXISTS feed_seen (
-    fp         TEXT PRIMARY KEY,
-    source     TEXT NOT NULL,
-    title      TEXT NOT NULL,
-    url        TEXT NOT NULL DEFAULT '',
-    first_seen TEXT NOT NULL,
-    decision   TEXT NOT NULL DEFAULT 'shown'
+    fp            TEXT PRIMARY KEY,
+    source        TEXT NOT NULL,
+    title         TEXT NOT NULL,
+    url           TEXT NOT NULL DEFAULT '',
+    first_seen    TEXT NOT NULL,
+    decision      TEXT NOT NULL DEFAULT 'pending',
+    review_status TEXT NOT NULL DEFAULT 'pending',
+    process_status TEXT NOT NULL DEFAULT 'pending',
+    event_id      INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_feed_seen_time ON feed_seen(first_seen DESC);
 """
@@ -128,19 +131,27 @@ SOURCES = {"eastmoney": fetch_eastmoney, "sina": fetch_sina}
 
 
 def fetch_headlines(sources=None, limit=50):
-    """按源抓取；单个源挂掉不影响其他源（返回 errors 供 CLI 提示）。"""
+    """按源抓取，返回 (items, errors, ok_sources)。
+
+    ok_sources 是**成功来源数**（返回空列表也算成功）：CLI 靠它区分
+    “全部源都挂了”和“源正常、今天确实没新闻”——只看 items 为空会把故障当安静。
+    """
     keys = sources or list(SOURCES)
-    items, errors = [], []
+    items, errors, ok = [], [], 0
     for k in keys:
         fn = SOURCES.get(k)
         if not fn:
             errors.append(f"未知源: {k}")
             continue
         try:
-            items.extend(fn(limit=limit))
+            got = fn(limit=limit)
+            if not isinstance(got, list):
+                raise ValueError("源返回结构异常")
+            items.extend(got)
+            ok += 1                                 # 空列表也算这个源成功
         except Exception as e:                      # 网络问题不该让整个 feed 挂掉
             errors.append(f"{k}: {type(e).__name__} {str(e)[:60]}")
-    return items, errors
+    return items, errors, ok
 
 
 # ---------------------------------------------------------------- 筛选 / 去重
@@ -245,23 +256,60 @@ def init_seen(conn=None):
     own = conn is None
     conn = conn or events_store.connect()
     conn.executescript(SEEN_SCHEMA)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(feed_seen)").fetchall()}
+    migrated = False
+    for name, decl in (("event_id", "INTEGER"),
+                       ("review_status", "TEXT NOT NULL DEFAULT 'pending'"),
+                       ("process_status", "TEXT NOT NULL DEFAULT 'pending'")):
+        if name not in cols:
+            try:
+                conn.execute(f"ALTER TABLE feed_seen ADD COLUMN {name} {decl}")
+                migrated = migrated or name in ("review_status", "process_status")
+            except Exception:
+                pass
+
+    # 旧 decision → 两维状态迁移：只在补列那一次执行。
+    # 若每次 init 都跑，会把后来人工写入的 rejected/approved（decision 列仍为 pending）
+    # 又刷回 pending —— 人工结论被自动“洗白”比丢候选更严重。
+    if migrated:
+        conn.execute("UPDATE feed_seen SET process_status='extract_failed', "
+                     "review_status='pending' WHERE decision='extract_failed'")
+        conn.execute("UPDATE feed_seen SET process_status='ingested', review_status='approved' "
+                     "WHERE decision IN ('ingested','accepted')")
+        conn.execute("UPDATE feed_seen SET process_status='pending', review_status='pending' "
+                     "WHERE decision IN ('shown','skipped','pending')")
     conn.commit()
     if own:
         conn.close()
 
 
 def seen_fps(conn=None):
+    """已经**人工处理完**的候选（approved / rejected / ingested）。
+
+    这些才该从待处理列表里消失；pending 和 extract_failed 必须继续出现。
+    """
     init_seen(conn)
     own = conn is None
     conn = conn or events_store.connect()
-    s = {r[0] for r in conn.execute("SELECT fp FROM feed_seen")}
+    s = {r[0] for r in conn.execute(
+        "SELECT fp FROM feed_seen WHERE review_status IN ('approved','rejected') "
+        "OR process_status='ingested'")}
     if own:
         conn.close()
     return s
 
 
-def mark(items, decision="shown", conn=None):
-    """记下这批候选，避免下次重复打扰。decision: shown / accepted / skipped"""
+def mark(items, process="pending", conn=None, event_id=None, review=None):
+    """更新候选状态（双维度）：
+
+    review_status : pending（待人工审核）/ approved / rejected —— 只有人能改
+    process_status: pending / extract_failed / ingested —— 机器处理进度
+
+    要点：
+      - 展示候选只写 process=pending，绝不改 review_status
+      - 已 approved/rejected 的候选，后续采集不能覆盖人工结论（rule 8）
+      - extract_failed 保留 review=pending，下次继续出现
+    """
     init_seen(conn)
     own = conn is None
     conn = conn or events_store.connect()
@@ -270,14 +318,54 @@ def mark(items, decision="shown", conn=None):
     for it in items:
         fp = it.get("fp") or _fp(it)
         conn.execute(
-            "INSERT INTO feed_seen (fp,source,title,url,first_seen,decision) VALUES (?,?,?,?,?,?) "
-            "ON CONFLICT(fp) DO UPDATE SET decision=excluded.decision",
-            (fp, it.get("source", ""), it.get("title", ""), it.get("url", ""), now, decision))
+            "INSERT INTO feed_seen (fp,source,title,url,first_seen,decision,"
+            "review_status,process_status,event_id) VALUES (?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(fp) DO UPDATE SET "
+            "process_status=CASE "
+            "  WHEN feed_seen.process_status='ingested' "
+            "       AND excluded.process_status IN ('pending','extract_failed') "
+            "  THEN feed_seen.process_status ELSE excluded.process_status END, "
+            "review_status=CASE "
+            "  WHEN feed_seen.review_status IN ('approved','rejected') "
+            "       AND excluded.review_status='pending' THEN feed_seen.review_status "
+            "  ELSE COALESCE(excluded.review_status, feed_seen.review_status) END, "
+            "event_id=COALESCE(excluded.event_id, feed_seen.event_id)",
+            (fp, it.get("source", ""), it.get("title", ""), it.get("url", ""),
+             now, process, review or "pending", process,
+             event_id if event_id is not None else it.get("event_id")))
         n += 1
     conn.commit()
     if own:
         conn.close()
     return n
+
+
+def pending_fp(conn=None):
+    """未完成人工审核的候选（含抽取失败）。"""
+    init_seen(conn)
+    own = conn is None
+    conn = conn or events_store.connect()
+    rows = {r[0] for r in conn.execute(
+        "SELECT fp FROM feed_seen WHERE review_status='pending' "
+        "AND process_status<>'ingested'")}
+    if own:
+        conn.close()
+    return rows
+
+
+def decision_stats(conn=None):
+    """按两个维度统计：待审核/通过/驳回 × 待处理/抽取失败/已入库。"""
+    init_seen(conn)
+    own = conn is None
+    conn = conn or events_store.connect()
+    out = {"review": {}, "process": {}}
+    for r in conn.execute("SELECT review_status, COUNT(*) FROM feed_seen GROUP BY review_status"):
+        out["review"][r[0]] = r[1]
+    for r in conn.execute("SELECT process_status, COUNT(*) FROM feed_seen GROUP BY process_status"):
+        out["process"][r[0]] = r[1]
+    if own:
+        conn.close()
+    return out
 
 
 def recent_seen(days=7, limit=50, conn=None):

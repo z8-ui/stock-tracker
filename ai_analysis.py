@@ -15,7 +15,7 @@ import json
 import requests
 from datetime import datetime, timedelta
 
-from config import DEEPSEEK_API_KEY
+from config import DEEPSEEK_API_KEY, AI_CACHE_TTL_SEC
 from technical import calc_fibonacci_levels
 
 # 腾讯 K线接口(兜底)
@@ -382,7 +382,11 @@ def call_deepseek(prompt, api_key=None):
         data = resp.json()
         return data["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        return f"AI 分析调用失败: {e}"
+        # 错误信息可能带请求上下文；绝不把 key 原样回显（会进前端/日志/剪贴板）
+        msg = str(e)
+        if key and key in msg:
+            msg = msg.replace(key, "[REDACTED]")
+        return f"AI 分析调用失败: {msg[:200]}"
 
 
 # ========== 5. 对外主函数 ==========
@@ -411,6 +415,15 @@ def _save_cache(cache):
         pass
 
 
+def _cache_age_seconds(created_at):
+    """缓存年龄（秒）；时间格式坏掉返回 None（按"过期"处理，不能假装新鲜）。"""
+    try:
+        t = datetime.strptime(created_at or "", "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, (datetime.now() - t).total_seconds())
+
+
 def analyze(code, name, market=None, refresh=False, api_key=None):
     """输入代码+名称(+市场前缀), 返回 {analysis, indicators, cached, cached_at, kline_date}
     refresh=True 时强制重新分析并覆盖缓存
@@ -418,11 +431,13 @@ def analyze(code, name, market=None, refresh=False, api_key=None):
     """
     cache_key = f"{market or 'sz'}{code}"
 
-    # 命中缓存直接返回(秒开, 不调K线/DeepSeek)
+    # 命中缓存直接返回(秒开, 不调K线/DeepSeek)；超过 TTL 视为未命中
     if not refresh:
         cache = _load_cache()
         hit = cache.get(cache_key)
-        if hit and hit.get("analysis") and hit.get("indicators"):
+        age = _cache_age_seconds((hit or {}).get("created_at", ""))
+        if (hit and hit.get("analysis") and hit.get("indicators")
+                and age is not None and age <= AI_CACHE_TTL_SEC):
             return {
                 "analysis": hit["analysis"],
                 "indicators": hit["indicators"],

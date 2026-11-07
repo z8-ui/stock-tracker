@@ -1,6 +1,35 @@
 // 估值偏离页 专属脚本（从 valuation.html 抽出，2026-08）
 // 依赖: base.html 中的 echarts CDN + app.js（getChart 等共享函数）
 
+// ========== XSS 防护 ==========
+// 股票名、政策事件标题/摘要/来源都可能含 < > " '，直接拼 innerHTML 会被当成标签执行。
+// 模板里也不再拼 onclick="fn('名字')"（名字里的引号能直接闭合字符串），改用 data-* + 事件委托。
+function valEsc(v) {
+    return String(v === null || v === undefined ? '' : v)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+document.addEventListener('click', function (ev) {
+    var rm = ev.target.closest && ev.target.closest('[data-val-remove]');
+    if (rm) {
+        ev.stopPropagation();
+        removeValWatchlist(rm.getAttribute('data-val-remove'));
+        return;
+    }
+    var tg = ev.target.closest && ev.target.closest('[data-val-toggle]');
+    if (tg) {
+        toggleValWatchlist(tg.getAttribute('data-val-toggle'), tg.getAttribute('data-val-name') || '');
+        return;
+    }
+    var el = ev.target.closest && ev.target.closest('[data-val-code]');
+    if (el) {
+        var c = el.getAttribute('data-val-code'), n = el.getAttribute('data-val-name') || '';
+        if (el.hasAttribute('data-val-search')) loadStockValBySearch(c, n);
+        else loadStockVal(c, n);
+    }
+});
+
 // ========== 共享自选股池（与个股资金页共用 localStorage key: stockWatchlist） ==========
 function getWatchlist() {
     try { return JSON.parse(localStorage.getItem('stockWatchlist') || '[]'); } catch(e) { return []; }
@@ -31,8 +60,9 @@ function renderValWatchlist() {
         return;
     }
     el.innerHTML = w.map(function(i) {
-        return '<button class="chip" onclick="loadStockVal(\'' + i.code + '\',\'' + i.name + '\')">' + i.name +
-               ' <span onclick="event.stopPropagation();removeValWatchlist(\'' + i.code + '\')" style="margin-left:4px;cursor:pointer;">✕</span></button>';
+        var code = valEsc(i.code), name = valEsc(i.name);
+        return '<button class="chip" data-val-code="' + code + '" data-val-name="' + name + '">' + name +
+               ' <span data-val-remove="' + code + '" style="margin-left:4px;cursor:pointer;">✕</span></button>';
     }).join('');
 }
 function removeValWatchlist(code) {
@@ -61,7 +91,8 @@ function renderValHistory() {
     var el = document.getElementById('val-search-history');
     if (!h.length) { el.innerHTML = '<p class="hint">暂无</p>'; return; }
     el.innerHTML = h.map(function(i) {
-        return '<button class="chip" onclick="loadStockVal(\'' + i.code + '\',\'' + i.name + '\')">' + i.name + '</button>';
+        var code = valEsc(i.code), name = valEsc(i.name);
+        return '<button class="chip" data-val-code="' + code + '" data-val-name="' + name + '">' + name + '</button>';
     }).join('');
 }
 function searchValStock() {
@@ -76,7 +107,9 @@ function searchValStock() {
                 return;
             }
             el.innerHTML = res.data.map(function(s) {
-                return '<button class="chip" onclick="loadStockValBySearch(\'' + s.code + '\',\'' + s.name + '\')">' + s.name + ' (' + s.code + ')</button>';
+                var code = valEsc(s.code), name = valEsc(s.name);
+                return '<button class="chip" data-val-code="' + code + '" data-val-name="' + name + '" ' +
+                       'data-val-search="1">' + name + ' (' + code + ')</button>';
             }).join('');
         });
 }
@@ -98,8 +131,8 @@ function buildFinancialsHtml(fin) {
     var roe = (fin.roe === null || fin.roe === undefined) ? '-' : Number(fin.roe).toFixed(2) + '%';
     return '<hr>' +
         '<p style="color:#e0e0e0;font-weight:bold;margin:6px 0;">📊 最新财报 ' +
-        '<span style="color:#8892b0;font-size:11px;font-weight:normal;">' + (fin.report_name || '') +
-        ' · 披露 ' + (fin.notice_date || '-') + '</span></p>' +
+        '<span style="color:#8892b0;font-size:11px;font-weight:normal;">' + valEsc(fin.report_name || '') +
+        ' · 披露 ' + valEsc(fin.notice_date || '-') + '</span></p>' +
         '<div class="summary-row"><span class="label">EPS（基本）</span><span class="value">' + eps + ' 元</span></div>' +
         '<div class="summary-row"><span class="label">净利润同比</span><span class="value" style="color:' + pctColor(fin.profit_yoy) + ';">' + fmtPct(fin.profit_yoy) + '</span></div>' +
         '<div class="summary-row"><span class="label">营收同比</span><span class="value" style="color:' + pctColor(fin.revenue_yoy) + ';">' + fmtPct(fin.revenue_yoy) + '</span></div>' +
@@ -108,22 +141,216 @@ function buildFinancialsHtml(fin) {
         ' / 营收 ' + fmtYi(fin.revenue) + '（东财F10，缓存6小时）</p>';
 }
 
-function buildPolicyHtml(notes) {
-    if (!notes || !notes.length) return '';
-    var dirColor = {'利好': '#ef5350', '利空': '#26a69a', '中性': '#ffb74d'};
-    var html = '<hr><p style="color:#e0e0e0;font-weight:bold;margin:6px 0;">📰 政策与事件 ' +
-        '<span style="color:#8892b0;font-size:11px;font-weight:normal;">估值偏离需结合政策/财报综合判断</span></p>';
-    notes.forEach(function(n) {
-        var c = dirColor[n.direction] || '#ffb74d';
-        html += '<div style="border-left:3px solid ' + c + ';padding:4px 8px;margin:6px 0;background:rgba(255,255,255,0.03);">' +
-            '<div><span style="color:' + c + ';font-weight:bold;font-size:11px;">[' + (n.direction || '中性') + ']</span> ' +
-            '<span style="font-size:12px;color:#e0e0e0;">' + n.title + '</span>' +
-            '<span style="color:#8892b0;font-size:11px;margin-left:6px;">' + (n.date || '') + '</span></div>' +
-            '<div style="color:#8892b0;font-size:11px;margin-top:2px;line-height:1.6;">' + (n.impact || '') + '</div>' +
-            '<div style="color:#5a6a8a;font-size:10px;margin-top:2px;">来源：' + (n.source || '-') + '</div>' +
-            '</div>';
+// 只放行 http/https：source_url 来自外部新闻，javascript:/data: 能直接执行
+function policyUrl(u) {
+    if (!u) return '';
+    try {
+        var x = new URL(String(u), window.location.origin);
+        return (x.protocol === 'http:' || x.protocol === 'https:') ? x.href : '';
+    } catch (e) { return ''; }
+}
+
+function policyBadge(text, color) {
+    if (!text) return '';
+    return '<span style="display:inline-block;border:1px solid ' + color + ';color:' + color +
+        ';border-radius:4px;padding:0 5px;font-size:11px;margin:0 4px 2px 0;">' + valEsc(text) + '</span>';
+}
+
+// 关联类型 → 颜色 / 文案（与后端 policy_live.RELATION_LABEL 保持一致）
+var POLICY_REL_STYLE = {
+    'direct': { color: '#ef5350', label: '直接影响（公司公告）' },
+    'business_related': { color: '#ffb74d', label: '主营业务相关' },
+    'industry_indirect': { color: '#42a5f5', label: '产业链/行业间接' },
+    'macro_related': { color: '#8892b0', label: '宏观政策影响' },
+    'unconfirmed': { color: '#5c6b8a', label: '关联待确认' }
+};
+
+// 一条政策事件：关系类型 / 方向 / 影响程度 / 审核状态 / 三个时间 / 机制 / 证据 / 原文链接
+function policyItemHtml(n) {
+    var rel = POLICY_REL_STYLE[n.relation_type] || POLICY_REL_STYLE['unconfirmed'];
+    var relColor = rel.color;
+    var dirColor = { '利好': '#ef5350', '利空': '#26a69a', '中性': '#ffb74d', '待确认': '#8892b0' }[n.direction] || '#8892b0';
+
+    var when = n.occurred_at
+        ? valEsc(String(n.occurred_at).slice(0, 10))
+        : (n.published_at
+            ? '发布 ' + valEsc(String(n.published_at).slice(0, 10)) + '（发生日期未知）'
+            : '发生日期未知');
+    if (n.collected_at) when += ' · 采集 ' + valEsc(String(n.collected_at).slice(0, 10));
+
+    var url = policyUrl(n.source_url);
+    var link = url
+        ? '<a href="' + valEsc(url) + '" target="_blank" rel="noopener noreferrer" style="color:#42a5f5;text-decoration:none;">原文 ↗</a>'
+        : '<span style="color:#5c6b8a;">无原文链接</span>';
+
+    return '<div style="border-left:3px solid ' + relColor + ';padding:6px 9px;margin:8px 0;background:rgba(255,255,255,0.03);">' +
+        '<div style="margin-bottom:3px;">' +
+            policyBadge(n.relation_label || rel.label, relColor) +
+            policyBadge(n.direction, dirColor) +
+            policyBadge('影响程度：' + (n.impact_level || '待确认'), '#8892b0') +
+            (n.review_status === 'approved' ? policyBadge('已审核', '#26a69a') : policyBadge('未审核', '#ffb74d')) +
+        '</div>' +
+        '<div style="font-size:13px;color:#e6f1ff;">' + valEsc(n.title) + '</div>' +
+        '<div style="color:#8892b0;font-size:11px;margin-top:3px;">' + when + ' · ' + link + '</div>' +
+        (n.mechanism ? '<div style="color:#a8b8d8;font-size:12px;margin-top:4px;line-height:1.6;">影响机制：' + valEsc(n.mechanism) + '</div>' : '') +
+        (n.relation_basis ? '<div style="color:#5a6a8a;font-size:11px;margin-top:2px;">关联依据：' + valEsc(n.relation_basis) + '</div>' : '') +
+        (n.evidence ? '<div style="color:#5a6a8a;font-size:11px;margin-top:2px;">' + valEsc(n.evidence) + '</div>' : '') +
+        '</div>';
+}
+
+// 个股画像抬头：行业 / 产业链 / 主营业务 / 关键词。资料缺失时明说"缺失"，不补内容。
+function policyProfileHtml(profile, industry) {
+    if (!profile || (!profile.name && !profile.industry && !profile.business && !industry)) return '';
+    var bits = [];
+    var ind = profile.industry || industry || '';
+    if (ind) bits.push('行业：' + valEsc(ind));
+    if (profile.industry_chain && profile.industry_chain.length) {
+        bits.push('产业链：' + valEsc(profile.industry_chain.join(' > ')));
+    }
+    var role = '行业：' + valEsc(ind || '未知');
+    var biz = profile.business_short
+        ? '主营业务：' + valEsc(profile.business_short) +
+          '<span style="color:#5c6b8a;font-size:10px;">（' + valEsc(profile.business_source || '来源未标注') + '）</span>'
+        : '<span style="color:#ffb74d;">主营业务资料缺失（未获取到公司概况，不使用推测内容）</span>';
+    var kw = (profile.keywords && profile.keywords.length)
+        ? '检索关键词：' + valEsc(profile.keywords.slice(0, 8).join('、'))
+        : '';
+    var src = profile.source_url
+        ? '<a href="' + valEsc(profile.source_url) + '" target="_blank" rel="noopener noreferrer" style="color:#42a5f5;text-decoration:none;">' + valEsc(profile.source || '来源') + ' ↗</a>'
+        : '';
+    return '<div style="border-left:3px solid #42a5f5;padding:5px 9px;margin-bottom:6px;background:rgba(66,165,245,0.06);font-size:12px;color:#a8b8d8;">' +
+        '<div>' + (bits.length ? bits.join(' · ') : role) + '</div>' +
+        '<div style="margin-top:2px;">' + biz + '</div>' +
+        (kw ? '<div style="margin-top:2px;color:#5c6b8a;font-size:11px;">' + kw + '</div>' : '') +
+        (src ? '<div style="margin-top:2px;font-size:10px;">' + src + '</div>' : '') +
+        '</div>';
+}
+
+function renderPolicy(events, meta, industry, profile) {
+    var box = document.getElementById('valuation-policy');
+    if (!box) return;
+    events = events || [];
+    var head = document.getElementById('val-policy-meta');
+    if (head) head.textContent = events.length ? ('共 ' + events.length + ' 条' + (industry ? ' · ' + industry : '')) : (industry || '');
+    var profileHtml = policyProfileHtml(profile, industry);
+
+    if (!events.length) {
+        // 2.4：success / empty / partial / failed 必须分开说，不能把"取不到"说成"没有"
+        var ls = meta && meta.live_status ? String(meta.live_status) : '';
+        var msg = '库里暂无已确认的相关政策与事件';
+        var reason = '';
+        if (meta && meta.data_status === 'unavailable') reason = '事件库不可用（不等于"没有政策"）';
+        else if (meta && meta.status === 'error') reason = '请求失败';
+        if (ls === 'failed') {
+            msg = '实时检索失败，所有数据源都没返回结果';
+            reason = '这是"没取到"，不等于"没有相关政策"';
+        } else if (ls === 'partial') {
+            msg = '部分数据源检索失败，结果可能不完整';
+            var det = meta.live_status_detail || {};
+            reason = Object.keys(det).map(function (k) { return k + '：' + det[k]; }).join('；');
+        } else if (ls === 'empty') {
+            msg = '检索已完成，公告与快讯中确无相关条目';
+        } else if (ls === 'success') {
+            msg = '检索成功，但未命中与该公司业务相关的条目';
+        }
+        box.innerHTML = profileHtml + '<p style="color:#8892b0;font-size:12px;">' + valEsc(msg) +
+            (reason ? '（' + valEsc(reason) + '）' : '') + '。</p>' +
+            '<p style="color:#5c6b8a;font-size:11px;">可点右上角「🔍 实时检索公告」强制重新拉取（结果未审核，只作线索）。</p>';
+        return;
+    }
+    var counts = {};
+    events.forEach(function (e) {
+        var k = e.relation_type || 'unconfirmed';
+        counts[k] = (counts[k] || 0) + 1;
     });
-    return html;
+    var summary = Object.keys(counts).map(function (k) {
+        var st = POLICY_REL_STYLE[k] || POLICY_REL_STYLE['unconfirmed'];
+        return '<span style="color:' + st.color + ';">' + valEsc(st.label) + ' ' + counts[k] + '</span>';
+    }).join(' · ');
+    box.innerHTML = profileHtml +
+        (summary ? '<div style="font-size:11px;color:#5c6b8a;margin:2px 0 4px;">' + summary + '</div>' : '') +
+        events.map(policyItemHtml).join('');
+}
+
+// ========== 个股政策与事件：自动加载 + 竞态防护 ==========
+//
+// 2026-11 修复（P1）：
+//   1. 切股票必须让在飞的政策请求立刻失效 —— 旧实现只在手动检索里 ++policySeq，
+//      loadStockVal 不同步，于是"贵州茅台的慢响应"能落到紫金矿业页面上。
+//   2. 响应回来要同时校验三件事：序号仍有效 + 页面当前股票没变 + 响应里的股票码没变。
+//   3. 加载 / 空 / 失败 三种状态分开显示，失败不许伪装成"没有政策"。
+//   4. 切股票后自动拉取，不再要求用户点按钮（按钮保留，用于强制刷新）。
+
+var policySeq = 0;
+var policyAbort = null;
+
+function invalidatePolicyRequest() {
+    policySeq += 1;
+    if (policyAbort) {
+        try { policyAbort.abort(); } catch (e) { /* 已结束的请求 abort 会抛，忽略 */ }
+        policyAbort = null;
+    }
+    var btn = document.getElementById('val-live-btn');
+    if (btn) { btn.disabled = false; btn.textContent = '🔍 实时检索公告'; }
+}
+
+function policyStatusHtml(kind, text) {
+    var color = kind === 'error' ? '#ef5350' : '#8892b0';
+    return '<p class="loading-hint" style="color:' + color + ';font-size:12px;">' +
+        valEsc(text) + '</p>';
+}
+
+function loadPolicy(code, name, opts) {
+    opts = opts || {};
+    invalidatePolicyRequest();          // 同一股票连续刷新也不许旧结果覆盖新结果
+    var seq = policySeq;
+    var signal;
+    if (typeof AbortController !== 'undefined') {
+        policyAbort = new AbortController();
+        signal = policyAbort.signal;
+    }
+    var btn = document.getElementById('val-live-btn');
+    if (btn) { btn.disabled = true; btn.textContent = '检索中...'; }
+
+    var box = document.getElementById('valuation-policy');
+    if (box) {
+        box.innerHTML = policyStatusHtml('loading',
+            '正在加载 ' + (name || code) + ' 的政策与事件...');
+    }
+
+    var url = '/api/policy-events?stock_code=' + encodeURIComponent(code) +
+              '&stock_name=' + encodeURIComponent(name || '') + '&live=1' +
+              (opts.force ? '&refresh=1' : '');
+    fetch(url, signal ? { signal: signal } : {})
+        .then(function (r) { return r.json(); })
+        .then(function (res) {
+            if (seq !== policySeq) return;                        // 已有更新的请求
+            if (String(valCurrentCode) !== String(code)) return;   // 页面已经切走
+            if (btn) { btn.disabled = false; btn.textContent = '🔍 实时检索公告'; }
+            if (!res || res.code !== 200) {
+                if (box) box.innerHTML = policyStatusHtml('error',
+                    '政策事件请求失败，请稍后重试（这不等于"没有相关政策"）。');
+                return;
+            }
+            var d = res.data || {};
+            if (String(d.stock_code) !== String(code)) return;      // 响应自带的股票码也不对
+            renderPolicy(d.events || [], {
+                status: d.meta && d.meta.data_status,
+                live_status: d.meta && d.meta.live_status
+            }, d.industry || '', d.profile || {});
+        })
+        .catch(function (err) {
+            if (seq !== policySeq) return;                         // 被新请求取代/取消，静默
+            if (err && err.name === 'AbortError') return;
+            if (btn) { btn.disabled = false; btn.textContent = '🔍 实时检索公告'; }
+            if (box) box.innerHTML = policyStatusHtml('error',
+                '政策事件请求失败（网络或服务异常），这不等于"没有相关政策"。');
+        });
+}
+
+// 手动强制刷新：绕过普通缓存重新检索
+function refreshPolicyLive() {
+    loadPolicy(valCurrentCode, valCurrentName, { force: true });
 }
 
 // ========== Tab 切换 ==========
@@ -141,6 +368,7 @@ function switchTab(event, tabId) {
 // ========== 个股估值 ==========
 var valCurrentCode = '600519';
 var valCurrentName = '贵州茅台';
+var valSeq = 0;             // 请求序号，防止旧请求覆盖新股票
 
 function loadStockVal(code, name, refresh) {
     valCurrentCode = code;
@@ -148,12 +376,19 @@ function loadStockVal(code, name, refresh) {
     addValHistory(code, name);
     renderValWatchlist();
 
+    // 快速连点不同股票时，慢响应可能后到并盖掉新股票的内容 → 用序号丢弃过期响应
+    var seq = ++valSeq;
+
     // 在估值详情卡片加"加入自选"按钮
     var inWl = isInWatchlist(code);
     var wlBtn = inWl ? '<span style="color:#ef5350;font-weight:bold;">★ 已自选</span>' :
-        '<button onclick="toggleValWatchlist(\'' + code + '\',\'' + name + '\')" style="background:#ffb74d;border:none;border-radius:4px;padding:4px 10px;color:#fff;cursor:pointer;font-size:12px;">☆ 加入自选</button>';
+        '<button data-val-toggle="' + valEsc(code) + '" data-val-name="' + valEsc(name) + '" style="background:#ffb74d;border:none;border-radius:4px;padding:4px 10px;color:#fff;cursor:pointer;font-size:12px;">☆ 加入自选</button>';
     // 手动更新按钮：强制穿透行业PE/财报缓存重新拉取
     var refreshBtn = '<button id="val-refresh-btn" onclick="refreshStockVal()" style="background:#42a5f5;border:none;border-radius:4px;padding:4px 10px;color:#fff;cursor:pointer;font-size:12px;margin-left:6px;" title="强制重新拉取行情/行业PE/财报并更新">🔄 更新数据</button>';
+
+    // 切股票：先让在飞的政策请求失效（序号+取消），再自动加载当前股票的政策与事件
+    invalidatePolicyRequest();
+    loadPolicy(code, name, {});
 
     Promise.all([
         fetch('/api/valuation?code=' + code + '&name=' + name + (refresh ? '&refresh=1' : '')).then(function(r) { return r.json(); }),
@@ -163,6 +398,7 @@ function loadStockVal(code, name, refresh) {
         var valRes = results[0];
         var ivRes = results[1];
         var fibRes = results[2];
+        if (seq !== valSeq) return;      // 已经切到别的股票，丢弃这次结果
 
         // 摆动点/支撑压力/趋势线（独立请求，失败不影响上面三个）
         loadSwingAnalysis(code, name, swingLevel);
@@ -177,31 +413,65 @@ function loadStockVal(code, name, refresh) {
             var devTxt = isNum(d.deviation_pe)
                 ? '<span style="color:' + levelColor + ';font-weight:bold;">' + (d.deviation_pe > 0 ? '+' : '') + d.deviation_pe + '%</span>'
                 : NA;
-            document.getElementById('valuation-detail').innerHTML = wlBtn + refreshBtn +
+            var peSrcTxt = d.industry_pe_is_static
+                ? '⚠ ' + valEsc(d.industry_pe_source_label || '静态行业PE（人工估算，非实时）')
+                : (d.industry_pe_source === 'eastmoney' ? '东财实时板块' : '不可用（接口未返回且不在静态表内）');
+            var actBox = document.getElementById('val-main-actions');
+            if (actBox) actBox.innerHTML = wlBtn + refreshBtn;
+            var titleBox = document.getElementById('val-main-title');
+            if (titleBox) titleBox.textContent = name + ' (' + code + ')';
+            document.getElementById('valuation-detail').innerHTML =
                 '<div class="summary-row"><span class="label">PE (市盈率)</span><span class="value">' + (isNum(d.pe) ? d.pe : NA) + '</span></div>' +
                 '<div class="summary-row"><span class="label">PB (市净率)</span><span class="value">' + (isNum(d.pb) ? d.pb : NA) + '</span></div>' +
                 '<div class="summary-row"><span class="label">PE-TTM</span><span class="value">' + (isNum(d.pe_ttm) ? d.pe_ttm : NA) + '</span></div>' +
-                '<div class="summary-row"><span class="label">行业平均 PE（' + (d.industry_name || '未知') + '）</span><span class="value">' + (isNum(d.industry_pe) ? d.industry_pe : NA) + '</span></div>' +
+                '<div class="summary-row"><span class="label">行业平均 PE（' + valEsc(d.industry_name || '未知') + '）</span><span class="value">' + (isNum(d.industry_pe) ? d.industry_pe : NA) + '</span></div>' +
                 '<hr>' +
                 '<div class="summary-row"><span class="label">偏离度</span><span class="value">' + devTxt + '</span></div>' +
-                '<div class="summary-row"><span class="label">结论</span><span class="value" style="color:' + levelColor + ';font-weight:bold;">' + d.level + '</span></div>' +
-                (d.level_reason ? '<p style="color:#ffb74d;font-size:12px;margin-top:6px;">' + d.level_reason + '</p>' : '') +
-                '<p style="color:#8892b0;font-size:12px;margin-top:6px;">行业PE来源：' + (d.industry_pe_source === 'eastmoney' ? '东财实时板块' : '静态参考（实时获取失败）') + '</p>';
+                '<div class="summary-row"><span class="label">结论</span><span class="value" style="color:' + levelColor + ';font-weight:bold;">' + valEsc(d.level) + '</span></div>' +
+                (d.level_reason ? '<p style="color:#ffb74d;font-size:12px;margin-top:6px;">' + valEsc(d.level_reason) + '</p>' : '') +
+                '<p style="color:#8892b0;font-size:12px;margin-top:6px;">行业PE来源：' + peSrcTxt + '</p>' +
+                '<p style="color:#8892b0;font-size:11px;margin-top:2px;">' +
+                    '行情时间：' + (d.quote_asof ? new Date(d.quote_asof * 1000).toLocaleString() : '未知') +
+                    (d.quote_source ? ' · 来源 ' + valEsc(d.quote_source) : '') +
+                    (d.quote_stale ? ' · <span style="color:#ffb74d;">' + valEsc(d.quote_stale_reason || '数据可能过期') + '</span>' : '') +
+                '</p>' +
+                '<p style="color:#5c6b8a;font-size:11px;margin-top:2px;">' + valEsc(d.deviation_basis || '偏离度仅作横向参考') +
+                    '。历史估值分位：未接入真实历史 PE 序列，本页不显示该指标。</p>';
 
-            // 2026-08: 财报快照 + 政策事件（估值偏离需结合最新季报与产业政策）
-            document.getElementById('valuation-detail').innerHTML +=
-                buildFinancialsHtml(d.financials) + buildPolicyHtml(d.policy_notes);
+            // 财报快照留在"一、基础估值"；政策与事件已拆到"四、政策与事件"
+            document.getElementById('valuation-detail').innerHTML += buildFinancialsHtml(d.financials);
+            renderPolicy(d.policy_notes || [],
+                         { status: (d.policy_notes && d.policy_notes.length) ? 'real' : 'empty' },
+                         d.industry_name || '');
+        } else {
+            // 估值接口失败：政策区不能一直停在"加载中"，那是伪装成"还在查"
+            renderPolicy([], { status: 'error' });
         }
 
         if (ivRes.code === 200) {
             var d = ivRes.data;
             renderIntrinsicValue('chart-intrinsic', d);
             var priceTxt = (d.price || 0).toFixed(2);
+            var mp = d.model_params || {};
+            var basisHtml = mp.basis
+                ? '<p style="color:#8892b0;font-size:11px;margin-top:2px;">估值依据：' + valEsc(mp.basis) +
+                  '；安全边际 ' + (mp.safety_margin != null ? mp.safety_margin : '--') + '</p>'
+                : '';
+            var refHtml = basisHtml;
+            if (d.pe_reference && d.pe_reference.available) {
+                refHtml = basisHtml + '<hr>' +
+                    '<div class="summary-row"><span class="label">相对PE参考估值</span><span class="value">' +
+                    Number(d.pe_reference.value).toFixed(2) + '</span></div>' +
+                    '<p style="color:#8892b0;font-size:11px;margin-top:2px;">' +
+                    valEsc(d.pe_reference.label) + '；反推 EPS=' + d.pe_reference.eps_derived +
+                    '（由股价/PE 得到，不是财报值，仅供参考）</p>';
+            }
             if (d.available === false || d.intrinsic_value === null || d.intrinsic_value === undefined) {
                 // 不再用股价顶替内在价值（否则偏离恒为 0，等于自证"合理"）
                 document.getElementById('intrinsic-detail').innerHTML =
                     '<div class="summary-row"><span class="label">当前股价</span><span class="value">' + priceTxt + '</span></div>' +
-                    '<p style="color:#ffb74d;font-size:12px;margin-top:6px;">' + (d.reason || '缺少可用的 EPS / 行业 PE，无法估算内在价值') + '</p>';
+                    '<p style="color:#ffb74d;font-size:12px;margin-top:6px;">' + valEsc(d.reason || '缺少可用的 EPS / 行业 PE，无法估算内在价值') + '</p>' +
+                    refHtml;
             } else {
                 var gapColor = d.gap > 0 ? '#ef5350' : '#26a69a';
                 document.getElementById('intrinsic-detail').innerHTML =
@@ -210,7 +480,11 @@ function loadStockVal(code, name, refresh) {
                     '<div class="summary-row"><span class="label">每股收益 EPS</span><span class="value">' + d.eps + '</span></div>' +
                     '<hr>' +
                     '<div class="summary-row"><span class="label">偏离</span><span class="value" style="color:'+gapColor+';font-weight:bold;">' + (d.gap > 0 ? '+' : '') + d.gap + '%</span></div>' +
-                    '<div class="summary-row"><span class="label">判断</span><span class="value" style="color:'+gapColor+';font-weight:bold;">' + (d.gap < -10 ? '低估' : (d.gap > 10 ? '高估' : '合理')) + '</span></div>';
+                    '<div class="summary-row"><span class="label">判断</span><span class="value" style="color:'+gapColor+';font-weight:bold;">' + (d.gap < -10 ? '低估' : (d.gap > 10 ? '高估' : '合理')) + '</span></div>' +
+                    '<p style="color:#8892b0;font-size:11px;margin-top:6px;">模型：年化EPS × 行业PE(×' +
+                    valEsc(d.industry_pe) + ') × 安全边际 ' + valEsc(mp.safety_margin) +
+                    '；EPS 来源：' + valEsc(d.eps_source || '-') + '</p>' +
+                    refHtml;
             }
         }
 
@@ -533,7 +807,10 @@ function loadIndexAnalysis(code, name) {
             }
 
             var devColor = lastDev > 2 ? '#ef5350' : (lastDev < -2 ? '#26a69a' : '#ffb74d');
-            document.getElementById('tech-analysis-summary').innerHTML =
+            var mockBadge = d.is_mock
+                ? '<p style="color:#ef5350;font-weight:bold;font-size:12px;">⚠ 模拟数据：历史K线接口未返回，以下指标由随机数据生成，不可用于决策</p>'
+                : '';
+            document.getElementById('tech-analysis-summary').innerHTML = mockBadge +
                 '<div class="row"><div class="col"><p><b>EMA20偏离度：</b><span style="color:'+devColor+'">' + lastDev + '%</span> — ' +
                 (lastDev > 3 ? '显著偏离，注意回调风险' : (lastDev > 1 ? '小幅偏离，趋势偏强' : (lastDev < -3 ? '显著偏离，存在反弹机会' : '在均线附近，趋势平稳'))) +
                 '</p><p><b>斐波那契位置：</b>当前 ' + lastClose + '，处于 Fib ' + nearestLevel + ' (' + nearestVal + ') 附近</p></div>' +

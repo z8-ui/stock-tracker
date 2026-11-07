@@ -4,8 +4,13 @@
 """
 
 # Flask 服务器配置
-SERVER_HOST = "0.0.0.0"   # 允许局域网访问
+# ⚠️ 默认只绑回环地址：0.0.0.0 会把看板暴露给整个局域网，而这个项目没有账号体系。
+#    确实要给局域网/手机看时，改这里或 config_local.py，但必须同时设置 SERVER_AUTH_TOKEN，
+#    否则 app.py 会直接拒绝启动（见 app.py:lan_auth_error）。
+SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 5000
+# 局域网访问的 HTTP Basic 密码（用户名固定 stock）。为空 = 只允许本机。
+SERVER_AUTH_TOKEN = ""
 # ⚠️ 安全默认值: 仓库内 DEBUG=False(公网/局域网暴露时无 Werkzeug 调试器 RCE 风险)
 #    本地开发想开调试(自动重载+错误堆栈), 在 config_local.py 里加一行 DEBUG = True 即可
 DEBUG = False
@@ -21,9 +26,18 @@ APP_NAME = "A股追踪系统"
 # AI 分析 - DeepSeek API key(个人配置, 放 config_local.py, 不会上传 GitHub)
 DEEPSEEK_API_KEY = ""
 
-# AI 分析接口可选 token(防滥用): 非空时 /api/ai-analysis 必须带 ?token=xxx
+# AI 分析接口可选 token(防滥用): 非空时 /api/ai-analysis 必须带 Header `X-AI-Token: <token>`
+# ⚠️ 不接受 ?token=xxx：URL 会进浏览器历史、代理日志、Flask access log
 # 自用可留空(不校验); 部署到公网时建议在 config_local.py 设置一个随机串
 AI_API_TOKEN = ""
+# AI 分析结果缓存有效期（秒）。过期后重新调用模型；refresh=1 无视缓存。
+AI_CACHE_TTL_SEC = 6 * 3600
+
+# 估值模型参数（拍脑袋的系数要能看见、能改）
+# 内在价值 = 年化 EPS × 行业 PE × VALUATION_SAFETY_MARGIN
+VALUATION_SAFETY_MARGIN = 0.8
+# 缓存超过这个秒数就标记 _stale=True（前端会显示"缓存数据"），避免旧数据被当成实时
+STALE_AFTER_SEC = 900
 
 # 板块热力图 - 要显示的行业板块列表
 # 东方财富行业板块代码，想加板块就在这加

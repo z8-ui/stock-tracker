@@ -144,11 +144,71 @@ class TestIntrinsicValue(unittest.TestCase):
         self.assertEqual(iv["eps_source"], "report_nonpositive")
         self.assertIn("亏损", iv["reason"])
 
-    def test_price_pe_derived_marked(self):
+    def test_price_pe_derived_marked_as_reference_only(self):
+        """反推 EPS 只能作为「相对PE参考」，不得进入内在价值计算。
+
+        以前 fin 缺失就 EPS = price/PE，再乘行业PE×0.8 —— 结果恒等于
+        price×0.8×(个股PE/行业PE) 的变形，等于用股价自证估值。
+        """
         with _Stubs(pe=30.0, price=120.0, fin=None):
             iv = d.estimate_intrinsic_value(d.get_stock_quote("600519"))
-        self.assertEqual(iv["eps_source"], "price_pe_derived")
-        self.assertAlmostEqual(iv["eps"], 4.0, places=3)
+        self.assertFalse(iv["available"])
+        self.assertIsNone(iv["intrinsic_value"])
+        self.assertIsNone(iv["eps"])
+        self.assertEqual(iv["eps_source"], "report_missing")
+        ref = iv["pe_reference"]
+        self.assertTrue(ref["available"])
+        self.assertAlmostEqual(ref["eps_derived"], 4.0, places=3)
+        self.assertEqual(ref["label"].split("（")[0], "相对PE参考")
+        self.assertIn("非财报口径", ref["label"])
+
+    def test_unknown_industry_pe_is_not_25x(self):
+        """行业 PE 取不到时必须是 None，不能再默认 25 倍。"""
+        with _Stubs(pe=12.0, price=50.0, fin={"eps": 1.0, "report_date": "2025-12-31"}):
+            d.get_industry_pe = lambda code: {"pe": None, "industry": "未知",
+                                              "source": "unavailable",
+                                              "source_label": "不可用", "is_static": False}
+            iv = d.estimate_intrinsic_value(d.get_stock_quote("600519"))
+        self.assertFalse(iv["available"])
+        self.assertIsNone(iv["intrinsic_value"])
+        self.assertIn("行业 PE", iv["reason"])
+
+
+class TestIndustryPeFallback(unittest.TestCase):
+    """静态行业 PE 的口径：表里有就用且标记 is_static，没有就是 None。"""
+
+    def test_unknown_code_returns_none_not_25(self):
+        with mock.patch.object(d, "_cached_get", return_value=None):
+            ind = d.get_industry_pe("999999")
+        self.assertIsNone(ind["pe"])
+        self.assertEqual(ind["source"], "unavailable")
+        self.assertFalse(ind["is_static"])
+
+    def test_static_map_hit_is_labelled(self):
+        self.assertIn("600519", d.INDUSTRY_PE_MAP)
+        with mock.patch.object(d, "_cached_get", return_value=None):
+            ind = d.get_industry_pe("600519")
+        self.assertEqual(ind["pe"], d.INDUSTRY_PE_MAP["600519"])
+        self.assertTrue(ind["is_static"])
+        self.assertIn("静态", ind["source_label"])
+
+    def test_live_result_is_not_static(self):
+        live = {"pe": 20.0, "industry": "白酒Ⅱ", "source": "eastmoney",
+                "source_label": "东方财富行业板块动态 PE（实时接口）", "is_static": False}
+        with mock.patch.object(d, "_cached_get", return_value=live):
+            ind = d.get_industry_pe("600519")
+        self.assertFalse(ind["is_static"])
+        self.assertEqual(ind["pe"], 20.0)
+
+
+class TestValuationModelParams(unittest.TestCase):
+    def test_safety_margin_is_explicit_parameter(self):
+        import config
+        with _Stubs(pe=20.0, price=30.0, fin={"eps": 1.5, "report_date": "2025-12-31"}):
+            iv = d.estimate_intrinsic_value(d.get_stock_quote("600519"))
+        self.assertEqual(iv["model_params"]["safety_margin"], config.VALUATION_SAFETY_MARGIN)
+        self.assertAlmostEqual(iv["intrinsic_value"],
+                               1.5 * 25 * config.VALUATION_SAFETY_MARGIN, places=2)
 
 
 class TestCacheFetchedAt(unittest.TestCase):
@@ -205,10 +265,12 @@ class TestCacheFetchedAt(unittest.TestCase):
         with open(self.tmp.name, "w", encoding="utf-8") as f:
             json.dump({"k3": {"value": 7}}, f)
         with mock.patch.object(d, "_market_status", return_value=("已收盘", False)):
-            got = d._cached_get("k3", lambda: {"value": 999}, ttl=60)
+            # 重抓也失败（返回 None）→ 只能退回旧缓存，并诚实标记"时间未知+陈旧"
+            got = d._cached_get("k3", lambda: None, ttl=60)
         self.assertEqual(got["value"], 7)
         self.assertIsNone(got["_asof"])
         self.assertFalse(got["_asof_known"])
+        self.assertTrue(got["_stale"])
 
 
 if __name__ == "__main__":

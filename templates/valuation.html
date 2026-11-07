@@ -11,7 +11,7 @@
     </div>
 </div>
 
-<!-- ========== Tab 1: 个股估值 ========== -->
+<!-- ========== Tab 1: 个股估值（四段式单卡） ========== -->
 <div id="stock-tab" class="tab-content active">
     <div class="row">
         <div class="col" style="flex:2">
@@ -32,47 +32,54 @@
         </div>
     </div>
 
-    <div class="row">
-        <div class="col">
-            <div class="card">
-                <div class="card-header">个股估值偏离</div>
-                <div id="chart-valuation" class="chart-box chart-large"></div>
+    <!-- 个股估值：基础估值 / 估值偏离 / 内在价值 / 政策与事件 合成一张卡 -->
+    <div class="card" id="val-main-card">
+        <div class="card-header">
+            <span id="val-main-title">个股估值</span>
+            <span id="val-main-actions" style="float:right;"></span>
+        </div>
+
+        <div class="val-section">
+            <div class="val-section-title">一、基础估值</div>
+            <div id="valuation-detail" class="summary-box">
+                <p class="loading-hint">选择个股后加载...</p>
             </div>
         </div>
-        <div class="col">
-            <div class="card">
-                <div class="card-header">股价 vs 内在价值</div>
-                <div id="chart-intrinsic" class="chart-box chart-large"></div>
+
+        <div class="val-section">
+            <div class="val-section-title">二、估值偏离
+                <span class="val-section-hint">个股 PE 与行业 PE 对比，柱高为偏离幅度</span>
+            </div>
+            <div id="chart-valuation" class="chart-box chart-large"></div>
+        </div>
+
+        <div class="val-section">
+            <div class="val-section-title">三、内在价值
+                <span class="val-section-hint">模型估算（年化 EPS × 行业 PE × 安全边际），仅供参考</span>
+            </div>
+            <div id="chart-intrinsic" class="chart-box chart-large"></div>
+            <div id="intrinsic-detail" class="summary-box"></div>
+        </div>
+
+        <div class="val-section">
+            <div class="val-section-title">四、政策与事件
+                <span id="val-policy-meta" class="val-section-hint"></span>
+                <button id="val-live-btn" class="chip" onclick="refreshPolicyLive()"
+                        style="float:right;background:#16233d;border:1px solid #253656;color:#a8b8d8;border-radius:14px;padding:2px 10px;cursor:pointer;font-size:12px;"
+                        title="按当前股票实时检索公开公告与快讯（只作线索，未审核）">🔍 实时检索公告</button>
+            </div>
+            <div id="valuation-policy" class="summary-box">
+                <p class="loading-hint">选择个股后加载...</p>
             </div>
         </div>
     </div>
 
-    <div class="row">
-        <div class="col">
-            <div class="card">
-                <div class="card-header">估值详情</div>
-                <div id="valuation-detail" class="summary-box">
-                    <p class="loading-hint">加载中...</p>
-                </div>
-            </div>
+    <div class="card">
+        <div class="card-header">
+            自选股池 <button onclick="clearValWatchlist()" style="background:none;border:none;color:#8892b0;cursor:pointer;font-size:12px;">清空</button>
         </div>
-        <div class="col">
-            <div class="card">
-                <div class="card-header">内在价值详情</div>
-                <div id="intrinsic-detail" class="summary-box">
-                    <p class="loading-hint">加载中...</p>
-                </div>
-            </div>
-        </div>
-        <div class="col">
-            <div class="card">
-                <div class="card-header">
-                    自选股池 <button onclick="clearValWatchlist()" style="background:none;border:none;color:#8892b0;cursor:pointer;font-size:12px;">清空</button>
-                </div>
-                <div id="val-watchlist-stocks" class="chip-group">
-                    <p class="loading-hint">暂无自选股</p>
-                </div>
-            </div>
+        <div id="val-watchlist-stocks" class="chip-group">
+            <p class="loading-hint">暂无自选股</p>
         </div>
     </div>
 
@@ -152,6 +159,10 @@
 
 {% block scripts %}
 <style>
+.val-section { padding:10px 0 4px; border-top:1px dashed #1b2740; }
+.val-section:first-of-type { border-top:none; }
+.val-section-title { color:#e6f1ff; font-size:14px; font-weight:600; margin:4px 0 8px; }
+.val-section-hint { color:#8892b0; font-size:11px; font-weight:normal; margin-left:8px; }
 .tab-bar { display:flex; border-bottom:1px solid #233054; }
 .tab-btn { background:none; border:none; color:#8892b0; padding:12px 24px; cursor:pointer; font-size:14px; border-bottom:2px solid transparent; transition:all 0.2s; }
 .tab-btn:hover { color:#e0e0e0; }

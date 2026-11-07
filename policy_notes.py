@@ -154,21 +154,32 @@ def get_policy_notes(code, industry_name=""):
     code:            股票代码
     industry_name:   行业名（来自 get_industry_pe），用于附加行业级提示
 
-    2026-11：优先读 events_store（SQLite 事件中心），DB 不存在/为空/出错时回退下面的
-    静态字典——页面不会因为 DB 挂了变空白，但新事件应该录进 DB。
+    2026-11：优先读 events_store（SQLite 事件中心）。三种状态分开处理：
+      - 库不可用（没表/打不开）→ 回退静态字典（页面别变空白）
+      - 库存在但还没导入过数据 → 回退静态字典（首次部署直接可用）
+      - 库正常 → 只用库里的结果，哪怕是空列表
+        （空列表可能是"该股所有事件都已归档"，这时回退静态字典会让归档失效）
     """
+    db_notes = None
+    state = "unavailable"
     try:
-        from events_store import notes_for
-        db_notes = notes_for(code, industry_name)
-        if db_notes:
-            return db_notes
+        from events_store import notes_for, db_state
+        state = db_state()
+        if state != "unavailable":
+            db_notes = notes_for(code, industry_name)
     except Exception:
-        pass
+        state, db_notes = "unavailable", None
 
-    notes = list(POLICY_NOTES.get(code, []))
+    if state == "ok" and db_notes is not None:
+        return db_notes      # 可能是 []，语义是"确实没有有效事件"
+
+    notes = [dict(n) for n in POLICY_NOTES.get(code, [])]
     for kw, ind_notes in INDUSTRY_POLICY.items():
         if industry_name and kw in industry_name:
-            notes.extend(ind_notes)
+            for n in ind_notes:
+                item = dict(n)
+                item["_relation"] = "industry"      # 行业条目：行业整体影响，不是个股直连
+                notes.append(item)
     # 按 (date,title) 去重（个股和行业提示可能重复）
     seen, unique = set(), []
     for n in sorted(notes, key=lambda x: x.get("date", ""), reverse=True):
@@ -177,4 +188,23 @@ def get_policy_notes(code, industry_name=""):
             continue
         seen.add(key)
         unique.append(n)
-    return unique
+    # 2026-11：静态字典是"未入库的人工策池"，不能冒充已核实结论。
+    # 行业条目统一标 industry（行业整体影响），个股条目才是 direct；
+    # 审核状态一律 pending —— 这条链路没有经过审核动作，不许写成 approved。
+    tagged = []
+    for n in unique:
+        item = dict(n)
+        is_industry = item.get("_relation") == "industry"
+        item.setdefault("occurred_at", item.get("date") or None)
+        item.setdefault("published_at", None)
+        item.setdefault("date_known", bool(item.get("date")))
+        item.setdefault("relation_type", "industry" if is_industry else "direct")
+        item.setdefault("relation_label", "行业整体影响" if is_industry else "直接影响")
+        item.setdefault("impact_level", "待确认")
+        item.setdefault("mechanism", item.get("impact") or "")
+        item.setdefault("evidence", "静态兜底字典（未入库、未逐条核实）")
+        item.setdefault("review_status", "pending")
+        item.setdefault("summary", item.get("impact") or "")
+        item.pop("_relation", None)
+        tagged.append(item)
+    return tagged

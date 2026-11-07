@@ -53,7 +53,13 @@ function renderPieChart(domId, title, items, colors) {
     if (!chart) return;
 
     chart.setOption({
-        tooltip: { trigger: 'item', formatter: '{b}: {c}亿 ({d}%)' },
+        tooltip: {
+            trigger: 'item',
+            // 饼图给的是绝对值（流入/流出规模），不显示正负号，但必须两位小数
+            formatter: function (p) {
+                return p.name + ': ' + window.fmt.fixed(p.value) + '亿 (' + window.fmt.fixed(p.percent) + '%)';
+            }
+        },
         color: colors,
         legend: {
             data: items.map(i => i.name),
@@ -107,7 +113,9 @@ function renderBarChart(domId, xLabel, data) {
             label: {
                 show: true,
                 position: 'right',
-                formatter: function(p) { return p.value + suffix; },
+                formatter: function(p) {
+                    return suffix === '亿' ? window.fmt.money(p.value, '亿') : window.fmt.pct(p.value);
+                },
                 color: '#8892b0',
                 fontSize: 11
             }
@@ -123,7 +131,13 @@ function renderMainForceChart(domId, data) {
 
     const items = data.items;
     chart.setOption({
-        tooltip: { trigger: 'axis' },
+        tooltip: {
+            trigger: 'axis',
+            formatter: function (ps) {
+                var one = ps[0] || {};
+                return one.name + '<br/>主力净流入: ' + window.fmt.money(one.value, '亿');
+            }
+        },
         grid: { left: '3%', right: '4%', bottom: '3%', containLabel: true },
         xAxis: {
             type: 'category',
@@ -132,7 +146,7 @@ function renderMainForceChart(domId, data) {
         },
         yAxis: {
             type: 'value',
-            axisLabel: { color: '#8892b0', formatter: '{value} 亿' },
+            axisLabel: { color: '#8892b0', formatter: function (v) { return window.fmt.fixed(v) + ' 亿'; } },
             splitLine: { lineStyle: { color: '#233054' } }
         },
         series: [{
@@ -145,7 +159,7 @@ function renderMainForceChart(domId, data) {
             label: {
                 show: true,
                 position: 'top',
-                formatter: (p) => p.value + '亿',
+                formatter: (p) => window.fmt.money(p.value, '亿'),
                 color: '#8892b0'
             }
         }]
@@ -195,7 +209,8 @@ function renderTreemap(domId, title, data) {
             formatter: function(p) {
                 const d = p.data;
                 const direction = d.flow >= 0 ? '流入' : '流出';
-                return d.name + '<br/>涨跌幅: ' + d.change + '%<br/>资金' + direction + ': ' + Math.abs(d.flow).toFixed(2) + '亿';
+                return d.name + '<br/>涨跌幅: ' + window.fmt.pct(d.change) +
+                    '<br/>资金' + direction + ': ' + window.fmt.fixed(Math.abs(d.flow)) + '亿';
             }
         },
         series: [{
@@ -208,8 +223,8 @@ function renderTreemap(domId, title, data) {
             label: {
                 show: true,
                 formatter: function(p) {
-                    const direction = p.data.flow >= 0 ? '+' : '';
-                    return p.name + '\n' + p.data.change + '%\n' + direction + p.data.flow + '亿';
+                    return p.name + '\n' + window.fmt.pct(p.data.change) + '\n' +
+                        window.fmt.money(p.data.flow, '亿');
                 },
                 color: '#fff',
                 fontSize: 13,
@@ -237,7 +252,16 @@ function renderStockFlow(domId, data) {
             textStyle: { color: '#e0e0e0', fontSize: 14 },
             subtextStyle: { color: data.is_mock ? '#ffb74d' : '#8892b0', fontSize: 11 }
         },
-        tooltip: { trigger: 'axis' },
+        tooltip: {
+            trigger: 'axis',
+            formatter: function (ps) {
+                if (!ps || !ps.length) return '';
+                var rows = ps.map(function (p) {
+                    return p.marker + p.seriesName + ': ' + window.fmt.money(p.value, '亿');
+                });
+                return ps[0].name + '<br/>' + rows.join('<br/>');
+            }
+        },
         legend: {
             data: data.series.map(s => s.name),
             textStyle: { color: '#8892b0' },
@@ -251,7 +275,7 @@ function renderStockFlow(domId, data) {
         },
         yAxis: {
             type: 'value',
-            axisLabel: { color: '#8892b0', formatter: '{value} 亿' },
+            axisLabel: { color: '#8892b0', formatter: function (v) { return window.fmt.fixed(v) + ' 亿'; } },
             splitLine: { lineStyle: { color: '#233054' } }
         },
         series: data.series.map((s, i) => ({
@@ -414,7 +438,7 @@ function renderIntrinsicValue(domId, data) {
                 { value: data.gap, itemStyle: { color: color } }
             ],
             barWidth: '35%',
-            label: { show: true, position: 'top', formatter: function(p) { return p.seriesIndex === 2 ? p.value + '%' : p.value.toFixed(2); }, color: '#8892b0' }
+            label: { show: true, position: 'top', formatter: function(p) { return p.seriesIndex === 2 ? p.value + '%' : window.fmt.fixed(p.value); }, color: '#8892b0' }
         }]
     });
 }
@@ -468,3 +492,47 @@ function renderSectorPERank(domId, sectors) {
         }]
     });
 }
+
+/* ---------------------------------------------------------------- 数据健康
+   只读 /api/data-health（后端不联网）：状态永远是"真实来源+时间"推出来的，
+   缓存就写 CACHED，过期就写 STALE，绝不把缓存说成实时。 */
+function dhEsc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+        return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c];
+    });
+}
+
+function renderDataHealth() {
+    var box = document.getElementById('data-health-body');
+    if (!box) return;
+    fetch('/api/data-health').then(function (r) { return r.json(); }).then(function (res) {
+        if (!res || res.code !== 200) { box.textContent = '数据健康获取失败'; return; }
+        var rows = (res.data && res.data.rows) || [];
+        var color = {REAL: '#4caf50', CACHED: '#64b5f6', STALE: '#ffb74d',
+                     PARTIAL: '#ffb74d', UNAVAILABLE: '#ef5350'};
+        var html = '<table style="width:100%;border-collapse:collapse;font-size:12px;">' +
+            '<tr style="color:#8892b0;"><th style="text-align:left;padding:4px 6px;">模块</th>' +
+            '<th style="text-align:left;">状态</th><th style="text-align:left;">更新时间</th>' +
+            '<th style="text-align:left;">来源 / 说明</th></tr>';
+        rows.forEach(function (r) {
+            html += '<tr><td style="padding:4px 6px;white-space:nowrap;">' + dhEsc(r.module) + '</td>' +
+                '<td style="color:' + (color[r.status] || '#8892b0') + ';white-space:nowrap;">' + dhEsc(r.status) + '</td>' +
+                '<td style="white-space:nowrap;">' + dhEsc(r.updated_at || '--') + '</td>' +
+                '<td>' + dhEsc((r.source ? r.source + ' · ' : '') + (r.detail || '')) + '</td></tr>';
+        });
+        html += '</table><p style="color:#5c6b8a;font-size:11px;margin-top:6px;">' +
+            'REAL=真实(15分钟内) · CACHED=缓存(1天内) · STALE=过期/时间未知 · PARTIAL=部分可用 · ' +
+            'UNAVAILABLE=不可用。单个数据源失败不代表整个系统失败。</p>';
+        box.innerHTML = html;
+        var ts = document.getElementById('ts-data-health');
+        if (ts) ts.textContent = (res.data && res.data.generated_at) || '';
+        var st = document.getElementById('status-data-health');
+        if (st && res.data && res.data.summary) {
+            var s = res.data.summary;
+            st.textContent = s.abnormal ? ('异常 ' + s.abnormal + ' / ' + s.total) : '全部正常';
+            st.style.color = s.level === 'ok' ? '#4caf50' : (s.level === 'warn' ? '#ffb74d' : '#ef5350');
+        }
+    }).catch(function () { box.textContent = '数据健康获取失败（接口异常）'; });
+}
+
+document.addEventListener('DOMContentLoaded', renderDataHealth);
