@@ -16,6 +16,9 @@ from policy_notes import get_policy_notes
 from config import ALLOW_MOCK_FALLBACK, STALE_AFTER_SEC, VALUATION_SAFETY_MARGIN
 from market_calendar import load_calendar, is_trading_day
 
+# V2.1 S1：数据源访问开始走 Provider 体系（目前只搬了腾讯行情）
+from services.data import registry as _providers
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Referer": "https://data.eastmoney.com/"
@@ -451,16 +454,15 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
 # ==============================================================
 
 def _tencent_quote(code):
-    """获取腾讯个股/指数行情"""
-    market = "sh" if code.startswith("6") or code == "000001" else "sz"
-    url = f"http://qt.gtimg.cn/q={market}{code}"
-    try:
-        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
-        resp.encoding = "gbk"
-        parts = resp.text.split("~")
-        return parts if len(parts) > 50 else None
-    except:
-        return None
+    """获取腾讯个股/指数行情
+
+    V2.1 S1：真正的请求与解析搬到了 services/data/providers/tencent.py。
+    这里保留原函数名与返回结构（~ 切分后的字段列表），失败依旧返回 None ——
+    上层 get_stock_quote / get_market_flow 完全不用改。
+    需要知道"到底为什么失败"时用 services.data.registry.call() 拿 ProviderResult。
+    """
+    result = _providers.call("tencent_quote", code)
+    return result.data if result.ok() else None
 
 
 # ==============================================================
@@ -519,6 +521,12 @@ def get_market_flow():
                     small_order += val2yi(item.get("f75", 0))
             except:
                 pass
+
+        # 两条链路都没拿到任何东西（腾讯没给指数、东财没给资金）：
+        # 返回 None，让页面显示"暂无数据"。旧行为会返回一个全零 dict，
+        # 页面渲染成 0.00 / 0.00 亿 —— 等于把"抓取失败"伪装成"真实零值"。
+        if index_price <= 0 and main_force == 0:
+            return None
 
         return {
             "main_force": main_force,
