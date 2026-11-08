@@ -31,6 +31,8 @@ import json
 import os
 import re
 import sqlite3
+import uuid
+from contextlib import contextmanager
 from datetime import datetime
 
 _ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -94,6 +96,62 @@ def init_db(conn=None):
     conn.commit()
     if own:
         conn.close()
+
+
+def _schema_ready(conn):
+    """表结构是否已经能直接写（建表 + 2026-11 新增列）。
+
+    批量写入时不能随便调 init_db：它走 `executescript`，而 sqlite3 的
+    executescript 会在执行前**隐式 COMMIT**，把外层批量事务拦腰截断。
+    所以只有在缺表/缺列（即还没写过任何数据）时才允许初始化。
+    """
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(events)").fetchall()}
+    except sqlite3.DatabaseError:
+        return False
+    return {"id", "fingerprint", "created_at", "occurred_at",
+            "impact_level", "mechanism", "evidence", "review_status"} <= cols
+
+
+@contextmanager
+def transaction(conn):
+    """批量写入的事务边界，**纯 SAVEPOINT 语义，不碰调用方事务**。
+
+    - 成功：只 RELEASE 本层。若本层就是最外层 SAVEPOINT，SQLite 规定 RELEASE
+      即提交整个事务；若外面已经有事务，则只是释放嵌套层 —— 调用方的东西不会被提交。
+    - 失败：ROLLBACK TO 撤销本层写入，再 RELEASE 释放本层，异常原样抛出；
+      不 commit、不 rollback，调用方的事务状态由调用方自己决定。
+    - 无论成功失败，异常路径都不会留下未释放的 SAVEPOINT。
+    """
+    name = "sp_" + uuid.uuid4().hex[:12]
+    conn.execute(f"SAVEPOINT {name}")
+    try:
+        yield conn
+    except BaseException:
+        conn.execute(f"ROLLBACK TO SAVEPOINT {name}")
+        conn.execute(f"RELEASE SAVEPOINT {name}")
+        raise
+    else:
+        conn.execute(f"RELEASE SAVEPOINT {name}")
+
+
+def _ensure_schema(conn, own):
+    """确保表结构就绪，并且绝不在调用方事务里做会隐式提交的 DDL。
+
+    init_db() 走 `executescript()`，sqlite3 在执行前会隐式 COMMIT —— 这会提交
+    调用方正在写的事务。所以分三种情况：
+      1. 结构已就绪            → 什么都不做（不重复迁移）；
+      2. 缺表/缺列 + 连接在事务里 → 明确拒绝报错（不静默提交）；
+      3. 缺表/缺列 + 无外层事务 → 就地 init_db（自己开的连接一定是这种）。
+    """
+    if _schema_ready(conn):
+        return
+    if not own and getattr(conn, "in_transaction", False):
+        raise RuntimeError(
+            "事件库结构不完整（缺表或缺列），而当前连接已在事务中："
+            "init_db() 的 executescript() 会隐式提交调用方事务，因此拒绝在事务内迁移。"
+            "请先在事务外调用 events_store.init_db(conn) 完成迁移，再执行 seed。")
+    init_db(conn)
 
 
 def _ensure_columns(conn):
@@ -187,7 +245,8 @@ def _norm_targets(stocks=(), industries=()):
 def add_event(event_date=None, title=None, summary="", direction="中性", source="",
               source_url="", stocks=(), industries=(), status="active",
               occurred_at=None, published_at=None, collected_at=None, conn=None,
-              impact_level="待确认", mechanism="", evidence="", review_status="pending"):
+              impact_level="待确认", mechanism="", evidence="", review_status="pending",
+              commit=True):
     """新增一条事件并挂标的；同日同标题已存在则只补挂缺失标的。
 
     三个时间字段语义严格区分（2026-11 整改）：
@@ -202,6 +261,11 @@ def add_event(event_date=None, title=None, summary="", direction="中性", sourc
 
     event_date 列保留为 NOT NULL 兼容老表：occurred_at 未知时写 ''，
     绝不能为了满足约束塞今天。
+
+    commit=False（2026-11 seed 原子性修复）：
+      只做语句、不提交、不建表，事务交给外层（见 transaction()）。
+      批量调用必须这样用 —— 否则每写一条就 commit，中途失败会留下半截数据。
+
     返回 (event_id, created: bool, new_links: int)
     """
     occurred = _norm_date(occurred_at if occurred_at is not None else event_date)
@@ -214,8 +278,12 @@ def add_event(event_date=None, title=None, summary="", direction="中性", sourc
         raise ValueError("title 不能为空")
 
     own = conn is None
+    if own and not commit:
+        raise ValueError(
+            "add_event(conn=None, commit=False) 是危险组合：连接由本函数创建又要求不提交，"
+            "关闭时会丢弃这批写入。批量写入请显式传入 conn，并配合 transaction(conn) 使用。")
     conn = conn or connect()
-    init_db(conn)
+    _ensure_schema(conn, own)
     # 指纹：有发生日期用发生日期，否则用发布时间；都没有就只按标题去重
     fp = _fingerprint(occurred or (published or "")[:10], title)
     cur = conn.execute("SELECT id, occurred_at, published_at, collected_at, "
@@ -257,42 +325,52 @@ def add_event(event_date=None, title=None, summary="", direction="中性", sourc
             new_links += 1
         except sqlite3.IntegrityError:
             pass    # 已挂过
-    conn.commit()
+    if commit:
+        conn.commit()
     if own:
         conn.close()
     return event_id, created, new_links
 
 
 def seed_from_static(conn=None, verbose=False):
-    """把 policy_notes.py 里的老字典导入 DB（幂等，可重复跑）。"""
+    """把 policy_notes.py 里的老字典导入 DB（幂等，可重复跑）。
+
+    事务边界（2026-11 修复）：一次 seed 的所有 events / event_links 写入
+    要么全进、要么全不进。内部 add_event(commit=False) 只发语句不提交，
+    由这里统一 commit；任一条失败 → transaction() 整体 ROLLBACK 并把异常抛出去，
+    不留半截数据、也不吞异常假装成功（调用方看到的是非 0 退出/异常）。
+    """
     from policy_notes import POLICY_NOTES, INDUSTRY_POLICY   # 延迟导入，避免循环
 
     own = conn is None
     conn = conn or connect()
-    init_db(conn)
     created = linked = 0
-    for code, notes in POLICY_NOTES.items():
-        for n in notes:
-            _, is_new, links = add_event(
-                n.get("date"), n.get("title"), n.get("impact", ""), n.get("direction"),
-                n.get("source", ""), n.get("source_url", ""),
-                stocks=[code], conn=conn,
-                evidence="静态策池（人工维护）", review_status="approved")
-            created += int(is_new)
-            linked += links
-    for industry, notes in INDUSTRY_POLICY.items():
-        for n in notes:
-            _, is_new, links = add_event(
-                n.get("date"), n.get("title"), n.get("impact", ""), n.get("direction"),
-                n.get("source", ""), n.get("source_url", ""),
-                industries=[industry], conn=conn,
-                evidence="静态策池（行业级，非个股直连）", review_status="approved")
-            created += int(is_new)
-            linked += links
+    try:
+        _ensure_schema(conn, own)   # 结构已就绪就不迁移；事务内绝不做隐式提交的 DDL
+        with transaction(conn):
+            for code, notes in POLICY_NOTES.items():
+                for n in notes:
+                    _, is_new, links = add_event(
+                        n.get("date"), n.get("title"), n.get("impact", ""), n.get("direction"),
+                        n.get("source", ""), n.get("source_url", ""),
+                        stocks=[code], conn=conn, commit=False,
+                        evidence="静态策池（人工维护）", review_status="approved")
+                    created += int(is_new)
+                    linked += links
+            for industry, notes in INDUSTRY_POLICY.items():
+                for n in notes:
+                    _, is_new, links = add_event(
+                        n.get("date"), n.get("title"), n.get("impact", ""), n.get("direction"),
+                        n.get("source", ""), n.get("source_url", ""),
+                        industries=[industry], conn=conn, commit=False,
+                        evidence="静态策池（行业级，非个股直连）", review_status="approved")
+                    created += int(is_new)
+                    linked += links
+    finally:
+        if own:
+            conn.close()
     if verbose:
         print(f"seed 完成：新建事件 {created} 条，新增关联 {linked} 条")
-    if own:
-        conn.close()
     return created, linked
 
 

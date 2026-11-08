@@ -5,7 +5,7 @@
 
 > 项目：A 股个股/板块数据看板 + 估值偏离 + 个股政策事件（本地 SQLite）
 > 形态：单进程 Flask + 原生 JS + ECharts + SQLite，纯标准库单测，无前端构建
-> 规模：约 6.0k 行 Python（不含测试）/ 1.6k 行 JS，**320 个离线单测**
+> 规模：约 6.0k 行 Python（不含测试）/ 1.6k 行 JS，**335 个离线单测**
 
 > **当前版本 V2.0.2（2026-11-08）**
 > 本轮（相对 V2.0.1）：
@@ -36,7 +36,7 @@
 ## 1. 30 秒跑起来（不需要任何 API key）
 
 ```bash
-python3 -m unittest discover -s tests -v      # 320 个用例，纯离线，不联网
+python3 -m unittest discover -s tests -v      # 335 个用例，纯离线，不联网
 python3 app.py                                # 打开 http://127.0.0.1:5000
 ```
 
@@ -47,7 +47,9 @@ python3 app.py                                # 打开 http://127.0.0.1:5000
 - 数据来自腾讯行情、东方财富公开接口，需要能访问外网；接口失败时页面显示"暂无数据"，
   **不会退化成随机数**（见第 3 节第一条）。
 - `data/events.db` 也不在包里（本地运行时数据，首次启动自动建表）。想灌入示例数据：
-  `python3 scripts/events_cli.py seed`（内置 4 条行业事件）。
+  `python3 scripts/events_cli.py seed`（内置静态策池 15 条文案 → 去重后 4 条事件 / 15 条关联）。
+  seed 是**幂等 + 单事务**的：重复跑不会产生重复记录，不覆盖库里已有事件与人工审核状态，
+  中途失败整体回滚、不留半截数据（细节见第 7 节债务 1）。
 - **没有 `/events` 页面**：政策事件在 `估值偏离 → 个股估值 → 政策与事件` 内按个股展示。
 
 ---
@@ -72,7 +74,7 @@ scripts/events_cli.py   事件录入 CLI：seed/add/add-text/feed/link/archive/r
 scripts/package_release.py  打发布包（排除密钥/缓存/本地库，入包出包各扫一次密钥）
 scripts/feed_daily.sh   每日抓取（crontab 调，只读不写库）
 templates/, static/     页面与前端；static/vendor/echarts.min.js 是 vendor 的 ECharts
-tests/                  320 个离线单测（数据层/缓存 SWR/认证/扫描器/政策口径/API/前端契约）
+tests/                  335 个离线单测（数据层/缓存 SWR/认证/扫描器/政策口径/API/前端契约/seed 事务与嵌套）
 ```
 
 ---
@@ -134,7 +136,7 @@ tests/                  320 个离线单测（数据层/缓存 SWR/认证/扫描
    要不要抽公共壳？
 8. **数据健康的口径**：`STALE` 的阈值是"15 分钟 REAL / 1 天 CACHED / 超过 1 天 STALE 或时间未知"，
    有没有更合理的分档？`外部数据源成功率`是进程内计数（重启清零），你是否认为必须落到磁盘。
-9. **测试覆盖的边界**：320 个用例覆盖 routes 的超时/4xx/5xx/非法 JSON/空数据/缺字段/
+9. **测试覆盖的边界**：335 个用例覆盖 routes 的超时/4xx/5xx/非法 JSON/空数据/缺字段/
    旧缓存兜底/stale/失败不覆盖缓存，认证 fail-closed，扫描器转义与跨块，
    前端 JS 用 node 实跑（`format.js` 数值格式、`valuation.js` 政策竞态）。
    但仍是**基于 mock 的契约测试**：真实数据源改字段名、真实 DeepSeek 返回结构变化，
@@ -145,8 +147,8 @@ tests/                  320 个离线单测（数据层/缓存 SWR/认证/扫描
 ## 6. 验证命令（都是真跑过的，不是写在文档里的愿望）
 
 ```bash
-python3 -m unittest discover -s tests          # 320 tests, OK
-python3 scripts/events_cli.py stats            # 事件 4 / 关联 15 / 孤儿 0
+python3 -m unittest discover -s tests          # 335 tests, OK
+python3 scripts/events_cli.py stats            # 本机：事件 4 / 关联 16 / 孤儿 0（新库 seed 后是 4 / 15）
 python3 scripts/events_cli.py list --code 000657   # 3 条钨相关事件
 python3 scripts/events_cli.py feed --strong    # 抓快讯，只留强相关候选
 python3 scripts/package_release.py --dry-run   # 扫描但不写产物
@@ -161,16 +163,110 @@ python3 scripts/package_release.py             # 打包含密钥扫描
 
 ---
 
-## 7. 版本与已知未完成
+## 7. 版本与技术债务台账
 
-- 分支 `main`；本轮基线版本 V2.0.2（发布包不含 `.git`）
-- 数据口径文档：`README.md` 的「数据可信度」一节，逐条列了每根曲线的来源/刷新/失败行为
-- **已知未完成**（不要当成已实现）：
-  - 事件影响量化（事件研究/超额收益）—— 未做
-  - 历史估值分位 —— 未做，页面明示不可用
-  - 政策原文全文解析 —— 只有标题 + 摘要，机制判断据此写成"资料不完整"
-  - AI 分析历史记录持久化 —— 未做，数据健康面板只能显示"已配置，无记录"
-  - `data_service.py` 拆层、API 契约测试 —— 未做
+- 分支 `main`；基线版本 **V2.0.2**（`8cebf99`，发布包不含 `.git`）。本轮只做
+  **seed 事务修复 + 文档**，不新增业务功能、不改架构。
+- 数据口径文档：`README.md` 的「数据可信度」一节，逐条列了每根曲线的来源/刷新/失败行为。
+- 状态只有四档，**不许把计划写成已完成**：
+  `已实现` / `部分实现` / `未实现` / `计划开发`（阶段编号对应 `docs/V2.1_ROADMAP.md`）。
+
+| # | 事项 | 状态 | 依据 / 缺口 |
+|---|---|---|---|
+| 1 | 政策事件 seed 初始化 | 已实现 | 见 7.1 |
+| 2 | seed 幂等、不覆盖既有事件与人工审核状态 | 已实现 | 见 7.1，`tests/test_events_store.py::TestSeed` |
+| 3 | seed 事务原子性（失败整体回滚） | 已实现（2026-11 修复） | 见 7.2 |
+| 4 | 历史 PE / PB 估值分位 | 未实现 | 见 7.3；规划 D2 |
+| 5 | 政策全文分析 | 部分实现 | 见 7.4；只有标题+摘要+关键词检索，原文与传导分析未做 |
+| 6 | AI 分析记录持久化 | 未实现 | 见 7.5；规划 D4 |
+| 7 | 数据源成功率持久化 | 部分实现（进程内） | 见 7.6；重启清零，规划 D5 |
+| 8 | `data_service.py` 拆层、Provider 标准化 | 未实现 | 规划 D1 |
+| 9 | 事件影响量化（事件研究/超额收益） | 未实现 | 库里只有 4 条事件，样本量不够，暂不做 |
+| 10 | 真实浏览器点击复测 | 未测试（NOT TESTED） | 现有验证是 Flask test_client + node 跑前端 JS |
+
+### 7.1 债务 1：本机事件库不入库，新用户靠 seed 初始化
+
+- 本机 `data/events.db` 里有 **4 条政策事件 / 16 条关联**（钨产业链）。其中 15 条关联是 seed
+  自带的，另有 1 条是手工挂在 `2026-06-10 钨原料长单采购价` 那条上的 `industry:小金属`；
+  全新库跑 seed 得到的是 4 事件 / 15 关联。属于运行时数据：
+  `.gitignore` 排除 `data/`，**不进 GitHub、不进发布包**。这是刻意设计 —— 事件是人工维护的
+  本机资产，跟着仓库走会变成"永远追不上的 diff"。
+- 新用户 clone 后政策区为空，需要一次性初始化：
+
+  ```bash
+  python3 scripts/events_cli.py seed      # 从 policy_notes.py 静态策池导入
+  python3 scripts/events_cli.py stats     # 期望 事件 4 / 关联 15 / 孤儿 0
+  ```
+
+- **安全约束（双向都成立）**：
+  1. 数据源只有 `policy_notes.py` 的静态字典（个股 4 只 / 12 条 + 行业 1 个 / 3 条，
+     去重后 4 条事件），**不读本机 `data/events.db`**，不含个人信息、API key、本机路径；
+  2. 幂等：指纹 `sha1(日期|标题)`，重复执行 `created=0`，不会产生重复行；
+  3. 命中已有事件时只补空的 `occurred_at/published_at` 与缺失标的，
+     **不改标题/摘要/方向/来源/审核状态**（人工改过的内容保得住）；
+  4. 新建的静态条目带 `review_status='approved'`（静态池本身是人工维护的），
+     但**不会把库里 pending 的事件升成 approved**；
+  5. 只增不删：seed 不会删除任何已有事件。
+
+### 7.2 债务 3：seed 事务原子性 + 嵌套事务安全（本轮修复）
+
+- 修复前（两个断点，不是一个）：`seed_from_static()` 逐条调 `add_event()`，而 `add_event()`
+  每条末尾自己 `conn.commit()`；`add_event()` 还会每次调 `init_db()`，而 `init_db()` 用
+  `executescript()` —— sqlite3 在执行 `executescript` 前会**隐式 COMMIT**。
+  结果：一次 seed 被拆成 N 个小事务，中途失败留半截数据。
+  实测（HEAD `8cebf99`，第 3 条写入抛 `OperationalError`）：**残留 3 条事件 / 3 条关联**。
+- 修复后：
+  - `events_store.transaction(conn)`：**纯 SAVEPOINT 语义，不碰调用方事务**。
+    成功只 `RELEASE` 本层（本层即最外层时 SQLite 规定等于提交）；失败只
+    `ROLLBACK TO SAVEPOINT + RELEASE` 再把异常抛出 —— **不再无条件 `commit()` / `rollback()`**；
+  - `add_event(..., commit=True)` 新增形参：批量写入传 `commit=False`，只发语句不提交；
+    `add_event(conn=None, commit=False)` 在建连接**之前**直接 `ValueError`（危险组合，关闭时会丢写入）；
+  - `_ensure_schema(conn, own)`：结构已就绪就不迁移；缺表/缺列且**连接已在事务中**时明确拒绝
+    （`RuntimeError`，说明 `executescript` 会隐式提交），只有无外层事务时才 `init_db()`；
+  - `seed_from_static()` 用一个 `with transaction(conn)` 包住全部写入，`finally` 关闭自建连接，
+    异常原样抛给调用方（CLI 打印明确失败原因并 `exit 1`）。
+- 同场景复测：**残留 0 条事件 / 0 条关联**，随后正常 seed 完整初始化 4 条。
+- 嵌套事务实测（上一版 `transaction` 对照）：外层事务里跑 seed 成功 → 旧实现让外层
+  `in_transaction=False`、第二个连接已能看到 5 条（外层被提交）；失败 → 旧实现把外层标记
+  也滚掉了。修复后两种情况外层事务都完好，提交/回滚由调用方决定。
+- 覆盖测试（`tests/test_events_store.py::TestSeed`，新增 15 个）：A 全新库 / B 重复执行 /
+  C 已有事件保护（含"同指纹不覆盖"）/ D 审核状态保护（approved 与 pending 双向）/
+  E 中途失败整体回滚（**用全新连接读文件校验，不只看异常**）/ F 外层事务中 seed 成功不提交外层 /
+  G 外层事务中 seed 失败只回滚自己那层（外层仍可提交、也可回滚）/ H 拒绝 `conn=None + commit=False` /
+  I 结构不完整且连接在事务中 → 拒绝迁移且不隐式提交，另验旧库在事务外仍能正常迁移。
+  全量：**335 tests OK**。
+
+### 7.3 债务 4：历史 PE / PB 估值分位 —— 未实现
+
+现在只有"当前 PE 对比行业 PE"和 `EPS × 行业PE × 安全边际` 的内在价值估算，
+**没有任何历史分位**：缺 3 年 / 5 年历史 PE、PB 序列（现用数据源只给当下快照）。
+估值页明确写"未接入"，不给假分位。方案见 `docs/V2.1_ROADMAP.md` D2。
+
+### 7.4 债务 5：政策全文分析 —— 部分实现
+
+已实现：事件标题 / 摘要 / 方向 / 来源 / 关联标的、静态策池、快讯半自动采集（人工 `--pick --yes`）、
+个股画像关键词 + 出处（`keyword_evidence`）、两个数据库检索源与四档状态（success/empty/partial/failed）。
+**未实现**：官方政策原文抓取、条文要求识别、主营业务→收入/成本/利润的传导分析、证据链留存。
+所以机制字段现在只能是"资料不完整"级别，不出结论。方案见 D3。
+
+### 7.5 债务 6：AI 分析记录持久化 —— 未实现
+
+现在 DeepSeek 分析结果只落在 `ai_cache.json`（文本缓存），**没有结构化分析记录**：
+没有股票代码 / 分析时间 / 模型版本 / 所用数据日期 / 数据快照版本 / 证据引用的历史库，
+无法按股票复盘"上次为什么这么判"。数据健康面板只能显示"已配置，无记录"。方案见 D4。
+
+### 7.6 债务 7：数据源成功率 —— 进程内统计，重启清零
+
+`data_service` 的成功率/耗时/最近错误是模块级内存计数，**进程重启归零**，
+所以健康面板的"历史成功率"实际只覆盖本次运行。要做成真正的监控需要落库（请求数/成功数/
+失败数/响应时间/最后成功时间/最近错误），方案见 D5。
+
+### 7.7 债务 8：本机半成品虚拟环境（非项目资产）
+
+`/mnt/d/venvs/stock-v202` 是早前在 DrvFs 上装包超时留下的**半成品 venv**，
+不属于项目源码、不在仓库、不随发布包外发。**本轮不删除、不移动、不清理**；
+确认过的测试环境是 `/home/lenovo/.hermes/cache/scratch/venv-v202`（flask 3.1.3 / requests 2.34.2）。
+如需删除 `/mnt/d/venvs/stock-v202`，须先取得用户明确同意。
 
 ---
 

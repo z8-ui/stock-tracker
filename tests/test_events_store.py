@@ -108,6 +108,372 @@ class TestSeed(EventStoreCase):
         self.assertTrue(static_only.issubset({n["title"] for n in db_notes}))
         self.assertEqual(len(db_notes), len({(n["date"], n["title"]) for n in db_notes}))
 
+    # ---- 场景 C：已有正式事件不被 seed 破坏 ----
+
+    def test_seed_preserves_existing_user_event(self):
+        """C-1：用户先录的事件，seed 后仍在，且内容一个字都没被改。"""
+        eid, _, _ = events_store.add_event(
+            "2026-10-01", "用户自建：某公司扩产公告", "人工写的影响说明",
+            "利好", "公司公告", stocks=["000001"], review_status="pending")
+        before = dict(events_store.list_events(limit=50)[0])
+
+        events_store.seed_from_static()
+
+        rows = {r["id"]: r for r in events_store.list_events(limit=50)}
+        self.assertIn(eid, rows)
+        after = rows[eid]
+        for field in ("event_date", "title", "summary", "direction", "source",
+                      "fingerprint", "review_status", "status", "evidence"):
+            self.assertEqual(after[field], before[field], f"{field} 被 seed 改动了")
+        self.assertEqual(len(rows), events_store.stats()["events"])  # 只有种子条目多出来
+        self.assertIn("用户自建：某公司扩产公告", {r["title"] for r in rows.values()})
+
+    def test_seed_does_not_overwrite_same_fingerprint_event(self):
+        """C-2：库里已有「同日期同标题」事件时，seed 不能拿静态字典覆盖它。
+
+        这是最容易踩的坑：指纹相同 → add_event 走"已存在"分支。
+        静态池里的 impact/direction 与库里人工改过的版本不同，必须以库里为准。
+        """
+        static_code, static_note = next(iter(policy_notes.POLICY_NOTES.items()))
+        note = static_note[0]
+        eid, created, _ = events_store.add_event(
+            note["date"], note["title"], "人工改写过的说明（不是静态字典那句）",
+            "利空", "人工核实", stocks=[static_code], review_status="approved")
+        self.assertTrue(created)
+
+        events_store.seed_from_static()
+        events_store.seed_from_static()          # 连跑两次，确认也不会被覆盖
+
+        row = [r for r in events_store.list_events(limit=200) if r["id"] == eid][0]
+        self.assertEqual(row["summary"], "人工改写过的说明（不是静态字典那句）")
+        self.assertEqual(row["direction"], "利空")
+        self.assertEqual(row["source"], "人工核实")
+        self.assertEqual(row["review_status"], "approved")
+
+    # ---- 场景 D：人工审核状态不被 seed 覆盖 ----
+
+    def test_seed_keeps_approved_review_status(self):
+        """D：标成 approved 的事件，seed 后仍是 approved，审核记录不丢。"""
+        eid, _, _ = events_store.add_event(
+            "2026-09-15", "待人工审核的事件", "说明", stocks=["600519"],
+            review_status="pending")
+        conn = events_store.connect()
+        conn.execute("UPDATE events SET review_status='approved', "
+                     "impact_level='直接受影响', mechanism='成本上升' WHERE id=?", (eid,))
+        conn.commit()
+        conn.close()
+
+        events_store.seed_from_static()
+        events_store.seed_from_static()
+
+        conn = events_store.connect()
+        row = conn.execute("SELECT * FROM events WHERE id=?", (eid,)).fetchone()
+        conn.close()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["review_status"], "approved")
+        self.assertEqual(row["impact_level"], "直接受影响")
+        self.assertEqual(row["mechanism"], "成本上升")
+        # seed 新插入的静态条目本身带 approved（静态池是人工维护的），
+        # 但不能因此把"人工改过的 pending 事件"也顺手改成 approved
+        others = events_store.list_events(limit=200)
+        self.assertTrue(all(r["review_status"] in ("approved", "pending") for r in others))
+
+    def test_seed_does_not_flip_pending_to_approved(self):
+        """D-2：人工明确标成 pending 的既有事件，seed 不得把它升成 approved。"""
+        note = next(iter(policy_notes.POLICY_NOTES.values()))[0]
+        eid, _, _ = events_store.add_event(
+            note["date"], note["title"], "人工待审", "中性", "", review_status="pending")
+        events_store.seed_from_static()
+        conn = events_store.connect()
+        status = conn.execute("SELECT review_status FROM events WHERE id=?", (eid,)).fetchone()[0]
+        conn.close()
+        self.assertEqual(status, "pending")
+
+    # ---- 场景 E：事务原子性（真实数据库状态校验） ----
+
+    def test_seed_rolls_back_entirely_on_midway_failure(self):
+        """E：中途写入失败 → 已写的事件全部回滚，库里没有半截初始化数据。"""
+        real_add = events_store.add_event
+        calls = {"n": 0}
+
+        def flaky(*args, **kwargs):
+            calls["n"] += 1
+            result = real_add(*args, **kwargs)      # 先真的写进去
+            if calls["n"] >= 3:
+                raise sqlite3.OperationalError("disk I/O error（模拟中途失败）")
+            return result
+
+        with mock.patch.object(events_store, "add_event", side_effect=flaky):
+            with self.assertRaises(sqlite3.OperationalError):
+                events_store.seed_from_static()
+
+        self.assertGreaterEqual(calls["n"], 3)      # 确认确实写到第 3 条才炸
+
+        # 用全新连接读文件本身，不看异常、只看落盘结果
+        conn = sqlite3.connect(self.db)
+        try:
+            events = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+            links = conn.execute("SELECT COUNT(*) FROM event_links").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(events, 0, f"回滚失败：残留 {events} 条事件")
+        self.assertEqual(links, 0, f"回滚失败：残留 {links} 条关联")
+
+        # 半截数据清理后，正常再跑一次必须能完整初始化
+        created, linked = events_store.seed_from_static()
+        pairs = {(n["date"], n["title"])
+                 for notes in policy_notes.POLICY_NOTES.values() for n in notes}
+        pairs |= {(n["date"], n["title"])
+                  for notes in policy_notes.INDUSTRY_POLICY.values() for n in notes}
+        self.assertEqual(created, len(pairs))
+        self.assertGreater(linked, 0)
+        self.assertEqual(events_store.stats()["events"], len(pairs))
+
+        conn = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM events").fetchone()[0],
+                             len(pairs))
+        finally:
+            conn.close()
+
+    def test_seed_rollback_leaves_no_partial_when_failure_on_first_row(self):
+        """E-2：第一条就失败时也不能建出"空壳半成品"——不残留任何事件。"""
+        with mock.patch.object(events_store, "add_event",
+                               side_effect=sqlite3.OperationalError("boom")):
+            with self.assertRaises(sqlite3.OperationalError):
+                events_store.seed_from_static()
+        self.assertEqual(events_store.stats()["events"], 0)
+
+    def test_seed_commits_on_success(self):
+        """事务修复不能把成功路径也弄成"只在当前连接可见"。"""
+        events_store.seed_from_static()
+        conn = sqlite3.connect(self.db)      # 另一个连接读文件
+        try:
+            n = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(n, events_store.stats()["events"])
+        self.assertGreater(n, 0)
+
+    # ---- 事务嵌套语义（F/G） ----
+
+    def test_transaction_commits_when_it_is_outermost(self):
+        """最外层 SAVEPOINT 的 RELEASE 必须等价于提交。"""
+        conn = events_store.connect()
+        conn.execute("CREATE TABLE IF NOT EXISTS marker (x TEXT)")
+        with events_store.transaction(conn):
+            conn.execute("INSERT INTO marker (x) VALUES ('a')")
+        conn.close()
+        other = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(other.execute("SELECT COUNT(*) FROM marker").fetchone()[0], 1)
+        finally:
+            other.close()
+
+    def test_nested_transaction_does_not_commit_outer(self):
+        """嵌套 SAVEPOINT 成功只释放本层，外层仍未提交。"""
+        conn = events_store.connect()
+        conn.execute("CREATE TABLE IF NOT EXISTS marker (x TEXT)")
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("INSERT INTO marker (x) VALUES ('outer')")
+        with events_store.transaction(conn):
+            conn.execute("INSERT INTO marker (x) VALUES ('inner')")
+        self.assertTrue(conn.in_transaction)          # 外层还在
+        other = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(other.execute("SELECT COUNT(*) FROM marker").fetchone()[0], 0)
+        finally:
+            other.close()
+        conn.commit()
+        conn.close()
+        other = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(other.execute("SELECT COUNT(*) FROM marker").fetchone()[0], 2)
+        finally:
+            other.close()
+
+    # ---- 场景 F：外层事务中的 seed 成功 ----
+
+    def test_seed_inside_outer_transaction_does_not_commit(self):
+        """F：seed 在外层事务里成功，第二个连接看不到任何未提交数据。"""
+        events_store.init_db()
+        conn = events_store.connect()
+        conn.execute("BEGIN IMMEDIATE")
+        events_store.add_event("2026-11-01", "外层标记事件", "外层写入", stocks=["000001"],
+                               conn=conn, commit=False)
+        self.assertTrue(conn.in_transaction)
+
+        created, linked = events_store.seed_from_static(conn=conn)
+        self.assertGreater(created, 0)
+        self.assertGreater(linked, 0)
+        self.assertTrue(conn.in_transaction, "seed 把调用方事务提交掉了")
+
+        other = sqlite3.connect(self.db)          # 第二个连接：什么都看不到
+        try:
+            self.assertEqual(other.execute("SELECT COUNT(*) FROM events").fetchone()[0], 0)
+            self.assertEqual(other.execute("SELECT COUNT(*) FROM event_links").fetchone()[0], 0)
+        finally:
+            other.close()
+
+        conn.commit()                             # 调用方自己提交后才可见
+        conn.close()
+        other = sqlite3.connect(self.db)
+        try:
+            total = other.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+            titles = {r[0] for r in other.execute("SELECT title FROM events")}
+        finally:
+            other.close()
+        self.assertEqual(total, created + 1)
+        self.assertIn("外层标记事件", titles)
+
+    # ---- 场景 G：外层事务中的 seed 失败 ----
+
+    def test_seed_failure_inside_outer_transaction_keeps_outer_work(self):
+        """G：seed 中途失败只回滚自己那一层，外层标记记录还在、外层仍可提交。"""
+        events_store.init_db()
+        conn = events_store.connect()
+        conn.execute("BEGIN IMMEDIATE")
+        events_store.add_event("2026-11-01", "外层标记事件", "外层写入", stocks=["000001"],
+                               conn=conn, commit=False)
+
+        real_add = events_store.add_event
+        state = {"n": 0}
+
+        def flaky(*args, **kwargs):
+            state["n"] += 1
+            result = real_add(*args, **kwargs)
+            if state["n"] >= 3:
+                raise sqlite3.OperationalError("boom（模拟 seed 中途失败）")
+            return result
+
+        with mock.patch.object(events_store, "add_event", side_effect=flaky):
+            with self.assertRaises(sqlite3.OperationalError):
+                events_store.seed_from_static(conn=conn)
+
+        self.assertTrue(conn.in_transaction, "种子失败错误地把外层事务也回滚了")
+        titles = [r[0] for r in conn.execute("SELECT title FROM events")]
+        self.assertEqual(titles, ["外层标记事件"])          # seed 的写入全撤了
+        # 只剩外层那条的关联（1 条，指向 000001）；seed 的 15 条关联必须全部撤销
+        links = conn.execute("SELECT target_key FROM event_links").fetchall()
+        self.assertEqual([r[0] for r in links], ["000001"])
+
+        conn.commit()                                       # 外层仍能正常提交
+        conn.close()
+        other = sqlite3.connect(self.db)
+        try:
+            self.assertEqual([r[0] for r in other.execute("SELECT title FROM events")],
+                             ["外层标记事件"])
+        finally:
+            other.close()
+
+    def test_seed_failure_inside_outer_transaction_can_still_rollback(self):
+        """G-2：失败后外层也可以选择整体回滚，同样不能卡住。"""
+        events_store.init_db()
+        conn = events_store.connect()
+        conn.execute("BEGIN IMMEDIATE")
+        events_store.add_event("2026-11-01", "外层标记事件", conn=conn,
+                               stocks=["000001"], commit=False)
+        with mock.patch.object(events_store, "add_event",
+                               side_effect=sqlite3.OperationalError("boom")):
+            with self.assertRaises(sqlite3.OperationalError):
+                events_store.seed_from_static(conn=conn)
+        conn.rollback()                                     # 外层主动回滚
+        conn.close()
+        other = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(other.execute("SELECT COUNT(*) FROM events").fetchone()[0], 0)
+        finally:
+            other.close()
+
+    # ---- 场景 H：禁止 own=True + commit=False ----
+
+    def test_rejects_own_connection_without_commit(self):
+        """H：add_event(conn=None, commit=False) 必须在建连接之前就拒绝。"""
+        self.assertFalse(os.path.exists(self.db), "前置条件：库里还不该有文件")
+        with self.assertRaises(ValueError) as ctx:
+            events_store.add_event("2026-11-01", "危险组合", commit=False)
+        self.assertIn("commit=False", str(ctx.exception))
+        self.assertIn("conn", str(ctx.exception))
+        self.assertFalse(os.path.exists(self.db), "拒绝应当发生在 connect() 之前")
+
+    # ---- 场景 I：Schema 迁移边界 ----
+
+    OLD_SCHEMA = """
+        CREATE TABLE events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_date TEXT NOT NULL,
+            title TEXT NOT NULL,
+            summary TEXT NOT NULL DEFAULT '',
+            direction TEXT NOT NULL DEFAULT '中性',
+            source TEXT NOT NULL DEFAULT '',
+            source_url TEXT NOT NULL DEFAULT '',
+            fingerprint TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE event_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+            target_type TEXT NOT NULL,
+            target_key TEXT NOT NULL,
+            UNIQUE(event_id, target_type, target_key)
+        );
+        CREATE TABLE marker (x TEXT);
+    """
+
+    def _make_old_schema(self):
+        raw = sqlite3.connect(self.db)
+        try:
+            raw.executescript(self.OLD_SCHEMA)
+            raw.commit()
+        finally:
+            raw.close()
+        self.assertFalse(events_store._schema_ready(events_store.connect()))
+
+    def test_schema_migration_refused_inside_outer_transaction(self):
+        """I：结构不完整 + 连接已在事务中 → 明确拒绝，且不得隐式提交外层事务。"""
+        self._make_old_schema()
+        conn = events_store.connect()
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("INSERT INTO marker (x) VALUES ('outer')")
+
+        with self.assertRaises(RuntimeError) as ctx:
+            events_store.seed_from_static(conn=conn)
+        self.assertIn("事务", str(ctx.exception))
+
+        self.assertTrue(conn.in_transaction, "executescript 把调用方事务隐式提交了")
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM marker").fetchone()[0], 1)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM events").fetchone()[0], 0)
+
+        other = sqlite3.connect(self.db)          # 未提交 → 外部看不到
+        try:
+            self.assertEqual(other.execute("SELECT COUNT(*) FROM marker").fetchone()[0], 0)
+        finally:
+            other.close()
+
+        conn.commit()                             # 外层照常提交
+        conn.close()
+        other = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(other.execute("SELECT COUNT(*) FROM marker").fetchone()[0], 1)
+        finally:
+            other.close()
+
+    def test_old_schema_migrates_outside_transaction(self):
+        """I-2：旧库在事务外调用时仍能正常迁移 + seed（不能因为加了守卫而迁不动）。"""
+        self._make_old_schema()
+        created, linked = events_store.seed_from_static()
+        self.assertEqual(created, 4)
+        self.assertGreater(linked, 0)
+        conn = events_store.connect()
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(events)").fetchall()}
+            self.assertIn("review_status", cols)
+            self.assertIn("evidence", cols)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM events").fetchone()[0], 4)
+        finally:
+            conn.close()
+
 
 class TestFallback(EventStoreCase):
     def test_falls_back_to_static_when_no_table(self):

@@ -31,7 +31,13 @@ import events_store  # noqa: E402
 
 
 def cmd_seed(args):
-    created, linked = events_store.seed_from_static(verbose=True)
+    try:
+        created, linked = events_store.seed_from_static(verbose=True)
+    except Exception as exc:                      # 不吞异常，但要说清「没写进去」
+        print(f"  [!] seed 失败：本次没有留下任何半截数据（事务已回滚或尚未写入）")
+        print(f"      原因: {type(exc).__name__}: {exc}")
+        print(f"      库文件: {events_store.db_path()}")
+        return 1
     print("  当前库:", events_store.stats())
     return 0
 

@@ -75,7 +75,7 @@ stock-tracker/
 ├── templates/           # base/dashboard/market_flow/heatmap/stock_flow/valuation/ai
 ├── static/js/           # format.js(格式化) + app.js(总览/热力/数据健康) + valuation.js(估值+政策+画线)
 ├── scripts/             # events_cli.py(事件库CLI) + package_release.py(打包+密钥扫描)
-├── tests/               # 320 条离线单测
+├── tests/               # 335 条离线单测
 └── requirements.txt     # 仅 flask + requests
 ```
 
@@ -105,7 +105,7 @@ python app.py
 ## 🧪 测试与打包
 
 ```bash
-# 单元测试（320 个用例，纯离线，不依赖 pytest）
+# 单元测试（335 个用例，纯离线，不依赖 pytest）
 # 覆盖：Flask 路由/认证、缓存 SWR、政策检索与关联、估值口径、打包密钥扫描、
 #       前端 JS（node 实跑 format.js / valuation.js 竞态）
 python3 -m unittest discover -s tests -v
@@ -170,7 +170,7 @@ event_links   关联：target_type = stock | industry，target_key = 股票代�
 去重靠 `fingerprint = sha1(日期|标题)`，同一事件换个标的重录不会多一行。
 
 ```bash
-python3 scripts/events_cli.py seed                       # 把老字典导入（幂等，已跑：4 事件 / 15 关联）
+python3 scripts/events_cli.py seed                       # 把老字典导入（幂等 + 单事务，重复跑不重复；新库 seed 后 4 事件 / 15 关联）
 python3 scripts/events_cli.py stats                      # 库内统计
 python3 scripts/events_cli.py list --code 000657          # 某只股票挂的事件
 python3 scripts/events_cli.py add --date 2026-11-07 --title "…" --summary "…" \
