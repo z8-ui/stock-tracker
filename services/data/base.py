@@ -23,6 +23,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional
 
 from .exceptions import ProviderError
+from . import telemetry
 
 STATUSES = ("success", "empty", "partial", "stale", "failed", "unavailable")
 OK_STATUSES = ("success", "partial", "stale")
@@ -85,15 +86,21 @@ class Provider:
             raw = self.request(*args, **kwargs)
             data, asof = self.normalize(raw, *args, **kwargs)
         except ProviderError as e:
+            elapsed = (time.time() - t0) * 1000
+            telemetry.record(self.name, e.status, elapsed, e.to_error())
             return ProviderResult(None, self.name, e.status, "", t0, False,
-                                  e.to_error(), (time.time() - t0) * 1000)
+                                  e.to_error(), elapsed)
         except Exception as e:                     # 未预期异常也不能漏成 500
             err = ProviderError(self.name, f"未预期异常 {type(e).__name__}: {e}"[:160], cause=e)
+            elapsed = (time.time() - t0) * 1000
+            telemetry.record(self.name, "failed", elapsed, err.to_error())
             return ProviderResult(None, self.name, "failed", "", t0, False,
-                                  err.to_error(), (time.time() - t0) * 1000)
+                                  err.to_error(), elapsed)
         status = "success" if data is not None and data != [] and data != {} else "empty"
+        elapsed = (time.time() - t0) * 1000
+        telemetry.record(self.name, status, elapsed, None)
         return ProviderResult(data, self.name, status, asof or "", t0, False, None,
-                              (time.time() - t0) * 1000)
+                              elapsed)
 
     def describe(self):
         """给 /api/data-health 之类的地方展示用。"""

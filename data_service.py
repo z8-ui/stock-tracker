@@ -125,6 +125,38 @@ def source_stats():
     return out
 
 
+# 缓存层统计（与 Provider 的上游统计分开：命中不等于发生了一次请求）
+CACHE_STATS = {"hit": 0, "miss": 0, "stale_served": 0, "closed_served": 0, "refresh": 0}
+_CACHE_STATS_LOCK = threading.Lock()
+
+
+def _bump(key, n=1):
+    try:
+        with _CACHE_STATS_LOCK:
+            CACHE_STATS[key] = CACHE_STATS.get(key, 0) + n
+    except Exception:
+        pass
+
+
+def cache_stats():
+    """缓存命中/未命中/降级/休市直出 —— 用来证明"缓存命中不算一次真实请求"。"""
+    with _CACHE_STATS_LOCK:
+        snap = dict(CACHE_STATS)
+    total = snap["hit"] + snap["miss"] + snap["closed_served"] + snap["stale_served"]
+    snap["total"] = total
+    snap["hit_rate"] = round(snap["hit"] / total, 3) if total else 0.0
+    return snap
+
+
+def provider_stats():
+    """Provider 层（真实上游请求）统计，见 services/data/telemetry.py。"""
+    try:
+        from services.data import telemetry
+        return telemetry.snapshot()
+    except Exception:
+        return {}
+
+
 def _fmt_ts(ts):
     try:
         return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(ts)))
@@ -287,13 +319,15 @@ def _has_valid_data(data):
         return False
     # 对于市场资金流：必须有真实的 fund flow 数据（主力资金非零或拆分项非零）
     if "main_force" in data:
-        # 检查任意一项 fund flow 是否为真实值
         flow_fields = ["main_force", "super_large", "large_order", "middle_order", "small_order"]
-        has_flow = any(abs(data.get(f, 0)) > 0.01 for f in flow_fields)
         has_index = abs(data.get("index_price", 0)) > 0.01
-        # 必须有 index 数据（腾讯稳定返回）且最好有 flow 数据
-        # 若完全没有 flow 但 index 正常 → 缓存不可用（非交易时段抓到的空数据）
-        return has_index and has_flow
+        if not has_index:
+            return False
+        # 源明确返回过资金记录（diff 非空）→ 即使每一项都恰好是 0.00 亿，也是真实数据。
+        # 只有"根本没拿到资金记录"时，才退回按数值非零判断（避免把空结果当行情）。
+        if data.get("_flow_available") is True:
+            return True
+        return any(abs(data.get(f, 0)) > 0.01 for f in flow_fields)
     return True
 
 
@@ -386,6 +420,7 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
 
     # 强制刷新：跳过所有缓存层，同步拉取并写回
     if force:
+        _bump("miss")
         fresh = _timed_fetch()
         if _ok(fresh):
             return _inject(_store(fresh), now)
@@ -398,9 +433,12 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
         mem = _IN_MEMORY_CACHE.get(cache_key)
         # 1) 新鲜内存 → 直接返回
         if mem and (now - mem["time"]) < ttl:
+            _bump("hit")
             return _inject(mem["data"], mem["time"])
         # 2) 过期内存 → SWR：先返回旧数据，后台异步重建
         if mem:
+            _bump("stale_served")
+            _bump("refresh")
             _spawn_refresh(cache_key, _timed_fetch, validate_fn)
             return _inject(mem["data"], mem["time"])
         # 3) 无内存 → single-flight 同步构建（并发只建一次，检查+注册原子化）
@@ -411,12 +449,14 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
             evt.wait(5)  # 别人正在构建：最多等 5 秒
             mem = _IN_MEMORY_CACHE.get(cache_key)
             if mem:
+                _bump("hit")
                 return _inject(mem["data"], mem["time"])
             cached = _file_cache()
             if cached is not None:
                 return cached
             return None
         try:
+            _bump("miss")
             fresh = _timed_fetch()
             if _ok(fresh):
                 return _inject(_store(fresh), now)
@@ -437,6 +477,7 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
     cached = _file_cache()
     # 注意：缓存值可能是 list（板块资金流），list 没有 _stale 字段，不能直接 .get()
     if cached is not None and not (isinstance(cached, dict) and cached.get("_stale")):
+        _bump("closed_served")
         return cached
     # 无缓存，或缓存已经旧到不能代表"最近一次收盘"（例如停在两个月前）：
     # 先尝试抓一次；抓到就存，抓不到才退回旧缓存并保留 _stale 标记。
@@ -504,11 +545,13 @@ def get_market_flow():
         large_order = 0
         middle_order = 0
         small_order = 0
+        flow_available = False      # 东财是否真的给了资金记录（用于区分"零值"与"没数据"）
 
         if text:
             try:
                 data = json.loads(text)
                 diff = data.get("data", {}).get("diff", [])
+                flow_available = bool(diff)
                 for item in diff:
                     def val2yi(v):
                         if v is None: return 0
@@ -522,13 +565,15 @@ def get_market_flow():
             except:
                 pass
 
-        # 两条链路都没拿到任何东西（腾讯没给指数、东财没给资金）：
-        # 返回 None，让页面显示"暂无数据"。旧行为会返回一个全零 dict，
-        # 页面渲染成 0.00 / 0.00 亿 —— 等于把"抓取失败"伪装成"真实零值"。
-        if index_price <= 0 and main_force == 0:
+        # 只要有一边没拿到，就不能组装成"行情"：
+        #   - 没有指数 → 价格是假的 0；
+        #   - 没有资金记录（flow_available=False）→ 0.00 亿是"没数据"造出来的，不是真实零值。
+        # 两种都返回 None，让页面显示"暂无数据"。真实零值（源确实给了全 0 记录）不受影响。
+        if not flow_available or index_price <= 0:
             return None
 
         return {
+            "_flow_available": flow_available,
             "main_force": main_force,
             "super_large": super_large,
             "large_order": large_order,

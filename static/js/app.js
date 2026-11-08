@@ -522,7 +522,8 @@ function renderDataHealth() {
         });
         html += '</table><p style="color:#5c6b8a;font-size:11px;margin-top:6px;">' +
             'REAL=真实(15分钟内) · CACHED=缓存(1天内) · STALE=过期/时间未知 · PARTIAL=部分可用 · ' +
-            'UNAVAILABLE=不可用。单个数据源失败不代表整个系统失败。</p>';
+            'UNAVAILABLE=不可用。单个数据源失败不代表整个系统失败；' +
+            '休市期间不抓取更新，展示最近交易日数据属正常，不是故障。</p>';
         box.innerHTML = html;
         var ts = document.getElementById('ts-data-health');
         if (ts) ts.textContent = (res.data && res.data.generated_at) || '';
