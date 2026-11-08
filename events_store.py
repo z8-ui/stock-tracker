@@ -89,28 +89,163 @@ def connect(path=None):
 
 
 def init_db(conn=None):
+    """建表 + 补列 + 补索引（幂等）。
+
+    事务契约（2026-11）：`executescript()` 在执行前会**隐式 COMMIT**，所以
+    不允许在调用方已有事务的连接上执行。传入 conn 且 `conn.in_transaction` 为真时
+    直接拒绝并给出明确错误 —— 绝不静默提交调用方事务。
+    自己新建的连接永远是干净的（own=True），所以正常初始化/迁移流程不受影响。
+    """
     own = conn is None
     conn = conn or connect()
-    conn.executescript(SCHEMA)
-    _ensure_columns(conn)
-    conn.commit()
-    if own:
-        conn.close()
+    if not own and getattr(conn, "in_transaction", False):
+        raise RuntimeError(
+            "init_db(conn) 拒绝在已有事务中执行：executescript() 会隐式提交调用方事务。"
+            "请在事务开始之前完成初始化，或用独立连接调用 init_db()。")
+    try:
+        conn.executescript(SCHEMA)
+        _ensure_columns(conn)
+        conn.commit()
+    finally:
+        if own:
+            conn.close()
+
+
+# 写入所需字段（与 SCHEMA 一一对应，含 2026-11 新增的 5 个）
+_EVENTS_REQUIRED_COLS = frozenset({
+    "id", "event_date", "title", "summary", "direction", "source", "source_url",
+    "fingerprint", "status", "occurred_at", "published_at", "collected_at",
+    "impact_level", "mechanism", "evidence", "review_status", "created_at"})
+_LINKS_REQUIRED_COLS = frozenset({
+    "id", "event_id", "target_type", "target_key", "relation_type"})
+
+# 普通索引的真实结构要求（名字 → (所属表, ((列名, 是否DESC), ...))）
+# 只看名字是不够的：名字对、表错或列错的索引照样会让查询走错，也会让唯一性/排序失效。
+_REQUIRED_INDEXES = {
+    "idx_events_date": ("events", (("event_date", True),)),          # event_date DESC
+    "idx_links_target": ("event_links", (("target_type", False),     # target_type,
+                                         ("target_key", False))),    # target_key（顺序固定）
+}
+
+
+def _safe_ident(name):
+    """只允许 SCHEMA 里出现过的标识符进 PRAGMA（PRAGMA 不能参数化）。"""
+    return name if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name or "") else None
+
+
+def _index_signature(conn, name):
+    """索引的真实结构：(所属表, ((列名, 是否DESC), ...), 是否 partial)。
+
+    - 列与排序方向用 `PRAGMA index_xinfo` 读（index_info 不含 DESC）；
+      xinfo 行格式 (seqno, cid, name, desc, coll, key)，只取 key=1 的列。
+    - 用 `PRAGMA index_list` 顺带取 partial 标记（部分索引不能当完整索引用）。
+    索引不存在 / 是表达式索引 / 读不出来 → None。
+    """
+    name = _safe_ident(name)
+    if not name:
+        return None
+    row = conn.execute("SELECT tbl_name FROM sqlite_master "
+                       "WHERE type='index' AND name=?", (name,)).fetchone()
+    if not row:
+        return None
+    table = row[0]
+    if not _safe_ident(table):
+        return None
+    partial = False
+    try:
+        for meta in conn.execute(f"PRAGMA index_list({table})").fetchall():
+            if meta[1] == name:
+                partial = bool(meta[4]) if len(meta) > 4 else False
+                break
+        rows = conn.execute(f"PRAGMA index_xinfo({name})").fetchall()
+    except sqlite3.DatabaseError:
+        return None
+    cols = []
+    for r in rows:
+        if len(r) >= 6 and not r[5]:        # key=0 是 rowid 辅助行，跳过
+            continue
+        if r[2] is None:                    # 表达式索引：列名取不到，视为不符合
+            return None
+        cols.append((r[2], bool(r[3])))
+    return table, tuple(cols), partial
+
+
+def _unique_column_sets(conn, table):
+    """该表**完整**（非 partial）UNIQUE 索引的列组合。
+
+    PRAGMA index_list 行格式：(seq, name, unique, origin, partial)。
+    只取 unique=1 且 partial=0 的 —— 部分唯一索引（... WHERE ...）只约束一部分行，
+    不能当成"完整唯一约束"来用，否则重复数据会漏进来。
+    """
+    out = set()
+    table = _safe_ident(table)
+    if not table:
+        return out
+    try:
+        rows = conn.execute(f"PRAGMA index_list({table})").fetchall()
+    except sqlite3.DatabaseError:
+        return out
+    for row in rows:
+        if not row[2]:                      # unique 标记
+            continue
+        if len(row) > 4 and row[4]:         # partial 索引 → 不算完整约束
+            continue
+        idx = _safe_ident(row[1])
+        if not idx:
+            continue
+        try:
+            cols = tuple(r[2] for r in conn.execute(f"PRAGMA index_info({idx})").fetchall())
+        except sqlite3.DatabaseError:
+            continue
+        if cols and all(c for c in cols):
+            out.add(cols)
+    return out
 
 
 def _schema_ready(conn):
-    """表结构是否已经能直接写（建表 + 2026-11 新增列）。
+    """当前库是否已经能直接写入（表 / 列 / 唯一约束 / 索引结构 全对得上 SCHEMA）。
 
-    批量写入时不能随便调 init_db：它走 `executescript`，而 sqlite3 的
-    executescript 会在执行前**隐式 COMMIT**，把外层批量事务拦腰截断。
-    所以只有在缺表/缺列（即还没写过任何数据）时才允许初始化。
+    批量写入时不能随便调 init_db：它走 `executescript`，会在执行前隐式 COMMIT，
+    把外层事务拦腰截断。所以必须把"结构是否真的就绪"判准 ——
+    只查 events 的几张列是不够的（events 齐了但 event_links 不存在时曾误判为就绪，
+    写关联就会炸）；只查索引名字也不够（名字对、建在错的表/列上，排序与过滤都会失效）。
+
+    检查项：
+      1. events / event_links 两张表都存在；
+      2. events 写入所需字段齐全（含 published_at / collected_at）；
+      3. event_links 所需字段齐全（含 relation_type）；
+      4. events.fingerprint 与 event_links(event_id,target_type,target_key) 的**完整**唯一约束在
+         （partial unique index 不算）；
+      5. idx_events_date = events(event_date DESC)、
+         idx_links_target = event_links(target_type, target_key) 按真实结构与顺序匹配，
+         且都不是 partial 索引。
     """
     try:
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(events)").fetchall()}
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        if not {"events", "event_links"} <= tables:
+            return False
+        ecols = {r[1] for r in conn.execute("PRAGMA table_info(events)").fetchall()}
+        if not _EVENTS_REQUIRED_COLS <= ecols:
+            return False
+        lcols = {r[1] for r in conn.execute("PRAGMA table_info(event_links)").fetchall()}
+        if not _LINKS_REQUIRED_COLS <= lcols:
+            return False
+        if ("fingerprint",) not in _unique_column_sets(conn, "events"):
+            return False
+        if ("event_id", "target_type", "target_key") not in _unique_column_sets(conn, "event_links"):
+            return False
+        # 索引：不只看名字，比对 (所属表, 列, 顺序, DESC) 与 partial 标记
+        for name, expected in _REQUIRED_INDEXES.items():
+            sig = _index_signature(conn, name)
+            if sig is None:
+                return False
+            table, cols, partial = sig
+            if partial or (table, cols) != expected:
+                return False
+        return True
     except sqlite3.DatabaseError:
         return False
-    return {"id", "fingerprint", "created_at", "occurred_at",
-            "impact_level", "mechanism", "evidence", "review_status"} <= cols
 
 
 @contextmanager
@@ -140,18 +275,25 @@ def _ensure_schema(conn, own):
 
     init_db() 走 `executescript()`，sqlite3 在执行前会隐式 COMMIT —— 这会提交
     调用方正在写的事务。所以分三种情况：
-      1. 结构已就绪            → 什么都不做（不重复迁移）；
-      2. 缺表/缺列 + 连接在事务里 → 明确拒绝报错（不静默提交）；
-      3. 缺表/缺列 + 无外层事务 → 就地 init_db（自己开的连接一定是这种）。
+      1. 结构已就绪（表/列/唯一约束/索引 都对得上）→ 什么都不做（不重复迁移）；
+      2. 结构不完整 + 连接在事务里 → 明确拒绝报错（不静默提交）；
+      3. 结构不完整 + 无外层事务 → 就地 init_db（自己开的连接一定是这种），
+         迁移完再复核一次；仍不合格说明无法自动修复（例如缺唯一约束），直接报错，
+         绝不让后续写入在半成品结构上"看起来成功"。
     """
     if _schema_ready(conn):
         return
     if not own and getattr(conn, "in_transaction", False):
         raise RuntimeError(
-            "事件库结构不完整（缺表或缺列），而当前连接已在事务中："
+            "事件库结构不完整（缺表/缺列/缺唯一约束/索引结构不符），而当前连接已在事务中："
             "init_db() 的 executescript() 会隐式提交调用方事务，因此拒绝在事务内迁移。"
             "请先在事务外调用 events_store.init_db(conn) 完成迁移，再执行 seed。")
     init_db(conn)
+    if not _schema_ready(conn):
+        raise RuntimeError(
+            "事件库结构不完整且无法自动迁移（缺表/缺列/缺唯一约束/索引结构不符）："
+            f"{db_path()}。init_db() 只能建缺失的表与索引、补缺失的列，"
+            "改不了已存在的约束与同名但结构错误的索引；请人工检查或从备份恢复。")
 
 
 def _ensure_columns(conn):
@@ -580,7 +722,7 @@ def timeline(days=365, industry=None, month=None, max_months=24, conn=None):
 
     own = conn is None
     conn = conn or connect()
-    init_db(conn)
+    _ensure_schema(conn, own)     # 结构就绪时不做 DDL（不隐式提交调用方事务）
     today = date.today()
     since = (today - timedelta(days=int(days))).isoformat()
     eff = _eff_date("e")
@@ -661,7 +803,7 @@ def timeline(days=365, industry=None, month=None, max_months=24, conn=None):
 def stats(conn=None):
     own = conn is None
     conn = conn or connect()
-    init_db(conn)
+    _ensure_schema(conn, own)     # 同上：只读统计不该顺手提交别人的事务
     s = {
         "events": conn.execute("SELECT COUNT(*) FROM events").fetchone()[0],
         "links": conn.execute("SELECT COUNT(*) FROM event_links").fetchone()[0],

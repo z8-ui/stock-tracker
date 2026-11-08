@@ -5,7 +5,7 @@
 
 > 项目：A 股个股/板块数据看板 + 估值偏离 + 个股政策事件（本地 SQLite）
 > 形态：单进程 Flask + 原生 JS + ECharts + SQLite，纯标准库单测，无前端构建
-> 规模：约 6.0k 行 Python（不含测试）/ 1.6k 行 JS，**335 个离线单测**
+> 规模：约 6.0k 行 Python（不含测试）/ 1.6k 行 JS，**350 个离线单测**
 
 > **当前版本 V2.0.2（2026-11-08）**
 > 本轮（相对 V2.0.1）：
@@ -36,7 +36,7 @@
 ## 1. 30 秒跑起来（不需要任何 API key）
 
 ```bash
-python3 -m unittest discover -s tests -v      # 335 个用例，纯离线，不联网
+python3 -m unittest discover -s tests -v      # 350 个用例，纯离线，不联网
 python3 app.py                                # 打开 http://127.0.0.1:5000
 ```
 
@@ -74,7 +74,7 @@ scripts/events_cli.py   事件录入 CLI：seed/add/add-text/feed/link/archive/r
 scripts/package_release.py  打发布包（排除密钥/缓存/本地库，入包出包各扫一次密钥）
 scripts/feed_daily.sh   每日抓取（crontab 调，只读不写库）
 templates/, static/     页面与前端；static/vendor/echarts.min.js 是 vendor 的 ECharts
-tests/                  335 个离线单测（数据层/缓存 SWR/认证/扫描器/政策口径/API/前端契约/seed 事务与嵌套）
+tests/                  350 个离线单测（数据层/缓存 SWR/认证/扫描器/政策口径/API/前端契约/seed 事务与嵌套）
 ```
 
 ---
@@ -136,7 +136,7 @@ tests/                  335 个离线单测（数据层/缓存 SWR/认证/扫描
    要不要抽公共壳？
 8. **数据健康的口径**：`STALE` 的阈值是"15 分钟 REAL / 1 天 CACHED / 超过 1 天 STALE 或时间未知"，
    有没有更合理的分档？`外部数据源成功率`是进程内计数（重启清零），你是否认为必须落到磁盘。
-9. **测试覆盖的边界**：335 个用例覆盖 routes 的超时/4xx/5xx/非法 JSON/空数据/缺字段/
+9. **测试覆盖的边界**：350 个用例覆盖 routes 的超时/4xx/5xx/非法 JSON/空数据/缺字段/
    旧缓存兜底/stale/失败不覆盖缓存，认证 fail-closed，扫描器转义与跨块，
    前端 JS 用 node 实跑（`format.js` 数值格式、`valuation.js` 政策竞态）。
    但仍是**基于 mock 的契约测试**：真实数据源改字段名、真实 DeepSeek 返回结构变化，
@@ -147,7 +147,7 @@ tests/                  335 个离线单测（数据层/缓存 SWR/认证/扫描
 ## 6. 验证命令（都是真跑过的，不是写在文档里的愿望）
 
 ```bash
-python3 -m unittest discover -s tests          # 335 tests, OK
+python3 -m unittest discover -s tests          # 350 tests, OK
 python3 scripts/events_cli.py stats            # 本机：事件 4 / 关联 16 / 孤儿 0（新库 seed 后是 4 / 15）
 python3 scripts/events_cli.py list --code 000657   # 3 条钨相关事件
 python3 scripts/events_cli.py feed --strong    # 抓快讯，只留强相关候选
@@ -221,20 +221,42 @@ python3 scripts/package_release.py             # 打包含密钥扫描
     `ROLLBACK TO SAVEPOINT + RELEASE` 再把异常抛出 —— **不再无条件 `commit()` / `rollback()`**；
   - `add_event(..., commit=True)` 新增形参：批量写入传 `commit=False`，只发语句不提交；
     `add_event(conn=None, commit=False)` 在建连接**之前**直接 `ValueError`（危险组合，关闭时会丢写入）；
-  - `_ensure_schema(conn, own)`：结构已就绪就不迁移；缺表/缺列且**连接已在事务中**时明确拒绝
+  - `_ensure_schema(conn, own)`：结构已就绪就不迁移；结构不完整且**连接已在事务中**时明确拒绝
     （`RuntimeError`，说明 `executescript` 会隐式提交），只有无外层事务时才 `init_db()`；
+    迁移后再复核一次，仍不合格（例如缺唯一约束，`init_db` 补不了）直接报"无法自动迁移"，
+    绝不留在半成品结构上继续写；
+  - `_schema_ready(conn)` 的判定范围（2026-11 二次 + 三次加固）：`events` 与 `event_links` 两张表都在、
+    `events` 17 个写入字段齐全（含 `published_at` / `collected_at`）、`event_links` 含 `relation_type`、
+    `events.fingerprint` 与 `event_links(event_id,target_type,target_key)` 的**完整**唯一约束在
+    （`partial` 唯一索引不算：只约束部分行，重复数据会漏进来）、
+    两个普通索引比对**真实结构**而非名字 —— `idx_events_date` 必须属于 `events` 且列是
+    `event_date DESC`，`idx_links_target` 必须属于 `event_links` 且列顺序是
+    `target_type, target_key`（用 `PRAGMA index_xinfo` 读列与 `desc`，`PRAGMA index_list` 读 `partial`）。
+    旧版只查 events 的 8 个列，对"events 齐全但 event_links 不存在"的库误判就绪 →
+    seed 在事务里撞 `no such table: event_links`（实测旧判定报这个错，新判定自动补建后 4 事件 / 15 关联）；
+    上一版只查索引名字，对"名字对但建在 `events.title` / `event_links.event_id` 上"的库也误判就绪
+    （实测旧名字判定 True、结构判定 False），这类库排序与过滤都是错的，必须重建成正确结构。
+    索引同名但结构错误时 `init_db` 补不了（`CREATE INDEX IF NOT EXISTS` 会跳过），
+    此时明确报"无法自动迁移"，要求人工处理而不是静默接受；
+  - `init_db(conn)` 明确事务契约：传入的 conn 已在事务中 → 直接 `RuntimeError`，不执行
+    `executescript`（它不是干净的初始化入口时就不许动）；自己新建连接的初始化路径不变。
+    `stats()` / `timeline()` 也从无条件 `init_db` 改为 `_ensure_schema` —— 只读统计不该顺手提交别人的事务；
   - `seed_from_static()` 用一个 `with transaction(conn)` 包住全部写入，`finally` 关闭自建连接，
     异常原样抛给调用方（CLI 打印明确失败原因并 `exit 1`）。
 - 同场景复测：**残留 0 条事件 / 0 条关联**，随后正常 seed 完整初始化 4 条。
 - 嵌套事务实测（上一版 `transaction` 对照）：外层事务里跑 seed 成功 → 旧实现让外层
   `in_transaction=False`、第二个连接已能看到 5 条（外层被提交）；失败 → 旧实现把外层标记
   也滚掉了。修复后两种情况外层事务都完好，提交/回滚由调用方决定。
-- 覆盖测试（`tests/test_events_store.py::TestSeed`，新增 15 个）：A 全新库 / B 重复执行 /
-  C 已有事件保护（含"同指纹不覆盖"）/ D 审核状态保护（approved 与 pending 双向）/
-  E 中途失败整体回滚（**用全新连接读文件校验，不只看异常**）/ F 外层事务中 seed 成功不提交外层 /
+- 覆盖测试（`tests/test_events_store.py`，共 45 个用例，本轮累计新增 30 个）：
+  A 全新库 / B 重复执行 / C 已有事件保护（含"同指纹不覆盖"）/ D 审核状态保护（双向）/
+  E 中途失败整体回滚（**用全新连接读文件校验**）/ F 外层事务中 seed 成功不提交外层 /
   G 外层事务中 seed 失败只回滚自己那层（外层仍可提交、也可回滚）/ H 拒绝 `conn=None + commit=False` /
-  I 结构不完整且连接在事务中 → 拒绝迁移且不隐式提交，另验旧库在事务外仍能正常迁移。
-  全量：**335 tests OK**。
+  I 结构不完整且连接在事务中 → 拒绝迁移且不隐式提交 + 旧库在事务外仍能迁移 /
+  J schema 契约（`TestSchemaContract` 15 个）：events 齐全但 event_links 缺失、
+  event_links 缺 relation_type、events 缺 published_at/collected_at、缺索引、
+  缺唯一约束必须报"无法自动迁移"、**索引名字对但列错 / 表错 / 列顺序错 / 少 DESC /
+  partial 唯一索引不算数**、`init_db(conn)` 在事务中拒绝且外层仍可提交/回滚、自建连接初始化幂等。
+  全量：**350 tests OK**。
 
 ### 7.3 债务 4：历史 PE / PB 估值分位 —— 未实现
 

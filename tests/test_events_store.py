@@ -475,6 +475,302 @@ class TestSeed(EventStoreCase):
             conn.close()
 
 
+class TestSchemaContract(EventStoreCase):
+    """schema 契约：结构判定必须覆盖 event_links 与约束/索引；迁移不得动调用方事务。"""
+
+    def _raw(self, script):
+        raw = sqlite3.connect(self.db)
+        try:
+            raw.executescript(script)
+            raw.commit()
+        finally:
+            raw.close()
+
+    def _ready(self):
+        conn = events_store.connect()
+        try:
+            return events_store._schema_ready(conn)
+        finally:
+            conn.close()
+
+    def test_fresh_db_is_ready(self):
+        events_store.init_db()
+        self.assertTrue(self._ready())
+
+    def test_events_complete_but_event_links_missing(self):
+        """events 齐全、event_links 不存在 → 不能判就绪；seed 要能把它补建出来。"""
+        events_store.init_db()
+        self._raw("DROP TABLE event_links;")
+        self.assertFalse(self._ready())
+
+        created, linked = events_store.seed_from_static()
+        self.assertEqual(created, 4)
+        self.assertGreater(linked, 0)
+        conn = events_store.connect()
+        try:
+            self.assertGreater(
+                conn.execute("SELECT COUNT(*) FROM event_links").fetchone()[0], 0)
+        finally:
+            conn.close()
+        self.assertTrue(self._ready())
+
+    def test_event_links_missing_relation_type(self):
+        """event_links 缺 relation_type → 判不就绪；迁移补列并回填 direct/industry。"""
+        events_store.init_db()
+        self._raw("""
+            DROP INDEX IF EXISTS idx_links_target;
+            DROP TABLE event_links;
+            CREATE TABLE event_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id INTEGER NOT NULL,
+                target_type TEXT NOT NULL,
+                target_key TEXT NOT NULL,
+                UNIQUE(event_id, target_type, target_key)
+            );
+        """)
+        self.assertFalse(self._ready())
+
+        created, _ = events_store.seed_from_static()
+        self.assertEqual(created, 4)
+        conn = events_store.connect()
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(event_links)").fetchall()}
+            self.assertIn("relation_type", cols)
+            rows = conn.execute(
+                "SELECT target_type, relation_type FROM event_links").fetchall()
+            self.assertTrue(rows)
+            for target_type, rel in rows:
+                self.assertEqual(rel, "direct" if target_type == "stock" else "industry")
+        finally:
+            conn.close()
+        self.assertTrue(self._ready())
+
+    def test_events_missing_published_and_collected(self):
+        """events 缺 published_at / collected_at → 判不就绪；迁移补列后 seed 正常。"""
+        self._raw("""
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_date TEXT NOT NULL, title TEXT NOT NULL,
+                summary TEXT NOT NULL DEFAULT '', direction TEXT NOT NULL DEFAULT '中性',
+                source TEXT NOT NULL DEFAULT '', source_url TEXT NOT NULL DEFAULT '',
+                fingerprint TEXT NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'active',
+                occurred_at TEXT,
+                impact_level TEXT NOT NULL DEFAULT '待确认',
+                mechanism TEXT NOT NULL DEFAULT '', evidence TEXT NOT NULL DEFAULT '',
+                review_status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL
+            );
+            CREATE INDEX idx_events_date ON events(event_date DESC);
+            CREATE TABLE event_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+                target_type TEXT NOT NULL, target_key TEXT NOT NULL,
+                relation_type TEXT NOT NULL DEFAULT '',
+                UNIQUE(event_id, target_type, target_key)
+            );
+            CREATE INDEX idx_links_target ON event_links(target_type, target_key);
+        """)
+        self.assertFalse(self._ready())
+
+        created, _ = events_store.seed_from_static()
+        self.assertEqual(created, 4)
+        conn = events_store.connect()
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(events)").fetchall()}
+            self.assertIn("published_at", cols)
+            self.assertIn("collected_at", cols)
+        finally:
+            conn.close()
+        self.assertTrue(self._ready())
+
+    def test_missing_index_is_not_ready(self):
+        """SCHEMA 里的索引缺失 → 判不就绪；seed 会重建（CREATE INDEX IF NOT EXISTS）。"""
+        events_store.init_db()
+        self._raw("DROP INDEX idx_events_date;")
+        self.assertFalse(self._ready())
+        events_store.seed_from_static()
+        conn = events_store.connect()
+        try:
+            names = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'").fetchall()}
+        finally:
+            conn.close()
+        self.assertIn("idx_events_date", names)
+        self.assertTrue(self._ready())
+
+    def test_missing_unique_constraint_is_reported_not_hidden(self):
+        """events.fingerprint 没有 UNIQUE → init_db 修不了，必须明确报错而不是假装成功。"""
+        self._raw("""
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_date TEXT NOT NULL, title TEXT NOT NULL,
+                summary TEXT NOT NULL DEFAULT '', direction TEXT NOT NULL DEFAULT '中性',
+                source TEXT NOT NULL DEFAULT '', source_url TEXT NOT NULL DEFAULT '',
+                fingerprint TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active',
+                occurred_at TEXT, published_at TEXT, collected_at TEXT,
+                impact_level TEXT NOT NULL DEFAULT '待确认',
+                mechanism TEXT NOT NULL DEFAULT '', evidence TEXT NOT NULL DEFAULT '',
+                review_status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL
+            );
+            CREATE INDEX idx_events_date ON events(event_date DESC);
+            CREATE TABLE event_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id INTEGER NOT NULL, target_type TEXT NOT NULL,
+                target_key TEXT NOT NULL, relation_type TEXT NOT NULL DEFAULT '',
+                UNIQUE(event_id, target_type, target_key)
+            );
+            CREATE INDEX idx_links_target ON event_links(target_type, target_key);
+        """)
+        self.assertFalse(self._ready())
+        with self.assertRaises(RuntimeError) as ctx:
+            events_store.seed_from_static()
+        self.assertIn("无法自动迁移", str(ctx.exception))
+
+    def test_index_signatures_match_schema(self):
+        """正常库：两个索引的表、列、顺序、DESC 全部对得上。"""
+        events_store.init_db()
+        conn = events_store.connect()
+        try:
+            self.assertEqual(events_store._index_signature(conn, "idx_events_date"),
+                             ("events", (("event_date", True),), False))
+            self.assertEqual(events_store._index_signature(conn, "idx_links_target"),
+                             ("event_links", (("target_type", False),
+                                              ("target_key", False)), False))
+        finally:
+            conn.close()
+        self.assertTrue(self._ready())
+
+    def test_index_right_name_wrong_column(self):
+        """idx_events_date 名字对，但建在 events.title 上 → 必须判不就绪。"""
+        events_store.init_db()
+        self._raw("""
+            DROP INDEX idx_events_date;
+            CREATE INDEX idx_events_date ON events(title DESC);
+        """)
+        self.assertFalse(self._ready())
+        with self.assertRaises(RuntimeError) as ctx:
+            events_store.seed_from_static()
+        self.assertIn("无法自动迁移", str(ctx.exception))
+
+    def test_index_right_name_wrong_table(self):
+        """idx_events_date 名字对，但建在 event_links 表上 → 必须判不就绪。"""
+        events_store.init_db()
+        self._raw("""
+            DROP INDEX idx_events_date;
+            CREATE INDEX idx_events_date ON event_links(target_type);
+        """)
+        self.assertFalse(self._ready())
+
+    def test_links_index_column_order_wrong(self):
+        """idx_links_target 列顺序反了（target_key, target_type）→ 必须判不就绪。"""
+        events_store.init_db()
+        self._raw("""
+            DROP INDEX idx_links_target;
+            CREATE INDEX idx_links_target ON event_links(target_key, target_type);
+        """)
+        self.assertFalse(self._ready())
+
+    def test_events_index_without_desc(self):
+        """idx_events_date 少了 DESC（默认 ASC）→ 必须判不就绪。"""
+        events_store.init_db()
+        self._raw("""
+            DROP INDEX idx_events_date;
+            CREATE INDEX idx_events_date ON events(event_date);
+        """)
+        self.assertFalse(self._ready())
+        sig = None
+        conn = events_store.connect()
+        try:
+            sig = events_store._index_signature(conn, "idx_events_date")
+        finally:
+            conn.close()
+        self.assertEqual(sig, ("events", (("event_date", False),), False))   # 确认真的读成 ASC
+
+    def test_partial_unique_index_is_not_a_real_constraint(self):
+        """事件表只有 partial unique index（带 WHERE）→ 不能当成完整唯一约束。"""
+        self._raw("""
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_date TEXT NOT NULL, title TEXT NOT NULL,
+                summary TEXT NOT NULL DEFAULT '', direction TEXT NOT NULL DEFAULT '中性',
+                source TEXT NOT NULL DEFAULT '', source_url TEXT NOT NULL DEFAULT '',
+                fingerprint TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active',
+                occurred_at TEXT, published_at TEXT, collected_at TEXT,
+                impact_level TEXT NOT NULL DEFAULT '待确认',
+                mechanism TEXT NOT NULL DEFAULT '', evidence TEXT NOT NULL DEFAULT '',
+                review_status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL
+            );
+            CREATE INDEX idx_events_date ON events(event_date DESC);
+            CREATE UNIQUE INDEX idx_dead_fp ON events(fingerprint) WHERE fingerprint <> '';
+            CREATE TABLE event_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id INTEGER NOT NULL, target_type TEXT NOT NULL,
+                target_key TEXT NOT NULL, relation_type TEXT NOT NULL DEFAULT '',
+                UNIQUE(event_id, target_type, target_key)
+            );
+            CREATE INDEX idx_links_target ON event_links(target_type, target_key);
+        """)
+        conn = events_store.connect()
+        try:
+            self.assertNotIn(("fingerprint",), events_store._unique_column_sets(conn, "events"))
+            self.assertEqual(events_store._unique_column_sets(conn, "events"), set())
+        finally:
+            conn.close()
+        self.assertFalse(self._ready())
+        with self.assertRaises(RuntimeError) as ctx:
+            events_store.seed_from_static()
+        self.assertIn("无法自动迁移", str(ctx.exception))
+
+    # ---- init_db 的事务契约 ----
+
+    def test_init_db_refuses_inside_outer_transaction(self):
+        events_store.init_db()                     # 先在事务外建好
+        conn = events_store.connect()
+        conn.execute("CREATE TABLE IF NOT EXISTS marker (x TEXT)")
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("INSERT INTO marker (x) VALUES ('outer')")
+
+        with self.assertRaises(RuntimeError) as ctx:
+            events_store.init_db(conn)
+        self.assertIn("事务", str(ctx.exception))
+        self.assertTrue(conn.in_transaction, "init_db 把调用方事务提交掉了")
+
+        other = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(other.execute("SELECT COUNT(*) FROM marker").fetchone()[0], 0)
+        finally:
+            other.close()
+
+        conn.commit()
+        conn.close()
+        other = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(other.execute("SELECT COUNT(*) FROM marker").fetchone()[0], 1)
+        finally:
+            other.close()
+
+    def test_init_db_refusal_keeps_outer_rollback_working(self):
+        events_store.init_db()
+        conn = events_store.connect()
+        conn.execute("CREATE TABLE IF NOT EXISTS marker (x TEXT)")
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("INSERT INTO marker (x) VALUES ('outer')")
+        with self.assertRaises(RuntimeError):
+            events_store.init_db(conn)
+        conn.rollback()                            # 外层主动回滚仍然有效
+        conn.close()
+        other = sqlite3.connect(self.db)
+        try:
+            self.assertEqual(other.execute("SELECT COUNT(*) FROM marker").fetchone()[0], 0)
+        finally:
+            other.close()
+
+    def test_init_db_own_connection_still_works(self):
+        """自己连自己建（CLI / 页面首次启动路径）不受事务契约影响。"""
+        events_store.init_db()
+        events_store.init_db()                     # 幂等重跑
+        self.assertTrue(self._ready())
+
+
 class TestFallback(EventStoreCase):
     def test_falls_back_to_static_when_no_table(self):
         # 指向一个空库（还没建表）→ notes_for 返回 None → policy_notes 回退静态字典
