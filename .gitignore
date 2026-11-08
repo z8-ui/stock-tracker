@@ -22,6 +22,11 @@ Thumbs.db
 *.log
 /tmp/
 
+# 环境变量（真实密钥只放本地 .env，示例可以入库）
+.env
+.env.*
+!.env.example
+
 # 备份（如果有）
 *-backup-*.tar.gz
 

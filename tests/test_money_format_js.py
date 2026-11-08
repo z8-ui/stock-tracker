@@ -39,7 +39,20 @@ const probes = {
   'pct_pos': f.pct(1.2345),
   'pct_neg': f.pct(-1.2355),
   'pct_zero': f.pct(0),
-  'pct_null': f.pct(undefined)
+  'pct_null': f.pct(undefined),
+  'plain_str': f.plain('43845.000'),
+  'date8_8digit': f.date8('20261106'),
+  'date8_number': f.date8(20261106),
+  'date8_dashed': f.date8('2026-11-06'),
+  'date8_spaces': f.date8(' 20261106 '),
+  'date8_slash': f.date8('2026/11/06'),
+  'date8_empty': f.date8(''),
+  'date8_null': f.date8(null),
+  'date8_undefined': f.date8(undefined),
+  'date8_short': f.date8('2026'),
+  'date8_bad_month': f.date8('20261399'),
+  'date8_garbage': f.date8('abc'),
+  'date8_truthy_check': f.date8(undefined) ? 'shown' : 'hidden'
 };
 console.log(JSON.stringify(probes));
 """
@@ -86,6 +99,23 @@ class TestFormatJsBehaviour(unittest.TestCase):
         self.assertEqual(self.got["pct_neg"], "-1.24%")
         self.assertEqual(self.got["pct_zero"], "0.00%")
         self.assertEqual(self.got["pct_null"], "--")
+
+    def test_date8_formats_real_trade_date(self):
+        """交易日 8 位 → 2026-11-06；取不到就是空串（页面据此不显示）。"""
+        self.assertEqual(self.got["date8_8digit"], "2026-11-06")
+        self.assertEqual(self.got["date8_number"], "2026-11-06")
+        self.assertEqual(self.got["date8_dashed"], "2026-11-06")
+        self.assertEqual(self.got["date8_spaces"], "2026-11-06")
+        self.assertEqual(self.got["date8_slash"], "2026-11-06")
+
+    def test_date8_never_returns_undefined_or_junk(self):
+        """空值/坏值一律空串：不许出现 undefined / null / NaN / 20261399。"""
+        for k in ("date8_empty", "date8_null", "date8_undefined",
+                  "date8_short", "date8_bad_month", "date8_garbage"):
+            with self.subTest(case=k):
+                self.assertEqual(self.got[k], "")
+        self.assertEqual(self.got["date8_truthy_check"], "hidden",
+                         "空日期必须是 falsy，页面才不会拼出多余空白")
 
 
 class TestNoRawMoneyConcat(unittest.TestCase):

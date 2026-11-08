@@ -44,5 +44,21 @@
         return fixed(v, d);
     }
 
-    window.fmt = { toNum: toNum, fixed: fixed, money: money, pct: pct, plain: plain };
+    // 交易日：接口原样给 8 位（20261106）→ 显示成 2026-11-06。
+    // 已是 2026-11-06 就原样返回；取不到 / 不是合法日期 → 空串。
+    // 之所以返回空串而不是 '--'：调用处据此直接不显示，页面上不该出现
+    // "上证指数 undefined" 或 "上证指数 --" 这种像坏了一半的样子。
+    function date8(v) {
+        if (v === null || v === undefined) return '';
+        var s = String(v).trim().replace(/\//g, '-');
+        var m;
+        if ((m = /^(\d{4})(\d{2})(\d{2})$/.exec(s)) || (m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s))) {
+            var mm = parseInt(m[2], 10), dd = parseInt(m[3], 10);
+            if (mm < 1 || mm > 12 || dd < 1 || dd > 31) return '';   // 20261399 这种直接不显示
+            return m[1] + '-' + m[2] + '-' + m[3];
+        }
+        return '';
+    }
+
+    window.fmt = { toNum: toNum, fixed: fixed, money: money, pct: pct, plain: plain, date8: date8 };
 })();

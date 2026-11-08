@@ -20,8 +20,12 @@ def build_market_flow_chart(flow_data):
         {"name": "中单", "value": flow_data.get("middle_order", 0)},
         {"name": "小单", "value": flow_data.get("small_order", 0)},
     ]
+    # 交易日：来自 get_market_flow() 解析的腾讯行情（原样 8 位，如 20261106）。
+    # 以前只拼进 title，前端读 data.date 永远 undefined；这里原样透出，不生成任何日期。
+    trade_date = flow_data.get("date") or ""
     return {
-        "title": f"全市资金流向（{flow_data.get('date', '')}）",
+        "title": f"全市资金流向（{trade_date}）" if trade_date else "全市资金流向",
+        "date": trade_date,
         "main_force": flow_data.get("main_force", 0),
         "index_name": flow_data.get("index_name", "上证指数"),
         "index_price": flow_data.get("index_price", 0),

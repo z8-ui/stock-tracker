@@ -470,7 +470,9 @@ def _tencent_quote(code):
 def get_market_flow():
     """全市资金流向（基于东方财富真实数据 + 文件缓存）"""
     def _fetch():
-        date = datetime.now().strftime("%Y-%m-%d")
+        # 只有真正从行情源拿到时间才填：以前默认 datetime.now()，
+        # 源不给时间（或干脆没数据）时会把"今天"当成交易日写进页面，属于凭空生成日期。
+        date = ""
         index_name = "上证指数"
         index_price = 0
         index_change = 0

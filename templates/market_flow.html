@@ -63,11 +63,14 @@ function loadMarketFlowData() {
             }
             const d = res.data;
             const color = d.index_change >= 0 ? '#ef5350' : '#26a69a';
+            // 交易日：接口给 8 位原值（如 20261106）。取不到就整段不显示，
+            // 绝不让 "上证指数 undefined" 出现在页面上。
+            const asof = window.fmt.date8(d.date);
 
             // 1. 大盘指数
             document.getElementById('index-summary').innerHTML = `
                 <div class="summary-number" style="color:${color}">${window.fmt.fixed(d.index_price)}</div>
-                <div class="summary-label">${d.index_name}  ${d.date}</div>
+                <div class="summary-label">${d.index_name}${asof ? '  ' + asof : ''}</div>
                 <div class="summary-status" style="color:${color}">${window.fmt.pct(d.index_change)}</div>
             `;
 
