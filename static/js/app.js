@@ -52,12 +52,17 @@ function renderPieChart(domId, title, items, colors) {
     const chart = getChart(domId);
     if (!chart) return;
 
+    // 空值语义：null = 源没给这个类别，必须保留成 null（不画扇区、tooltip 显示"暂无数据"），
+    // 不能经 Math.abs(null)→0 变成"真实的 0.00 亿"。
+    const seriesItems = window.fmt.pieItems(items);
+    putPieGapHint(domId, window.fmt.gapHint(seriesItems));
+
     chart.setOption({
         tooltip: {
             trigger: 'item',
             // 饼图给的是绝对值（流入/流出规模），不显示正负号，但必须两位小数
             formatter: function (p) {
-                return p.name + ': ' + window.fmt.fixed(p.value) + '亿 (' + window.fmt.fixed(p.percent) + '%)';
+                return window.fmt.pieTip(p.name, p.value, p.percent);
             }
         },
         color: colors,
@@ -73,10 +78,29 @@ function renderPieChart(domId, title, items, colors) {
             radius: ['35%', '55%'],
             center: ['50%', '42%'],
             label: { color: '#e0e0e0', fontSize: 12 },
-            data: items.map(i => ({ name: i.name, value: Math.abs(i.value) })),
+            data: seriesItems,
             emphasis: { itemStyle: { shadowBlur: 10, shadowColor: 'rgba(0,0,0,0.3)' } }
         }]
     });
+}
+
+// 缺失类别提示：动态文字，没有缺失时移除节点（不占位、不留空行）
+function putPieGapHint(domId, text) {
+    const box = document.getElementById(domId);
+    if (!box || !box.parentNode) return;
+    const id = domId + '-gap';
+    let el = document.getElementById(id);
+    if (!text) {
+        if (el) el.remove();
+        return;
+    }
+    if (!el) {
+        el = document.createElement('div');
+        el.id = id;
+        el.style.cssText = 'color:#ffb74d; font-size:12px; padding:4px 8px 0;';
+        box.parentNode.appendChild(el);
+    }
+    el.textContent = text;
 }
 
 // ========== 横向柱状图 ==========

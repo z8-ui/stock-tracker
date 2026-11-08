@@ -60,5 +60,44 @@
         return '';
     }
 
-    window.fmt = { toNum: toNum, fixed: fixed, money: money, pct: pct, plain: plain, date8: date8 };
+    // ---------- 图表空值 ----------
+    // Math.abs(null) === 0 —— 直接把 null 丢进 Math.abs 会把"没有数据"画成真实的 0。
+    // 约定：null/undefined/空串/NaN 一律保留为 null（ECharts 不画该扇区），0 仍是 0。
+    function chartValue(v) {
+        var n = toNum(v);
+        return n === null ? null : Math.abs(n);
+    }
+
+    // 饼图数据集：只做绝对值，null 原样保留
+    function pieItems(items) {
+        return (items || []).map(function (i) {
+            return { name: i && i.name, value: chartValue(i && i.value) };
+        });
+    }
+
+    // 饼图 tooltip：null 显示"暂无数据"，绝不显示 0.00 亿
+    function pieTip(name, value, percent) {
+        var n = toNum(value);
+        if (n === null) return name + ': 暂无数据';
+        var tail = (percent === null || percent === undefined) ? '' : ' (' + fixed(percent) + '%)';
+        return name + ': ' + fixed(n) + '亿' + tail;
+    }
+
+    // 缺失提示：按实际缺失的类别动态生成，不写死
+    function gapHint(series) {
+        var list = series || [];
+        var missing = [];
+        for (var i = 0; i < list.length; i++) {
+            if (toNum(list[i].value) === null) missing.push(list[i].name);
+        }
+        if (missing.length === 0) return '';
+        var head = missing.join('、') + '数据暂缺';
+        return missing.length === list.length
+            ? head + '，暂无可用资金数据。'
+            : head + '，当前图表仅展示可用资金类别。';
+    }
+
+    window.fmt = { toNum: toNum, fixed: fixed, money: money, pct: pct, plain: plain,
+                   date8: date8, chartValue: chartValue, pieItems: pieItems,
+                   pieTip: pieTip, gapHint: gapHint };
 })();
