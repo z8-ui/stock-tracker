@@ -308,6 +308,11 @@ python3 scripts/package_release.py             # 打包含密钥扫描
   "源给了全 0 记录"（真实零值，保留）与"没拿到资金记录"（返回 None，不造零值）；
   新增 `services/data/telemetry.py` + `cache_stats()`，Provider 维度与缓存键维度分开统计，
   缓存命中不再冒充上游请求；文档统计口径已按实际代码修正（1388 行 / 41 函数 / B 类 12 个）。
+- **S2 前置 hotfix（2026-11-08 晚）**：真实报文核对发现 `get_market_flow()` 把 f69/f75（占比）
+  当"中单/小单"金额、且 `val2yi()` 按数值大小猜单位 —— 页面上的中单/小单其实是百分比。
+  已改为 f78/f84 + `yuan_to_yi()`（一律 元→亿），缺失不填 0；旧缓存用 `_flow_fields_v=2` 自愈重取。
+  真实报文回放：中单 -279.00→45.83 亿、小单 -348.00→479.15 亿，守恒残差 -1151.97→0.01。
+  夹具见 `tests/fixtures/eastmoney/`，回归 `tests/test_market_flow_fields.py`（14 例）。
 - **仍然没有的**：东财系列 Provider（资金流 / 板块 / F10 / 行业 PE 还在 `data_service` 里）、
   缓存层独立、Routes 分层 —— 都按规划逐轮搬，一次一类。
 

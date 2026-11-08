@@ -15,10 +15,11 @@ def build_market_flow_chart(flow_data):
         return None
 
     items = [
-        {"name": "超大单", "value": flow_data.get("super_large", 0)},
-        {"name": "大单", "value": flow_data.get("large_order", 0)},
-        {"name": "中单", "value": flow_data.get("middle_order", 0)},
-        {"name": "小单", "value": flow_data.get("small_order", 0)},
+        # 中单/小单可能是 None（源没给金额）——原样透出，前端显示 "--"，不补 0
+        {"name": "超大单", "value": flow_data.get("super_large")},
+        {"name": "大单", "value": flow_data.get("large_order")},
+        {"name": "中单", "value": flow_data.get("middle_order")},
+        {"name": "小单", "value": flow_data.get("small_order")},
     ]
     # 交易日：来自 get_market_flow() 解析的腾讯行情（原样 8 位，如 20261106）。
     # 以前只拼进 title，前端读 data.date 永远 undefined；这里原样透出，不生成任何日期。
@@ -31,7 +32,9 @@ def build_market_flow_chart(flow_data):
         "index_price": flow_data.get("index_price", 0),
         "index_change": flow_data.get("index_change", 0),
         "items": items,
-        "colors": [COLORS["主力净流入"] if i["value"] > 0 else COLORS["主力净流出"] for i in items]
+        # value 为 None 时不能直接比大小（会 TypeError）；None 按"流出色"渲染，不影响数值
+        "colors": [COLORS["主力净流入"] if (i["value"] or 0) > 0 else COLORS["主力净流出"]
+                   for i in items]
     }
 
 

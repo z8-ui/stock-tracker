@@ -109,7 +109,8 @@ class Base(unittest.TestCase):
 
     def market_data(self, date="20261106", index_price=3649.18, main_force=-524.97,
                     flow_available=True):
-        return {"main_force": main_force, "super_large": -300.0, "large_order": -224.97,
+        return {"_flow_fields_v": 2, "main_force": main_force, "super_large": -300.0,
+                "large_order": -224.97,
                 "middle_order": 100.0, "small_order": 424.97, "date": date,
                 "index_name": "上证指数", "index_price": index_price,
                 "index_change": -1.1, "_flow_available": flow_available}

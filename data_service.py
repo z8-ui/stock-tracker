@@ -313,6 +313,19 @@ def calendar_info():
     }
 
 
+def yuan_to_yi(value):
+    """金额字段：元 → 亿元，保留两位小数。
+
+    只接受"源给的元"这一种口径，不再按数值大小猜单位 —— 旧实现
+    `round(v/1e8,2) if abs(v) > 1e6 else round(v,2)` 会把百分比 -299 当成 -299 亿，
+    也会把 100 万以下的真实净流入按"元"原样返回。
+    缺失就抛异常，由调用方决定"这条记录不可用"，绝不默认填 0。
+    """
+    if value is None or value == "":
+        raise ValueError("missing monetary field")
+    return round(float(value) / 100_000_000, 2)
+
+
 def _has_valid_data(data):
     """检查 dict 数据是否有真实值（非全零/全空）"""
     if not data:
@@ -327,7 +340,8 @@ def _has_valid_data(data):
         # 只有"根本没拿到资金记录"时，才退回按数值非零判断（避免把空结果当行情）。
         if data.get("_flow_available") is True:
             return True
-        return any(abs(data.get(f, 0)) > 0.01 for f in flow_fields)
+        vals = [data.get(f) for f in flow_fields if isinstance(data.get(f), (int, float))]
+        return any(abs(v) > 0.01 for v in vals)
     return True
 
 
@@ -546,6 +560,7 @@ def get_market_flow():
         middle_order = 0
         small_order = 0
         flow_available = False      # 东财是否真的给了资金记录（用于区分"零值"与"没数据"）
+        flow_partial = False        # 中单/小单金额缺失（老式报文）→ 未知而不是 0
 
         if text:
             try:
@@ -553,15 +568,24 @@ def get_market_flow():
                 diff = data.get("data", {}).get("diff", [])
                 flow_available = bool(diff)
                 for item in diff:
-                    def val2yi(v):
-                        if v is None: return 0
-                        v = float(v)
-                        return round(v / 1e8, 2) if abs(v) > 1e6 else round(v, 2)
-                    main_force += val2yi(item.get("f62", 0))
-                    super_large += val2yi(item.get("f66", 0))
-                    large_order += val2yi(item.get("f72", 0))
-                    middle_order += val2yi(item.get("f69", 0))
-                    small_order += val2yi(item.get("f75", 0))
+                    # 字段口径（2026-11-08 真实报文核对，见 docs/V2.1_S2_EASTMONEY_FLOW_DESIGN.md §2）：
+                    #   f62 主力净额 / f66 超大单 / f72 大单 / f78 中单 / f84 小单（单位：元）
+                    #   f69 f75 f81 f87 是占比(%)，绝不能当金额加进来
+                    try:
+                        main_force += yuan_to_yi(item.get("f62"))
+                        super_large += yuan_to_yi(item.get("f66"))
+                        large_order += yuan_to_yi(item.get("f72"))
+                        mid_raw, small_raw = item.get("f78"), item.get("f84")
+                        if mid_raw is None or small_raw is None:
+                            # 老式/残缺报文没有中、小单金额：保留"未知"，不填 0、不拿占比顶替
+                            flow_partial = True
+                            continue
+                        middle_order += yuan_to_yi(mid_raw)
+                        small_order += yuan_to_yi(small_raw)
+                    except (TypeError, ValueError):
+                        # 连主力/大单/超大单都缺 → 这份快照不可用，宁可"暂无数据"
+                        flow_available = False
+                        break
             except:
                 pass
 
@@ -572,8 +596,24 @@ def get_market_flow():
         if not flow_available or index_price <= 0:
             return None
 
+        # 多源累加后的浮点尾巴统一收口（单位已是亿元，两位小数是接口契约）
+        main_force = round(main_force, 2)
+        super_large = round(super_large, 2)
+        large_order = round(large_order, 2)
+        middle_order = round(middle_order, 2) if middle_order is not None else None
+        small_order = round(small_order, 2) if small_order is not None else None
+
+        if flow_partial:
+            # 未知 ≠ 0：前端 fmt.money(None) 会显示 "--"
+            middle_order = None
+            small_order = None
+
         return {
+            # 字段口径版本：2 = 中单/小单取 f78/f84、金额一律 元→亿。
+            # 旧缓存（v1）里的中单/小单是百分比被当成亿，读到就丢弃重取。
+            "_flow_fields_v": 2,
             "_flow_available": flow_available,
+            "_flow_partial": flow_partial,
             "main_force": main_force,
             "super_large": super_large,
             "large_order": large_order,
@@ -585,7 +625,11 @@ def get_market_flow():
             "index_change": index_change
         }
 
-    return _cached_get("market_flow", _fetch, validate_fn=_has_valid_data)
+    out = _cached_get("market_flow", _fetch, validate_fn=_has_valid_data)
+    # 旧口径缓存（v1）自愈：里面的中单/小单是错的，不能继续展示，重取一次覆盖
+    if isinstance(out, dict) and out.get("_flow_fields_v") != 2:
+        out = _cached_get("market_flow", _fetch, validate_fn=_has_valid_data, force=True)
+    return out
 
 
 # ==============================================================
