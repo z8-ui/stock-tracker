@@ -524,6 +524,12 @@ def _tencent_quote(code):
 #  1. 全市资金走向（腾讯大盘 + 模拟拆分）
 # ==============================================================
 
+MARKET_FLOW_INDICES = (
+    {"name": "上证指数", "code": "000001"},     # → secid 1.000001（指数语义，不是平安银行）
+    {"name": "深证成指", "code": "399001"},     # → secid 0.399001
+)
+
+
 def get_market_flow():
     """全市资金流向（基于东方财富真实数据 + 文件缓存）"""
     def _fetch():
@@ -535,59 +541,40 @@ def get_market_flow():
         index_change = 0
 
         # 并行调用腾讯（大盘行情） + 东方财富（资金流向）
+        # 东财这一段整体交给 Provider：ulist.np 的 diff 是"每指数一条快照"，不是 klines，
+        # 解析、元→亿、缺字段语义都在 Provider 里（见 §4.6 设计）。
         parts = None
-        text = None
-        eastmoney_url = "https://push2.eastmoney.com/api/qt/ulist.np/get"
-        eastmoney_params = {
-            "fltt": "2",
-            "fields": "f62,f66,f69,f72,f75,f78,f81,f84,f87",
-            "secids": "1.000001,0.399001"
-        }
+        flow_res = None
         with ThreadPoolExecutor(max_workers=2) as pool:
             tencent_fut = pool.submit(_tencent_quote, "000001")
-            em_fut = pool.submit(_get, eastmoney_url, eastmoney_params)
+            em_fut = pool.submit(_providers.call, "eastmoney_flow",
+                                 mode="market_snapshot", indices=MARKET_FLOW_INDICES)
             parts = tencent_fut.result()
-            text = em_fut.result()
+            flow_res = em_fut.result()
 
         if parts:
             index_name = parts[1] if parts[1] else "上证指数"
             index_price = float(parts[3]) if parts[3] else 0
             index_change = float(parts[32]) if len(parts) > 32 and parts[32] else 0
             date = parts[30][:8] if len(parts) > 30 and parts[30] else date
+
         main_force = 0
         super_large = 0
         large_order = 0
         middle_order = 0
         small_order = 0
-        flow_available = False      # 东财是否真的给了资金记录（用于区分"零值"与"没数据"）
-        flow_partial = False        # 中单/小单金额缺失（老式报文）→ 未知而不是 0
+        flow_available = False      # 东财是否真的给了资金记录（区分"零值"与"没数据"）
+        flow_partial = False        # 中单/小单金额缺失 → 未知而不是 0
 
-        if text:
-            try:
-                data = json.loads(text)
-                diff = data.get("data", {}).get("diff", [])
-                flow_available = bool(diff)
-                for item in diff:
-                    # 字段口径（2026-11-08 真实报文核对，见 docs/V2.1_S2_EASTMONEY_FLOW_DESIGN.md §2）：
-                    #   f62 主力净额 / f66 超大单 / f72 大单 / f78 中单 / f84 小单（单位：元）
-                    #   f69 f75 f81 f87 是占比(%)，绝不能当金额加进来
-                    try:
-                        main_force += yuan_to_yi(item.get("f62"))
-                        super_large += yuan_to_yi(item.get("f66"))
-                        large_order += yuan_to_yi(item.get("f72"))
-                        mid_raw, small_raw = item.get("f78"), item.get("f84")
-                        if mid_raw is None or small_raw is None:
-                            # 老式/残缺报文没有中、小单金额：保留"未知"，不填 0、不拿占比顶替
-                            flow_partial = True
-                            continue
-                        middle_order += yuan_to_yi(mid_raw)
-                        small_order += yuan_to_yi(small_raw)
-                    except (TypeError, ValueError):
-                        # 连主力/大单/超大单都缺 → 这份快照不可用，宁可"暂无数据"
-                        flow_available = False
-                        break
-            except:
-                pass
+        if flow_res is not None and flow_res.ok():
+            flow_available = True
+            total = flow_res.data["total"]
+            main_force = total["main_force"]
+            super_large = total["super_large"]
+            large_order = total["large_order"]
+            middle_order = total["middle_order"]
+            small_order = total["small_order"]
+            flow_partial = bool(flow_res.data.get("partial"))
 
         # 只要有一边没拿到，就不能组装成"行情"：
         #   - 没有指数 → 价格是假的 0；
@@ -825,8 +812,13 @@ def get_stock_quote(stock_code):
 # ==============================================================
 
 def _fflow_secid(stock_code):
-    """东财 secid：沪市(6/9) 用 1.，深市/北交所 用 0."""
-    return f"{'1' if stock_code.startswith(('6', '9')) else '0'}.{stock_code}"
+    """东财 secid（兼容保留）：规则已统一到 normalizers.secid()。
+
+    老测试仍在锁这个函数的输出，所以保留薄委托而不是删掉；
+    真正的市场判断（含 000001 指数/个股歧义、未知代码报错）在 normalizers.secid()。
+    """
+    from services.data.normalizers import secid
+    return secid(stock_code, "stock")
 
 
 def get_stock_money_flow(stock_code, days=20):
@@ -839,43 +831,11 @@ def get_stock_money_flow(stock_code, days=20):
     接口失败返回 None → 路由显示"暂无数据"，不再随机兜底
     """
     def fetch():
-        text = _get(
-            "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get",
-            {"lmt": "0", "klt": "101", "secid": _fflow_secid(stock_code),
-             "fields1": "f1,f2,f3,f7", "fields2": "f51,f52,f53,f54,f55,f56"},
-            timeout=10)
-        if not text:
-            return None
-        try:
-            klines = (json.loads(text).get("data") or {}).get("klines") or []
-        except Exception:
-            return None
-        if not klines:
-            return None
-
-        def yi(v):
-            """元 → 亿元（前端 Y 轴/tooltip 都是亿元）"""
-            try:
-                return round(float(v) / 1e8, 2)
-            except (TypeError, ValueError):
-                return 0.0
-
-        out = {"dates": [], "flows": {"super_large": [], "large": [], "middle": [], "small": []}}
-        for row in [k.split(",") for k in klines][-days:]:
-            if len(row) < 5:
-                continue
-            out["dates"].append(row[0][5:] if len(row[0]) >= 10 else row[0])  # YYYY-MM-DD → MM-DD
-            out["flows"]["small"].append(yi(row[2]))
-            out["flows"]["middle"].append(yi(row[3]))
-            out["flows"]["large"].append(yi(row[4]))
-            # 老接口可能只给到 f55，此时用 主力 - 大单 反推超大单
-            super_large = yi(row[5]) if len(row) > 5 else round(yi(row[1]) - yi(row[4]), 2)
-            out["flows"]["super_large"].append(super_large)
-        if not out["dates"]:
-            return None
-        out["unit"] = "亿元"
-        out["is_mock"] = False
-        return out
+        # 请求与解析都在 Provider（services/data/providers/eastmoney_flow.py）：
+        # klines 列序固定（不跟随 fields2）、元→亿、只取最近 days 行；失败返回 None，不补零不编日期。
+        result = _providers.call("eastmoney_flow", mode="history",
+                                 code=stock_code, days=days)
+        return result.data if result.ok() else None
 
     return _cached_get(f"stockflow_hist_{stock_code}", fetch,
                        validate_fn=lambda x: bool(x and x.get("dates")),
@@ -892,63 +852,35 @@ def get_stock_real_money_flow(stock_code):
           {main_force_pct, super_large_pct, large_pct, middle_pct, small_pct} 均为 %
     其中 large_pct 即 大单净量（大单净流入占成交额比例）
     """
-    market = "1" if stock_code.startswith("6") else "0"
-    secid = f"{market}.{stock_code}"
-
-    # 1) 拿个股成交额（腾讯）
+    # 成交额（腾讯）仍是占比的分母：本函数口径 = 资金净额 / 成交额
     quote = get_stock_quote(stock_code)
     if not quote:
         return None
     turnover_yi = max(quote.get("turnover", 0.1), 0.01)  # 亿元
 
-    # 2) 拿资金流向明细（东方财富 fflow API）
-    url = "https://push2.eastmoney.com/api/qt/stock/fflow/kline/get"
-    params = {
-        "secid": secid,
-        "fields1": "f1,f2,f3,f7",
-        "fields2": "f51,f52,f53,f54,f55",
-        "lmt": "1",
-        "klt": "101"
+    result = _providers.call("eastmoney_flow", mode="today", code=stock_code)
+    if not result.ok():
+        return None
+    amounts = result.data["amounts_yuan"]      # 单位：元（Provider 不做四舍五入，避免占比失真）
+
+    def yi(v):
+        return round(v / 1e8, 2)
+
+    def pct(v):
+        return round(v / (turnover_yi * 1e8) * 100, 2) if turnover_yi > 0 else 0
+
+    return {
+        "main_force": yi(amounts["main_force"]),
+        "super_large": yi(amounts["super_large"]),
+        "large": yi(amounts["large"]),
+        "middle": yi(amounts["middle"]),
+        "small": yi(amounts["small"]),
+        "main_force_pct": pct(amounts["main_force"]),
+        "super_large_pct": pct(amounts["super_large"]),
+        "large_pct": pct(amounts["large"]),       # 大单净量
+        "middle_pct": pct(amounts["middle"]),
+        "small_pct": pct(amounts["small"]),
     }
-    text = _get(url, params)
-    if not text:
-        return None
-    try:
-        data = json.loads(text)
-        klines = data.get("data", {}).get("klines", [])
-        if not klines:
-            return None
-        parts = klines[0].split(",")
-        # parts: date, 主力, 小单, 中单, 大单  (单位: 元)
-        main_force = float(parts[1]) if len(parts) > 1 else 0
-        small_order = float(parts[2]) if len(parts) > 2 else 0
-        middle_order = float(parts[3]) if len(parts) > 3 else 0
-        large_order = float(parts[4]) if len(parts) > 4 else 0
-        # 超大单 = 主力 - 大单
-        super_large = main_force - large_order
-
-        # 元 → 亿元
-        def yi(v):
-            return round(v / 1e8, 2)
-
-        # 计算占比% = 净流入额 / 成交额 * 100
-        def pct(v):
-            return round(v / (turnover_yi * 1e8) * 100, 2) if turnover_yi > 0 else 0
-
-        return {
-            "main_force": yi(main_force),
-            "super_large": yi(super_large),
-            "large": yi(large_order),
-            "middle": yi(middle_order),
-            "small": yi(small_order),
-            "main_force_pct": pct(main_force),
-            "super_large_pct": pct(super_large),
-            "large_pct": pct(large_order),       # 大单净量
-            "middle_pct": pct(middle_order),
-            "small_pct": pct(small_order),
-        }
-    except:
-        return None
 
 
 # ==============================================================

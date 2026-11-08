@@ -91,5 +91,7 @@ def result_unavailable(err):
 # 生产环境目前只有腾讯行情一个 Provider；东财系列（资金流 / F10 / 行业 PE）
 # 按 V2.1 规划在 S2-S3 逐个搬过来，搬一个注册一个，链条自然变长。
 from .providers import tencent as _tencent      # noqa: E402
+from .providers import eastmoney_flow as _emflow  # noqa: E402
 
 tencent_quote = register(_tencent.TencentQuoteProvider())
+eastmoney_flow = register(_emflow.EastMoneyFlowProvider())

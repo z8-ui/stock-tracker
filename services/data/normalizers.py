@@ -80,3 +80,55 @@ def market_prefix(code, sh_zero_index=True):
     if sh_zero_index and code == "000001":
         return "sh"
     return "sz"
+
+
+# ---------------------------------------------------------------- secid
+# 东方财富 secid = "市场.代码"，市场 1=沪、0=深/北。
+# 为什么不用 market_prefix() 决定指数：000001 既是上证指数又是平安银行，
+# 靠默认参数猜会把两者混成一个 secid（设计见 docs/V2.1_S2_EASTMONEY_FLOW_DESIGN.md §4.5）。
+
+INDEX_SECIDS = {
+    "000001": "1.000001",   # 上证指数
+    "000300": "1.000300",   # 沪深300
+    "000905": "1.000905",   # 中证500
+    "000016": "1.000016",   # 上证50
+    "000688": "1.000688",   # 科创50
+    "399001": "0.399001",   # 深证成指
+    "399006": "0.399006",   # 创业板指
+    "399005": "0.399005",   # 中小板指
+    "899050": "0.899050",   # 北证50
+}
+
+_SH_STOCK_PREFIXES = ("600", "601", "603", "605", "688", "689", "900")
+_SZ_STOCK_PREFIXES = ("000", "001", "002", "003", "300", "301", "200")
+_BJ_STOCK_PREFIXES = ("43", "83", "87", "88", "92")
+
+
+def secid(code, kind="stock"):
+    """A 股代码 → 东方财富 secid（"市场.代码"）。
+
+    kind="stock"：按代码段判市场；kind="index"：只认 INDEX_SECIDS 显式表。
+    无法确定时抛 ValueError —— 不静默回退到某个市场，否则会安静地拿到别的标的。
+    """
+    text = str(code or "").strip()
+    if kind == "index":
+        hit = INDEX_SECIDS.get(text)
+        if not hit:
+            raise ValueError(f"未知指数代码：{code!r}（请先登记到 INDEX_SECIDS）")
+        return hit
+    if kind != "stock":
+        raise ValueError(f"未知 kind：{kind!r}（只支持 stock / index）")
+    if len(text) != 6 or not text.isdigit():
+        raise ValueError(f"非法股票代码：{code!r}")
+    if text.startswith(_SH_STOCK_PREFIXES):
+        return f"1.{text}"
+    if text.startswith(_SZ_STOCK_PREFIXES) or text.startswith(_BJ_STOCK_PREFIXES):
+        return f"0.{text}"
+    raise ValueError(f"无法确定市场：{code!r}")
+
+
+def yuan_to_yi(value):
+    """金额字段：元 → 亿元（两位小数）。缺失抛 ValueError，绝不默认 0。"""
+    if value is None or value == "":
+        raise ValueError("missing monetary field")
+    return round(float(value) / 100_000_000, 2)
