@@ -307,5 +307,24 @@ class TestCliReservedNameFailsClosed(unittest.TestCase):
         self.assertFalse(os.path.exists(self.out), "被拦下的包仍然留在了磁盘上")
 
 
+class TestDataDirExclusion(unittest.TestCase):
+    """`data` 只该剪项目根目录的运行时库，不能连服务层代码包一起剪掉。
+
+    曾经的坑：EXCLUDE_DIRS 里写着全层级 "data"，发布包把 services/data/ 整棵剪了，
+    本地测试全绿、包却缺模块 —— 拿到包的人一跑就 ImportError。
+    """
+
+    def test_nested_data_package_is_included(self):
+        rels = {rel for _, rel in pr.iter_files()}
+        self.assertIn("services/data/__init__.py", rels,
+                      "services/data/ 是代码包，必须入包")
+        self.assertIn("services/data/providers/tencent.py", rels)
+
+    def test_root_data_dir_is_excluded(self):
+        rels = {rel for _, rel in pr.iter_files()}
+        self.assertFalse([r for r in rels if r.startswith("data/")],
+                         "根目录 data/ 是本地 SQLite 运行时数据，不能入包")
+
+
 if __name__ == "__main__":
     unittest.main()

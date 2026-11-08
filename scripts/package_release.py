@@ -31,10 +31,15 @@ import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# 目录：整棵剪掉
+# 目录：整棵剪掉（任何层级同名都剪：这些是构建产物/依赖缓存）
 EXCLUDE_DIRS = {
     ".git", ".venv", "venv", "stock-venv", "__pycache__", "dist", "build",
     ".idea", ".vscode", ".pytest_cache", "node_modules", ".mypy_cache",
+}
+# 目录：只剪项目根目录下那一个（运行时数据）
+# 以前 "data" 写在全层级排除里，结果 services/data/ 这种代码包也一起被剪掉 ——
+# 发布包缺模块，本地测试却全绿，是最难查的一类事故。
+EXCLUDE_DIRS_TOP = {
     "data",                     # 本地 SQLite（政策事件库），属于运行时数据
     "logs",                     # 每日 feed 日志
 }
@@ -88,9 +93,12 @@ def iter_files(allow_symlinks=False):
     for dirpath, dirnames, filenames in os.walk(ROOT, followlinks=False):
         keep = []
         for d in sorted(dirnames):
+            full = os.path.join(dirpath, d)
+            rel_dir = os.path.relpath(full, ROOT).replace(os.sep, "/")
             if d in EXCLUDE_DIRS:
                 continue
-            full = os.path.join(dirpath, d)
+            if d in EXCLUDE_DIRS_TOP and "/" not in rel_dir:     # 只剪根目录下的 data/ logs/
+                continue
             if os.path.islink(full):
                 if not allow_symlinks:
                     raise UnsafeEntry(f"目录是符号链接：{os.path.relpath(full, ROOT)}")
