@@ -75,7 +75,7 @@ stock-tracker/
 ├── templates/           # base/dashboard/market_flow/heatmap/stock_flow/valuation/ai
 ├── static/js/           # format.js(格式化) + app.js(总览/热力/数据健康) + valuation.js(估值+政策+画线)
 ├── scripts/             # events_cli.py(事件库CLI) + package_release.py(打包+密钥扫描)
-├── tests/               # 392 条离线单测
+├── tests/               # 409 条离线单测
 └── requirements.txt     # 仅 flask + requests
 ```
 
@@ -105,7 +105,7 @@ python app.py
 ## 🧪 测试与打包
 
 ```bash
-# 单元测试（392 个用例，纯离线，不依赖 pytest）
+# 单元测试（409 个用例，纯离线，不依赖 pytest）
 # 覆盖：Flask 路由/认证、缓存 SWR、政策检索与关联、估值口径、打包密钥扫描、
 #       前端 JS（node 实跑 format.js / valuation.js 竞态）
 python3 -m unittest discover -s tests -v

@@ -5,7 +5,7 @@
 
 > 项目：A 股个股/板块数据看板 + 估值偏离 + 个股政策事件（本地 SQLite）
 > 形态：单进程 Flask + 原生 JS + ECharts + SQLite，纯标准库单测，无前端构建
-> 规模：约 6.0k 行 Python（不含测试）/ 1.6k 行 JS，**392 个离线单测**
+> 规模：约 6.0k 行 Python（不含测试）/ 1.6k 行 JS，**409 个离线单测**
 
 > **当前版本 V2.0.2（2026-11-08）**
 > 本轮（相对 V2.0.1）：
@@ -36,7 +36,7 @@
 ## 1. 30 秒跑起来（不需要任何 API key）
 
 ```bash
-python3 -m unittest discover -s tests -v      # 392 个用例，纯离线，不联网
+python3 -m unittest discover -s tests -v      # 409 个用例，纯离线，不联网
 python3 app.py                                # 打开 http://127.0.0.1:5000
 ```
 
@@ -74,7 +74,7 @@ scripts/events_cli.py   事件录入 CLI：seed/add/add-text/feed/link/archive/r
 scripts/package_release.py  打发布包（排除密钥/缓存/本地库，入包出包各扫一次密钥）
 scripts/feed_daily.sh   每日抓取（crontab 调，只读不写库）
 templates/, static/     页面与前端；static/vendor/echarts.min.js 是 vendor 的 ECharts
-tests/                  392 个离线单测（数据层/缓存 SWR/认证/扫描器/政策口径/API/前端契约/seed 事务与嵌套）
+tests/                  409 个离线单测（数据层/缓存 SWR/认证/扫描器/政策口径/API/前端契约/seed 事务与嵌套）
 ```
 
 ---
@@ -136,7 +136,7 @@ tests/                  392 个离线单测（数据层/缓存 SWR/认证/扫描
    要不要抽公共壳？
 8. **数据健康的口径**：`STALE` 的阈值是"15 分钟 REAL / 1 天 CACHED / 超过 1 天 STALE 或时间未知"，
    有没有更合理的分档？`外部数据源成功率`是进程内计数（重启清零），你是否认为必须落到磁盘。
-9. **测试覆盖的边界**：392 个用例覆盖 routes 的超时/4xx/5xx/非法 JSON/空数据/缺字段/
+9. **测试覆盖的边界**：409 个用例覆盖 routes 的超时/4xx/5xx/非法 JSON/空数据/缺字段/
    旧缓存兜底/stale/失败不覆盖缓存，认证 fail-closed，扫描器转义与跨块，
    前端 JS 用 node 实跑（`format.js` 数值格式、`valuation.js` 政策竞态）。
    但仍是**基于 mock 的契约测试**：真实数据源改字段名、真实 DeepSeek 返回结构变化，
@@ -147,7 +147,7 @@ tests/                  392 个离线单测（数据层/缓存 SWR/认证/扫描
 ## 6. 验证命令（都是真跑过的，不是写在文档里的愿望）
 
 ```bash
-python3 -m unittest discover -s tests          # 392 tests, OK
+python3 -m unittest discover -s tests          # 409 tests, OK
 python3 scripts/events_cli.py stats            # 本机：事件 4 / 关联 16 / 孤儿 0（新库 seed 后是 4 / 15）
 python3 scripts/events_cli.py list --code 000657   # 3 条钨相关事件
 python3 scripts/events_cli.py feed --strong    # 抓快讯，只留强相关候选
@@ -256,7 +256,7 @@ python3 scripts/package_release.py             # 打包含密钥扫描
   event_links 缺 relation_type、events 缺 published_at/collected_at、缺索引、
   缺唯一约束必须报"无法自动迁移"、**索引名字对但列错 / 表错 / 列顺序错 / 少 DESC /
   partial 唯一索引不算数**、`init_db(conn)` 在事务中拒绝且外层仍可提交/回滚、自建连接初始化幂等。
-  全量：**392 tests OK**。
+  全量：**409 tests OK**。
 
 ### 7.3 债务 4：历史 PE / PB 估值分位 —— 未实现
 
@@ -303,6 +303,11 @@ python3 scripts/package_release.py             # 打包含密钥扫描
   7 处绕过统一传输的问题清单、S2 建议）。
 - **顺带修的假数据**：`get_market_flow()` 全源失败时不再返回全零 dict（页面会渲染成
   `0.00 / 0.00 亿`，等于把失败伪装成真实零值），改为返回 `None` 走"暂无数据"。
+- **S1 收尾（2026-11-08 晚）**：休市与故障分开 —— 新增 `data_health._session/_last_trading_day/_entry_status`，
+  周末展示最近交易日数据标 CACHED 而不是 STALE（异常从 5/9 降到 2/9）；`get_market_flow()` 区分
+  "源给了全 0 记录"（真实零值，保留）与"没拿到资金记录"（返回 None，不造零值）；
+  新增 `services/data/telemetry.py` + `cache_stats()`，Provider 维度与缓存键维度分开统计，
+  缓存命中不再冒充上游请求；文档统计口径已按实际代码修正（1388 行 / 41 函数 / B 类 12 个）。
 - **仍然没有的**：东财系列 Provider（资金流 / 板块 / F10 / 行业 PE 还在 `data_service` 里）、
   缓存层独立、Routes 分层 —— 都按规划逐轮搬，一次一类。
 
