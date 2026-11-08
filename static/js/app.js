@@ -52,8 +52,12 @@ function renderPieChart(domId, title, items, colors) {
     const chart = getChart(domId);
     if (!chart) return;
 
-    // 空值语义：null = 源没给这个类别，必须保留成 null（不画扇区、tooltip 显示"暂无数据"），
-    // 不能经 Math.abs(null)→0 变成"真实的 0.00 亿"。
+    // 空值语义（方案 A）：
+    //   1) null = 源没给这个类别，必须原样保留 —— 不能经 Math.abs(null)→0 变成"真实的 0.00 亿"；
+    //   2) ECharts 不会为 null 数据绘制扇区，所以用户看不到这一块，也不会悬停到它；
+    //   3) 缺失类别对用户的实际提示只来自 gapHint()（下方 putPieGapHint 展示的那行文字）；
+    //   4) pieTip() 里的 null 分支只是防御性格式化（保证万一被调用也不显示 0.00亿），
+    //      不代表"真实浏览器可以悬停 null 扇区看 tooltip"—— 这条路径不存在。
     const seriesItems = window.fmt.pieItems(items);
     putPieGapHint(domId, window.fmt.gapHint(seriesItems));
 
