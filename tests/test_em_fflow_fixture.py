@@ -105,5 +105,63 @@ class TestNamedCrossCheck(unittest.TestCase):
         self.assertLess(abs(total), 10, total)
 
 
+class TestFields2OrderIgnored(unittest.TestCase):
+    """GPT 要求的换序验证：列顺序并不跟随 fields2，而是固定内部顺序。
+
+    daykline 第二次请求 fields2=f51,f56,f55,f54,f53,f52，
+    返回的仍是 日期,主力,小单,中单,大单,超大单 —— 与第一次逐字相同。
+    kline 同样（f51,f55,f54,f53,f52 → 输出顺序不变）。
+    所以"位置=请求顺序"的假设被否证；列含义只能靠数值与命名字段对齐来确定。
+    """
+
+    def test_daykline_swap_is_byte_identical(self):
+        a = load("fflow_daykline_600519_2026-11-08.json")["data"]["klines"]
+        b = load("fflow_daykline_swap_600519_2026-11-08.json")["data"]["klines"]
+        self.assertEqual(a, b, "换序后响应变了 → 说明列顺序跟随 fields2；实测没变")
+
+    def test_kline_swap_is_byte_identical(self):
+        a = load("fflow_kline_600519_2026-11-08.json")["data"]["klines"]
+        b = load("fflow_kline_swap_600519_2026-11-08.json")["data"]["klines"]
+        self.assertEqual(a, b)
+
+    def test_columns_stay_in_canonical_order(self):
+        row = load("fflow_daykline_swap_600519_2026-11-08.json")["data"]["klines"][-1].split(",")
+        d = load("ulist_named_600519_2026-11-08.json")["data"]["diff"][0]
+        # 即使请求顺序被打乱，第 2 列仍是 f62、第 6 列仍是 f66
+        self.assertEqual(float(row[1]), d["f62"])
+        self.assertEqual(float(row[2]), d["f84"])
+        self.assertEqual(float(row[3]), d["f78"])
+        self.assertEqual(float(row[4]), d["f72"])
+        self.assertEqual(float(row[5]), d["f66"])
+
+    def test_kline_lmt_is_ignored(self):
+        """lmt=5 仍只返回 1 条：kline 是快照接口，历史只能走 daykline。"""
+        js = load("fflow_kline_lmt5_600519_2026-11-08.json")
+        self.assertEqual(len(js["data"]["klines"]), 1)
+
+
+class TestSecondSymbol(unittest.TestCase):
+    """第二只股票（000001 平安银行）：列含义与恒等式一致，排除"只有茅台这样"。"""
+
+    def setUp(self):
+        self.rows = load("fflow_daykline_000001_2026-11-08.json")["data"]["klines"]
+        self.named = load("ulist_named_000001_2026-11-08.json")["data"]["diff"][0]
+
+    def test_multi_day_identity(self):
+        self.assertEqual(len(self.rows), 5)
+        for r in self.rows:
+            p = [float(x) for x in r.split(",")[1:]]
+            self.assertAlmostEqual(p[0], p[3] + p[4], delta=1.0, msg=r)
+            self.assertLess(abs(p[0] + p[1] + p[2]), 500.0, r)
+
+    def test_last_row_matches_named_fields(self):
+        last = self.rows[-1].split(",")
+        self.assertEqual(float(last[1]), self.named["f62"])
+        self.assertEqual(float(last[2]), self.named["f84"])
+        self.assertEqual(float(last[3]), self.named["f78"])
+        self.assertEqual(float(last[4]), self.named["f72"])
+        self.assertEqual(float(last[5]), self.named["f66"])
+
+
 if __name__ == "__main__":
     unittest.main()
