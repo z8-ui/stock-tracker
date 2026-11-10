@@ -92,6 +92,8 @@ def result_unavailable(err):
 # 按 V2.1 规划在 S2-S3 逐个搬过来，搬一个注册一个，链条自然变长。
 from .providers import tencent as _tencent      # noqa: E402
 from .providers import eastmoney_flow as _emflow  # noqa: E402
+from .providers import eastmoney_sector as _emsector  # noqa: E402
 
 tencent_quote = register(_tencent.TencentQuoteProvider())
 eastmoney_flow = register(_emflow.EastMoneyFlowProvider())
+eastmoney_sector = register(_emsector.EastmoneySectorProvider())

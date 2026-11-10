@@ -9,11 +9,13 @@ import os
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import data_service as d  # noqa: E402
+from services.data.providers.eastmoney_sector import EastmoneySectorProvider  # noqa: E402
 
 
 class TestNum(unittest.TestCase):
@@ -29,22 +31,63 @@ class TestNum(unittest.TestCase):
 
 
 class TestSectorValuationParse(unittest.TestCase):
-    def test_dash_pb_does_not_kill_batch(self):
-        payload = {"data": {"diff": [
-            {"f14": "视频媒体", "f9": 153.49, "f23": "-", "f3": 6.25, "f20": 65157205000},
-            {"f14": "银行", "f9": 6.1, "f23": 0.7, "f3": 0.5, "f20": 1e12},
-        ]}}
-        with mock.patch.object(d, "_get", return_value=json.dumps(payload)):
-            rows = d.get_sector_valuation()
-        self.assertEqual(len(rows), 2)          # 以前整个循环会因 float("-") 抛异常
-        self.assertEqual(rows[0]["pb"], 0.0)
-        self.assertEqual(rows[1]["pb"], 0.7)
+    """板块估值解析（S3-3A 起走 EastmoneySectorProvider）。"""
 
-    def test_loss_sector_skipped(self):
-        payload = {"data": {"diff": [{"f14": "亏损板块", "f9": -12.0, "f23": 2.0,
-                                      "f3": 1.0, "f20": 1e10}]}}
-        with mock.patch.object(d, "_get", return_value=json.dumps(payload)):
-            self.assertIsNone(d.get_sector_valuation())
+    class _Offline:
+        """离线上下文：报文由 `_get` 提供，缓存不落盘、不串味。"""
+
+        def __init__(self, rows, total=None):
+            self.payload = {"rc": 0, "data": {
+                "total": total if total is not None else len(rows), "diff": rows}}
+            self._stack = None
+
+        def __enter__(self):
+            self._stack = ExitStack()
+            self._stack.enter_context(
+                mock.patch.object(EastmoneySectorProvider, "_get",
+                                  return_value=self.payload))
+            self._stack.enter_context(mock.patch.object(d, "_IN_MEMORY_CACHE", {}))
+            self._stack.enter_context(mock.patch.object(d, "_load_cache", lambda: {}))
+            self._stack.enter_context(mock.patch.object(d, "_save_cache", lambda c: None))
+            self._stack.enter_context(mock.patch.object(d, "_LAST_SUCCESS", {}))
+            return self
+
+        def __exit__(self, *exc):
+            self._stack.close()
+            return False
+
+    def test_dash_pb_is_none_and_real_pb_kept(self):
+        """D3 口径：「-」是缺失 → null；真实 0.7 仍然是 0.7。
+
+        原测试 `test_dash_pb_does_not_kill_batch` 断言 `rows[0]["pb"] == 0.0`，
+        那是 `_num("-", default=0.0)` 的旧行为；D3 明确禁止把缺失写成 0 倍。
+        测试价值保留：仍然验证"一条缺失 PB + 一条真实 PB"不会让整批解析崩掉。
+        """
+        rows = [{"f12": "BK0001", "f14": "视频媒体", "f9": 153.49, "f23": "-",
+                 "f3": 6.25, "f20": 65157205000},
+                {"f12": "BK0002", "f14": "银行", "f9": 6.1, "f23": 0.7,
+                 "f3": 0.5, "f20": 1e12}]
+        with self._Offline(rows):
+            out = d.get_sector_valuation()
+        self.assertEqual(len(out), 2)              # 以前整个循环会因 float("-") 抛异常
+        self.assertIsNone(out[0]["pb"])            # 缺失 ≠ 0 倍
+        self.assertEqual(out[1]["pb"], 0.7)        # 真实值不受影响
+
+    def test_loss_sector_retained(self):
+        """D1（S3-3 授权定向改写）：负 PE 板块不再被丢弃。
+
+        原测试 `test_loss_sector_skipped` 断言"负 PE 被过滤掉、函数返回 None"，
+        那是 S3-3 之前的旧口径；D4 明确要求 496 个板块全部返回、负 PE 保留原值，
+        亏损由前端单独标注，不允许用过滤或 abs() 伪造排名。
+        测试价值保留：仍然验证"一条负 PE 记录"的完整链路，只是结论从"被丢弃"变成"被保留"。
+        """
+        rows = [{"f12": "BK0001", "f14": "亏损板块", "f9": -12.0, "f23": 2.0,
+                 "f3": 1.0, "f20": 1e10}]
+        with self._Offline(rows):
+            out = d.get_sector_valuation()
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["pe"], -12.0)
+        self.assertEqual(out[0]["name"], "亏损板块")
 
 
 class TestSecid(unittest.TestCase):

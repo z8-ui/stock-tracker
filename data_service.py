@@ -676,76 +676,87 @@ SECTOR_LIST = [
     "游戏", "航空机场", "物流", "工程建设", "水泥建材"
 ]
 
-def get_sector_flow():
-    """行业板块数据（带文件缓存，休盘时段返回定格数据）"""
-    def _fetch():
-        result = []
-        url = "https://push2.eastmoney.com/api/qt/clist/get"
-        params = {
-            "pn": "1", "pz": "60", "po": "1", "np": "1",
-            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-            "fltt": "2", "invt": "2", "fid": "f3",
-            "fs": "m:90+t:2",
-            "fields": "f14,f2,f3,f62"
-        }
-        text = _get(url, params)
-        if text:
-            try:
-                data = json.loads(text)
-                if data.get("data") and data["data"].get("diff"):
-                    for row in data["data"]["diff"]:
-                        name = row.get("f14", "")
-                        change = _num(row.get("f3"))
-                        flow = _num(row.get("f62"))
-                        if name:
-                            result.append({
-                                "name": name,
-                                "change": round(change, 2),
-                                "flow": round(flow / 1e8, 2)
-                            })
-            except:
-                pass
-        # 兜底模拟：使用真实大盘涨跌幅 + 板块特性分布
-        # ⚠️ 默认关闭（ALLOW_MOCK_FALLBACK=False）：失败就返回 None 让页面显示"暂无数据"，
-        #    不再把随机数当真实资金流展示
-        if not result and ALLOW_MOCK_FALLBACK:
-            market_change = _get_market_change()
-            random.seed(datetime.now().strftime("%Y%m%d"))
-            # 板块分类：成长/周期/防御 各有不同弹性
-            growth = ["半导体", "软件开发", "通信设备", "光伏设备", "锂电池", "军工装备", "游戏"]
-            cyclical = ["证券", "有色金属", "煤炭开采", "钢铁", "水泥建材", "房地产开发", "汽车整车"]
-            defensive = ["银行", "电力", "食品饮料", "煤炭开采", "医药商业", "白酒", "保险"]
-            for name in SECTOR_LIST:
-                if name in growth:
-                    # 成长板块弹性更大：大盘涨+2%~4%，大盘跌-2%~0%
-                    offset = random.uniform(-2.0, 4.0)
-                elif name in cyclical:
-                    offset = random.uniform(-3.0, 3.0)
-                else:
-                    offset = random.uniform(-1.5, 2.0)
-                change = round(market_change + offset, 2)
-                # 防守板块在大盘跌时抗跌
-                if name in defensive and market_change < -1:
-                    change = round(change + random.uniform(1.0, 3.0), 2)
-                    change = min(change, 2.0)
-                flow = round(change * random.uniform(2, 6), 2)
-                result.append({"name": name, "change": change, "flow": flow})
-            result.sort(key=lambda x: x["change"], reverse=True)
-            # 模拟数据必须自带标记：调用方（图表/接口）据此显示"模拟数据"，不能混进真实分析
-            for row in result:
-                row["is_mock"] = True
-        return result if result else None
+SECTOR_FLOW_TTL = 60          # 板块资金流：分钟级变量，5 页抓取成本高，60s 足够
+SECTOR_VALUATION_TTL = 300    # 板块估值：PE/PB 是日频基本面，5 分钟粒度已过剩
 
-    def _validate_sectors(data):
-        if not data or not isinstance(data, list):
-            return False
-        # 至少有一条数据有非零的 change 或 flow
-        for s in data:
-            if abs(s.get("change", 0)) > 0.01 or abs(s.get("flow", 0)) > 0.01:
-                return True
+# 最近一次 Provider 结果（S3-3A：只记在内存供观察；S3-3B 会换成持久化旁路元数据）
+_SECTOR_LAST_RESULT = {}
+
+
+def _mock_sector_flow():
+    """模拟板块资金流（默认关闭；仅 ALLOW_MOCK_FALLBACK=True 时用于界面演示）。
+
+    ⚠️ Q7=A：S3-6 连同 ALLOW_MOCK_FALLBACK 一起删除。保留期间必须打 is_mock=True，
+       不允许混进真实分析。
+    """
+    result = []
+    market_change = _get_market_change()
+    random.seed(datetime.now().strftime("%Y%m%d"))
+    growth = ["半导体", "软件开发", "通信设备", "光伏设备", "锂电池", "军工装备", "游戏"]
+    cyclical = ["证券", "有色金属", "煤炭开采", "钢铁", "水泥建材", "房地产开发", "汽车整车"]
+    defensive = ["银行", "电力", "食品饮料", "煤炭开采", "医药商业", "白酒", "保险"]
+    for name in SECTOR_LIST:
+        if name in growth:
+            offset = random.uniform(-2.0, 4.0)
+        elif name in cyclical:
+            offset = random.uniform(-3.0, 3.0)
+        else:
+            offset = random.uniform(-1.5, 2.0)
+        change = round(market_change + offset, 2)
+        if name in defensive and market_change < -1:
+            change = round(change + random.uniform(1.0, 3.0), 2)
+            change = min(change, 2.0)
+        flow = round(change * random.uniform(2, 6), 2)
+        result.append({"name": name, "change": change, "flow": flow})
+    result.sort(key=lambda x: x["change"], reverse=True)
+    for row in result:
+        row["is_mock"] = True
+    return result
+
+
+def _sector_provider_result(mode):
+    """调用板块 Provider（registry 里已注册）并留一份结果供观察/后续元数据使用。"""
+    res = _providers.call("eastmoney_sector", mode=mode)
+    _SECTOR_LAST_RESULT[mode] = res
+    return res
+
+
+def _validate_sectors(data):
+    if not data or not isinstance(data, list):
         return False
+    # 至少有一条数据有非零的 change 或 flow
+    for s in data:
+        if not isinstance(s, dict):
+            continue
+        if abs(s.get("change") or 0) > 0.01 or abs(s.get("flow") or 0) > 0.01:
+            return True
+    return False
 
-    return _cached_get("sector_flow", _fetch, validate_fn=_validate_sectors)
+
+def get_sector_flow():
+    """行业板块资金流（全量 496：pz=100 × 5 页，按 f12 去重；60s 缓存）。
+
+    与迁移前的区别：
+      - 不再只取第 1 页 60 条（TD-17）；
+      - 缺失字段给 None，不再用 0 顶替（TD-16 同源）；
+      - 单页失败 → Provider 返回 partial + missing_pages，此处保留已抓到的行，
+        不会把"部分成功"伪装成完整成功（异常/全失败才降级到 Mock 或 None）。
+
+    ⚠️ 部署提示：旧版本写入的 `sector_flow` 缓存只有 60 行（pz=60 时代）。休市时
+       `_cached_get` 会直接返回文件缓存，因此**升级后需清一次该缓存键**
+       （`_data_cache.json` 里删掉 `sector_flow`），否则页面会继续显示 60 个板块，
+       直到下一次交易时段刷新。S3-3B 会用持久化元数据记录 rows/total 来根治。
+    """
+    def _fetch():
+        res = _sector_provider_result("flow")
+        if res.status in ("failed", "empty") or not res.data:
+            if ALLOW_MOCK_FALLBACK:
+                return _mock_sector_flow()
+            return None
+        return res.data
+
+    return _cached_get("sector_flow", _fetch, validate_fn=_validate_sectors,
+                       source="eastmoney_sector", ttl=SECTOR_FLOW_TTL)
 
 
 def _get_market_change():
@@ -1427,30 +1438,25 @@ def estimate_intrinsic_value(stock_quote):
 # ==============================================================
 
 def get_sector_valuation():
-    """各行业板块估值（PE/PB）"""
-    url = "https://push2.eastmoney.com/api/qt/clist/get"
-    params = {"pn": "1", "pz": "60", "po": "1", "np": "1",
-              "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-              "fltt": "2", "invt": "2", "fid": "f3",
-              "fs": "m:90+t:2", "fields": "f14,f2,f3,f9,f20,f23,f25,f37"}
-    text = _get(url, params)
-    if not text: return _mock_sector_valuation() if ALLOW_MOCK_FALLBACK else None
-    try:
-        data = json.loads(text)
-        result = []
-        if data.get("data") and data["data"].get("diff"):
-            for row in data["data"]["diff"]:
-                name = row.get("f14", "")
-                pe, pb = _num(row.get("f9")), _num(row.get("f23"))
-                change, mc = _num(row.get("f3")), _num(row.get("f20"))
-                if name and pe > 0:      # 亏损板块（PE 为 "-" / 负数）不进 PE 气泡图，否则会扭曲对比
-                    result.append({"name": name, "pe": round(pe, 2),
-                                   "pb": round(pb, 2),
-                                   "change": round(change, 2),
-                                   "market_cap": round(mc / 1e8, 2)})
-        return result if result else (_mock_sector_valuation() if ALLOW_MOCK_FALLBACK else None)
-    except:
-        return _mock_sector_valuation() if ALLOW_MOCK_FALLBACK else None
+    """各行业板块估值（PE/PB/市值）。
+
+    与迁移前的区别（S3-3 D3/D4）：
+      - 不再 `if pe > 0` 丢掉亏损板块：496 个全返回，负 PE 保留原值；
+      - `f23(PB)` 实测 496/496 为 "-" → `pb=None`（**不是 0.0**）；
+      - 不可解析的字段抛格式错，不再 `except:` 吞成 Mock/None；
+      - 带 300s 缓存，避免每次刷新都打 5 页（Phase B 接缓存元数据）。
+    """
+    def _fetch():
+        res = _sector_provider_result("valuation")
+        if res.status in ("failed", "empty") or not res.data:
+            if ALLOW_MOCK_FALLBACK:
+                return _mock_sector_valuation()
+            return None
+        return res.data
+
+    return _cached_get("sector_valuation", _fetch, validate_fn=_validate_sectors,
+                       source="eastmoney_sector", ttl=SECTOR_VALUATION_TTL)
+
 
 
 def _mock_sector_valuation():
