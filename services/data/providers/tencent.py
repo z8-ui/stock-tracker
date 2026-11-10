@@ -72,6 +72,10 @@ class TencentQuoteProvider(Provider):
     # 5 今开、6 成交量(手，可能是 "43845.000")、30 行情时间、31 涨跌、32 涨跌%、
     # 33 最高、34 最低、38 换手率、39 PE、43 振幅、44 总市值(亿)、46 PB、
     # 47 52周高、48 52周低、57 成交额(万元)。
+    #
+    # ⚠️ 单位：parts[57] 是「万元」。除以 10000 得到的是「亿元」，不是「元」
+    #    （1 亿 = 10000 万）。下游 get_stock_real_money_flow 的占比分母
+    #    `turnover_yi * 1e8` 也按亿元折算，两边口径一致。
     FIELD_INDEX = (
         ("price", 3), ("pre_close", 4), ("open", 5),
         ("high", 33), ("low", 34),
@@ -81,6 +85,12 @@ class TencentQuoteProvider(Provider):
         ("amplitude", 43), ("high_52w", 47), ("low_52w", 48),
     )
 
+    # 业务解析真正需要的最小字段数 = 最大下标 + 1 = 58。
+    # 注意与 MIN_PARTS(51) 的区别：51 是"传输层没明显被截断"的旧门槛（保持不动），
+    # 58 是"18 个字段全都能读到"的门槛；51~57 的报文在旧实现里会把成交额静默补 0，
+    # 那种"看起来正常的行情"正是要拒绝的，所以 parse_quote 单独卡 58。
+    REQUIRED_PARTS = max(idx for _label, idx in FIELD_INDEX) + 1
+
     # get_stock_quote 对外暴露的 18 个字段（API 契约，顺序即历史顺序）
     QUOTE_FIELDS = (
         "name", "code", "price", "pre_close", "open", "high", "low",
@@ -89,18 +99,30 @@ class TencentQuoteProvider(Provider):
     )
 
     def parse_quote(self, parts, code):
-        """把 ~ 快照解析成 18 字段业务字典；任一数值字段不可解析都抛 ProviderFormatError。
+        """把 ~ 快照解析成 18 字段业务字典；缺必需字段/非数字都抛 ProviderFormatError。
 
-        与迁移前的区别只有一处：以前 `except:` 会把任何异常吞成 None，
-        现在区分"字段缺失(→0.0)"和"字段有值但非数字(→异常)"，
-        上层照样得到 None（不可用），但原因能在 ProviderResult 里看到。
+        与迁移前（`git show 0f7afe1:data_service.py`）的差别只有两处，都是**收紧**：
+          1. 报文少于 REQUIRED_PARTS(58) 直接失败 —— 旧实现在 51~57 字段时会把
+             成交额等字段静默补 0，产出"看起来正常"的行情，这正是截断报文混入的路径；
+          2. 字段有值但不是数字时抛异常而不是被 `except:` 吞成 None，
+             上层依旧得到 None，但失败原因能在 ProviderResult / record_source 里看到。
         """
-        if not parts or len(parts) < 2:
+        if len(parts) < self.REQUIRED_PARTS:
+            raise ProviderFormatError(
+                self.name,
+                f"报文被截断：只有 {len(parts)} 个字段，行情解析需要 ≥{self.REQUIRED_PARTS}"
+                f"（成交额在下标 {self.FIELD_INDEX[-1][1]}）。截断报文不得当成有效行情",
+                url=self.build_url(code))
+        if len(parts) < 2:
             raise ProviderEmpty(self.name, "快照字段不足以解析行情", url=self.build_url(code))
 
         def num(label, idx):
-            if idx >= len(parts) or not parts[idx]:
-                return 0.0
+            if idx >= len(parts):
+                # 理论上不可达（上面已卡 REQUIRED_PARTS），但绝不靠"补 0"蒙过去
+                raise ProviderFormatError(
+                    self.name, f"缺少必需字段 {label}(下标 {idx})", url=self.build_url(code))
+            if not parts[idx]:
+                return 0.0                     # 字段存在但为空：这是"该源没给值"，不是截断
             try:
                 return float(parts[idx])
             except (TypeError, ValueError):
@@ -110,7 +132,10 @@ class TencentQuoteProvider(Provider):
 
         def lots(idx):
             # 腾讯成交量是带小数的字符串（"43845.000"），int() 直接炸 → 必须 float 再 int
-            if idx >= len(parts) or not parts[idx]:
+            if idx >= len(parts):
+                raise ProviderFormatError(
+                    self.name, f"缺少必需字段 volume_lots(下标 {idx})", url=self.build_url(code))
+            if not parts[idx]:
                 return 0
             try:
                 return int(float(parts[idx]))
@@ -123,6 +148,6 @@ class TencentQuoteProvider(Provider):
         for label, idx in self.FIELD_INDEX:
             quote[label] = num(label, idx)
         quote["volume_lots"] = lots(6)
-        # 成交额：腾讯给"万元"，对外统一成"元"（保留两位）
+        # 成交额：腾讯给"万元"，对外统一成"亿元"（1 亿 = 10000 万），保留两位
         quote["turnover"] = round(quote["turnover"] / 10000, 2)
         return {f: quote[f] for f in self.QUOTE_FIELDS}

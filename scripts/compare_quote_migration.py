@@ -15,6 +15,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
 from services.data.providers.tencent import TencentQuoteProvider   # noqa: E402
+from services.data.providers import tencent as tp                  # noqa: E402
 
 FIX = os.path.join(REPO, "tests", "fixtures", "s3_0")
 KEY = "tencent_quote_sh600519"
@@ -68,7 +69,7 @@ FIELD_NOTE = {
     "change": "涨跌额 parts[31]",
     "change_pct": "涨跌幅% parts[32]",
     "volume_lots": "成交量（手）parts[6]，字符串转 int",
-    "turnover": "成交额（元）= parts[57](万元)/10000，保留 2 位",
+    "turnover": "成交额（**亿元**）= parts[57](万元)/10000，保留 2 位",
     "turnover_rate": "换手率% parts[38]",
     "amplitude": "振幅% parts[43]",
     "pe": "市盈率 parts[39]",
@@ -88,7 +89,9 @@ def main():
     new = provider.parse_quote(parts, "600519")
 
     print(f"夹具：tests/fixtures/s3_0/{KEY}.raw（{len(raw.encode('gbk'))} 字节，{len(parts)} 个 ~ 字段）")
-    print(f"行情时间：{asof}")
+    print(f"行情时间：{asof}；Provider.REQUIRED_PARTS={provider.REQUIRED_PARTS}，"
+          f"normalize 门槛 MIN_PARTS={tp.MIN_PARTS}")
+    print("单位约定：`turnover` 对外是**亿元**（parts[57] 为万元，除以 10000）")
     print()
     print("| # | 字段 | 含义/来源 | 迁移前（旧实现） | 迁移后（Provider） | 一致 |")
     print("|---:|---|---|---|---|---|")

@@ -763,9 +763,11 @@ def cache_meta(cache_key):
 # 盘中同一证券 30 秒内只打一次上游（Q5=A：盘中 30s TTL，休市走文件缓存）
 QUOTE_CACHE_TTL = 30
 
-# 每只证券最近一次抓取的结果，仅用于把"实时/缓存降级/无数据"三态说清楚，
-# 不改 /api/stock-quote 的 18 字段返回结构。
+# 每只证券最近一次**真实抓取**的结果（与"这次返回的数据来自哪里"是两件事）
 _QUOTE_ATTEMPT = {}
+
+# 每只证券最近一次调用**实际返回的数据来源**：network / memory / memory_stale / file / file_fallback / none
+_QUOTE_SERVED = {}
 
 
 def _note_quote_attempt(stock_code, ok, reason=""):
@@ -773,31 +775,66 @@ def _note_quote_attempt(stock_code, ok, reason=""):
     # 但万一被脚本扫全市场，这里不能无限长——超过 1024 只就整体清空（只影响可观测性）。
     if len(_QUOTE_ATTEMPT) > 1024:
         _QUOTE_ATTEMPT.clear()
+        _QUOTE_SERVED.clear()
     _QUOTE_ATTEMPT[stock_code] = {"ok": bool(ok), "ts": time.time(), "reason": reason}
 
 
-def quote_cache_meta(stock_code):
-    """行情的新鲜度与降级状态（给需要区分"实时/缓存/无数据"的调用方用）。
+def _classify_served(call_state, mem_ts_before, data, trading):
+    """判定这次返回的数据来自哪一层 —— 不能靠"上次抓取成功"来推断。
 
-    返回：asof / age_sec / is_stale / market_status（同 cache_meta）
-         + status：live（本次真实抓取成功）/ cached（抓取失败，返回的是旧缓存）
-                   / unavailable（抓取失败且无缓存）/ unknown（尚无抓取记录）
-         + reason：失败原因
+    call_state["sync_fetch"] 只由**本次调用线程**写入（None=没抓 / True=抓到 / False=抓失败），
+    后台 SWR 线程的抓取结果不算"本次"，避免把旧数据标成实时。
+    """
+    if not isinstance(data, dict) or not data:
+        return "none"
+    sync = call_state.get("sync_fetch")
+    if sync is True:
+        return "network"
+    if sync is False:
+        return "file_fallback"        # 本次抓取失败，返回的是文件缓存
+    if not trading:
+        return "file"                 # 休市：直接读盘（定格快照）
+    age = data.get("_age_sec")
+    if age is not None and age >= QUOTE_CACHE_TTL:
+        return "memory_stale"         # SWR：先给旧值，后台重建
+    return "memory" if mem_ts_before is not None else "file"
+
+
+def quote_cache_meta(stock_code):
+    """行情的新鲜度、来源与失败状态（不改 /api/stock-quote 的 18 字段契约）。
+
+    刻意把两个概念分开，避免"上次抓取成功"被当成"这次仍是实时"：
+      - served_from       本次返回的数据来自哪一层：
+                          network（本次真抓）/ memory（T+30s 内命中内存）/
+                          memory_stale（TTL 过期，SWR 先给旧值）/ file（休市读盘）/
+                          file_fallback（抓取失败后退回文件缓存）/ none（无数据）
+      - last_fetch_status 最近一次真实抓取的结果：ok / failed / none
+      - status            对外三态：live（本次真抓）/ cached（任何缓存来源）/ unavailable（无数据）
     """
     key = f"quote_{stock_code}"
     meta = cache_meta(key)
+    served = _QUOTE_SERVED.get(stock_code)
     attempt = _QUOTE_ATTEMPT.get(stock_code)
-    if attempt is None:
-        # 本进程没抓过：要么休市直接读盘（定格快照），要么是重启后第一次读缓存
-        status = "cached" if meta["asof"] is not None else "unknown"
-        reason = "" if meta["asof"] is not None else meta["reason"]
-    elif attempt["ok"]:
-        status, reason = "live", ""
+    served_from = served["from"] if served else "none"
+    last_status = "none" if attempt is None else ("ok" if attempt["ok"] else "failed")
+
+    if served_from == "network":
+        status = "live"
+    elif served_from in ("memory", "memory_stale", "file", "file_fallback"):
+        status = "cached"
     elif meta["asof"] is None:
-        status, reason = "unavailable", attempt["reason"]
+        status = "unavailable" if last_status == "failed" else "unknown"
     else:
-        status, reason = "cached", attempt["reason"]
-    meta.update({"status": status, "reason": reason or meta["reason"]})
+        status = "cached"
+    reason = ""
+    if last_status == "failed" and attempt:
+        reason = attempt["reason"]
+    meta.update({
+        "status": status,
+        "served_from": served_from,
+        "last_fetch_status": last_status,
+        "reason": reason or meta["reason"],
+    })
     return meta
 
 
@@ -812,27 +849,44 @@ def get_stock_quote(stock_code) -> dict | None:
     返回的 18 个字段里不带任何元数据 —— 需要"这是不是缓存/多旧"时用 quote_cache_meta()，
     避免为了内部可观测性去改动前端 API 契约。
     """
+    key = f"quote_{stock_code}"
     provider = _providers.get("tencent_quote")
+    caller = threading.current_thread()
+    call_state: dict = {"sync_fetch": None}      # 只由本次调用线程写入
 
     def _fetch():
         parts = _tencent_quote(stock_code)
         if not parts:
             _note_quote_attempt(stock_code, False, "上游无数据")
+            if threading.current_thread() is caller:
+                call_state["sync_fetch"] = False
             return None
         try:
             quote = provider.parse_quote(parts, stock_code)
-        except Exception as e:                      # 字段不合法 → 不可用，不缓存
+        except Exception as e:                      # 截断/字段不合法 → 不可用，不缓存
             _note_quote_attempt(stock_code, False, f"{type(e).__name__}: {str(e)[:120]}")
+            if threading.current_thread() is caller:
+                call_state["sync_fetch"] = False
             return None
         # 价格缺失/为 0 不是"有效行情"：宁可接口失败，也别让页面显示 0.00 元
         if quote["price"] <= 0:
             _note_quote_attempt(stock_code, False, "价格无效（<=0）")
+            if threading.current_thread() is caller:
+                call_state["sync_fetch"] = False
             return None
         _note_quote_attempt(stock_code, True)
+        if threading.current_thread() is caller:
+            call_state["sync_fetch"] = True
         return quote
 
-    data = _cached_get(f"quote_{stock_code}", _fetch,
-                       source="tencent_quote", ttl=QUOTE_CACHE_TTL)
+    mem_before = _IN_MEMORY_CACHE.get(key)
+    mem_ts_before = mem_before["time"] if mem_before else None
+    _, trading = _market_status()
+
+    data = _cached_get(key, _fetch, source="tencent_quote", ttl=QUOTE_CACHE_TTL)
+    served = _classify_served(call_state, mem_ts_before, data, trading)
+    _QUOTE_SERVED[stock_code] = {"from": served, "ts": time.time()}
+
     if not isinstance(data, dict) or not data:
         return None
     # 只投影 18 个契约字段：_asof/_stale/_market_status 等缓存标注不外泄

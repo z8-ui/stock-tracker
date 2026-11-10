@@ -17,12 +17,15 @@
 全部离线：网络用 mock，缓存文件写临时目录。
 """
 
+import hashlib
 import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import requests as real_requests
@@ -30,6 +33,7 @@ import requests as real_requests
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import data_service as d                                    # noqa: E402
+from services.data.exceptions import ProviderFormatError     # noqa: E402
 from services.data.providers import tencent as tp           # noqa: E402
 from services.data.providers.tencent import TencentQuoteProvider  # noqa: E402
 
@@ -189,7 +193,7 @@ class TestMigrationDiff(QuoteCacheCase):
         cases = {
             "真实 88 字段": fixture_text(),
             "合成 88 字段": snapshot(),
-            "刚好 51 字段": snapshot(n=51),
+            "刚好到解析下限（58 数据字段）": snapshot(n=59),
             "成交量小数（43845.000）": snapshot(**{"6": "43845.000"}),
             "成交量为空": snapshot(**{"6": ""}),
             "PE/PB 为空": snapshot(**{"39": "", "46": ""}),
@@ -201,14 +205,12 @@ class TestMigrationDiff(QuoteCacheCase):
         for label, text in cases.items():
             with self.subTest(case=label):
                 parts = provider.normalize(text, code="600519")[0]
-                old = old_parse(parts, "600519") if parts else None
-                new = provider.parse_quote(parts, "600519") if parts else None
-                if old is None:                       # 价格无效 → 上层给 None
-                    self.assertLessEqual(new["price"], 0)
+                old = old_parse(parts, "600519")
+                if old is None:                      # 价格无效：解析层不管业务，上层才拒
+                    self.assertLessEqual(provider.parse_quote(parts, "600519")["price"], 0)
                     continue
-                self.assertEqual(
-                    {k: v for k, v in new.items()}, old,
-                    f"{label}: 18 个字段必须逐项相同")
+                self.assertEqual(provider.parse_quote(parts, "600519"), old,
+                                 f"{label}: 18 个字段必须逐项相同")
 
     def test_field_set_is_exactly_eighteen(self):
         q = TencentQuoteProvider().parse_quote(snapshot().split("~"), "600519")
@@ -382,6 +384,211 @@ class TestApiContract(QuoteCacheCase):
         self.assertIsInstance(q["volume_lots"], int)
         self.assertIsInstance(q["price"], float)
         self.assertIsInstance(q["name"], str)
+
+
+# ------------------------------------------- 截断报文：必须失败、不得缓存
+class TestTruncatedSnapshot(QuoteCacheCase):
+    """评审意见：MIN_PARTS(51) 与 parse_quote 实际用到的下标 57 不一致，
+    51~57 字段的截断报文会被静默补 0 当成有效行情。这里把它钉死。"""
+
+    def test_required_parts_constant_is_consistent(self):
+        p = TencentQuoteProvider
+        self.assertEqual(p.REQUIRED_PARTS, 58)
+        self.assertEqual(p.REQUIRED_PARTS, max(i for _l, i in p.FIELD_INDEX) + 1)
+        self.assertEqual(tp.MIN_PARTS, 51, "传输层旧门槛保持不动（既有测试锁着）")
+        self.assertLess(tp.MIN_PARTS, p.REQUIRED_PARTS)
+
+    def test_truncated_snapshots_raise_format_error(self):
+        for n in (51, 52, 57):
+            with self.subTest(fields=n):
+                parts = snapshot(n=n).split("~")
+                self.assertEqual(len(parts), n)
+                with self.assertRaises(ProviderFormatError) as ctx:
+                    TencentQuoteProvider().parse_quote(parts, "600519")
+                self.assertIn("截断", str(ctx.exception))
+
+    def test_truncated_snapshot_never_becomes_quote_or_enters_cache(self):
+        for n in (51, 52, 57):
+            with self.subTest(fields=n):
+                with self.serve(snapshot(n=n)):
+                    q = d.get_stock_quote("600519")
+                self.assertIsNone(q, f"{n} 字段的截断报文不得产出行情")
+                self.assertNotIn("quote_600519", d._IN_MEMORY_CACHE)
+                self.assertNotIn("quote_600519", d._load_cache())
+                meta = d.quote_cache_meta("600519")
+                self.assertEqual(meta["status"], "unavailable")
+                self.assertEqual(meta["last_fetch_status"], "failed")
+
+    def test_full_snapshot_at_required_boundary_is_accepted(self):
+        """58 个**数据字段** + 1 个终止符 = 59 个 parts：能解析。
+        （正好 58 个 parts 时，下标 57 是报文结尾的 `";`，会在数值校验处失败，
+          见 test_truncated_snapshots_raise_format_error —— 那是"截断"，不是"缺值"。）"""
+        text = snapshot(n=59)
+        parts = TencentQuoteProvider().normalize(text, code="600519")[0]
+        self.assertEqual(len(parts), 59)
+        self.assertEqual(parts[57], "658000.00", "第 58 个数据字段（成交额）必须在位")
+        with self.serve(text):
+            q = d.get_stock_quote("600519")
+        self.assertIsNotNone(q)
+        self.assertEqual(len(q), 18)
+        self.assertGreater(q["turnover"], 0)
+
+    def test_old_implementation_would_have_accepted_truncated(self):
+        """把差异写清楚：旧实现 57 字段时确实返回"有效"行情（turnover=0），
+        新实现拒绝。这是本轮**有意收紧**，不是回归。"""
+        parts = snapshot(n=57).split("~")
+        old = old_parse(parts, "600519")
+        self.assertIsNotNone(old, "旧实现在 57 字段时返回行情 → 截断混入的真实路径")
+        self.assertEqual(old["turnover"], 0.0)
+        self.assertGreater(old["price"], 0)
+        with self.assertRaises(ProviderFormatError):
+            TencentQuoteProvider().parse_quote(parts, "600519")
+
+
+# ------------------------------------------------------- 成交额单位（亿元）
+class TestTurnoverUnit(QuoteCacheCase):
+    def test_fixture_turnover_is_yi_yuan_not_yuan(self):
+        text = fixture_text()
+        parts = TencentQuoteProvider().normalize(text, code="600519")[0]
+        q = TencentQuoteProvider().parse_quote(parts, "600519")
+        raw_wan = float(parts[57])                     # 上游单位：万元
+        self.assertEqual(q["turnover"], round(raw_wan / 10000, 2))
+        # 亿元 × 1e8 == 万元 × 1e4，两边都等于"元"；两位小数带来 ≤0.005 亿 = 5e5 元误差
+        self.assertAlmostEqual(q["turnover"] * 1e8, raw_wan * 1e4, delta=1e6)
+        self.assertAlmostEqual(q["turnover"], 33.16, places=2)
+
+    def test_downstream_denominator_still_treats_it_as_yi_yuan(self):
+        quote = {"code": "600519", "turnover": 33.16}   # 33.16 亿元
+        amounts = {"main_force": 1e8, "super_large": 5e7, "large": 5e7,
+                   "middle": 0, "small": 0}
+        fake = SimpleNamespace(ok=lambda: True, data={"amounts_yuan": amounts})
+        with mock.patch.object(d, "get_stock_quote", return_value=quote), \
+             mock.patch.object(d._providers, "call", return_value=fake):
+            out = d.get_stock_real_money_flow("600519")
+        self.assertEqual(out["main_force"], 1.0)                       # 1e8 元 = 1 亿
+        self.assertAlmostEqual(out["main_force_pct"], 3.02, places=2)  # 1/33.16 ≈ 3.02%
+
+    def test_unit_comments_do_not_regress_to_yuan(self):
+        import inspect
+        src = inspect.getsource(TencentQuoteProvider)
+        self.assertIn("parts[57] 是「万元」", src)
+        self.assertIn("亿元", src)
+        self.assertNotIn("对外统一成\"元\"", src)
+
+
+# --------------------------------------------- 缓存状态转换（来源 ≠ 抓取结果）
+class TestCacheStateTransitions(QuoteCacheCase):
+    def test_first_fetch_is_network_then_memory_hit(self):
+        with self.serve():
+            d.get_stock_quote("600519")
+            first = d.quote_cache_meta("600519")
+            d.get_stock_quote("600519")
+            second = d.quote_cache_meta("600519")
+        self.assertEqual(self.calls, 1)
+        self.assertEqual((first["served_from"], first["status"]), ("network", "live"))
+        self.assertEqual((second["served_from"], second["status"]), ("memory", "cached"))
+        self.assertEqual(second["last_fetch_status"], "ok",
+                         "上次抓取成功 ≠ 这次是实时数据")
+
+    def test_after_close_file_cache_is_cached_not_live(self):
+        with self.serve():
+            d.get_stock_quote("600519")
+        d._IN_MEMORY_CACHE.clear()
+        d._market_status = lambda: ("已收盘", False)
+        with self.serve():
+            q = d.get_stock_quote("600519")
+        meta = d.quote_cache_meta("600519")
+        self.assertEqual(self.calls, 1, "休市不得再打上游")
+        self.assertIsNotNone(q)
+        self.assertEqual(meta["served_from"], "file")
+        self.assertEqual(meta["status"], "cached")
+        self.assertEqual(meta["market_status"], "已收盘")
+
+    def test_swr_returns_old_value_and_is_not_live(self):
+        with self.serve():
+            d.get_stock_quote("600519")
+        d._IN_MEMORY_CACHE["quote_600519"]["time"] -= 31
+        spawned = []
+        with mock.patch.object(d, "_spawn_refresh",
+                               side_effect=lambda k, fn, vf=None: spawned.append(k)):
+            q = d.get_stock_quote("600519")
+            meta = d.quote_cache_meta("600519")
+        self.assertEqual(spawned, ["quote_600519"])
+        self.assertEqual(q["price"], 1453.0, "SWR 先给旧值")
+        self.assertEqual(meta["served_from"], "memory_stale")
+        self.assertEqual(meta["status"], "cached", "旧值不得标成 live")
+        self.assertEqual(meta["last_fetch_status"], "ok", "但上次抓取确实是成功的")
+
+    def test_failed_fetch_without_cache_has_no_served_layer(self):
+        with self.serve(exc=real_requests.Timeout("t")):
+            self.assertIsNone(d.get_stock_quote("600519"))
+        meta = d.quote_cache_meta("600519")
+        self.assertEqual(meta["served_from"], "none")
+        self.assertEqual(meta["last_fetch_status"], "failed")
+        self.assertEqual(meta["status"], "unavailable")
+
+
+# ----------------------------------------- 后台刷新：真的跑完，不靠 sleep
+class TestBackgroundRefresh(QuoteCacheCase):
+    def _expire(self, price=1453.00):
+        with self.serve(snapshot(**{"3": f"{price:.2f}"})):
+            d.get_stock_quote("600519")
+        self.assertEqual(self.calls, 1)
+        d._IN_MEMORY_CACHE["quote_600519"]["time"] -= 31
+        return d._LAST_SUCCESS["quote_600519"]
+
+    def _swr(self, text=None, exc=None):
+        """触发一次 SWR，并 join 掉它派生的后台线程（确定性等待，不用 sleep）。"""
+        threads = []
+        real_thread = d.threading.Thread
+
+        class _Recorder(real_thread):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                threads.append(self)
+
+        with mock.patch.object(d.threading, "Thread", _Recorder), self.serve(text, exc):
+            q = d.get_stock_quote("600519")
+        for t in threads:
+            t.join(5)
+            self.assertFalse(t.is_alive(), "后台刷新 5 秒内必须结束")
+        return q
+
+    def test_refresh_success_updates_memory_file_and_fetched_at(self):
+        old_ts = self._expire()
+        q = self._swr(snapshot(**{"3": "1500.00"}))
+        self.assertEqual(q["price"], 1453.0, "本次仍应返回旧值（SWR 语义）")
+        self.assertEqual(self.calls, 2, "过期后必须且只能多打一次上游")
+        mem = d._IN_MEMORY_CACHE["quote_600519"]
+        self.assertEqual(mem["data"]["price"], 1500.0, "新数据必须写回内存")
+        self.assertEqual(d._load_cache()["quote_600519"]["__data"]["price"], 1500.0,
+                         "新数据必须写回文件缓存")
+        self.assertGreater(d._LAST_SUCCESS["quote_600519"], old_ts, "fetched_at 必须更新")
+        self.assertEqual(mem["time"], d._LAST_SUCCESS["quote_600519"])
+        # 刷新完成后再取一次：命中内存，来源是 memory 而不是 network
+        with self.serve():
+            again = d.get_stock_quote("600519")
+        self.assertEqual(again["price"], 1500.0)
+        self.assertEqual(d.quote_cache_meta("600519")["served_from"], "memory")
+
+    def test_refresh_failure_keeps_old_data_and_old_timestamp(self):
+        old_ts = self._expire()
+        q = self._swr(exc=real_requests.Timeout("t"))
+        self.assertEqual(q["price"], 1453.0)
+        self.assertEqual(self.calls, 2)
+        self.assertEqual(d._IN_MEMORY_CACHE["quote_600519"]["data"]["price"], 1453.0,
+                         "刷新失败不得清空/改写内存缓存")
+        self.assertEqual(d._load_cache()["quote_600519"]["__data"]["price"], 1453.0)
+        self.assertEqual(d._LAST_SUCCESS["quote_600519"], old_ts,
+                         "刷新失败不得刷新 fetched_at")
+        self.assertEqual(d.quote_cache_meta("600519")["last_fetch_status"], "failed")
+
+    def test_background_success_does_not_turn_that_call_into_live(self):
+        """后台刷新成功也不能把"这一次"返回的旧值标成实时。"""
+        self._expire()
+        self._swr(snapshot(**{"3": "1500.00"}))
+        # 直接检查那次 SWR 调用记录的来源（_QUOTE_SERVED 在调用瞬间写入）
+        self.assertEqual(d._QUOTE_SERVED["600519"]["from"], "memory_stale")
 
 
 if __name__ == "__main__":
