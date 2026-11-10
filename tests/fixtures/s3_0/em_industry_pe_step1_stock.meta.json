@@ -31,5 +31,17 @@
     "data_date": null
   },
   "data_date": null,
-  "finished_at": "2026-11-10T20:44:49+08:00"
+  "finished_at": "2026-11-10T20:44:49+08:00",
+  "capture_env": {
+    "host": "localhost",
+    "platform": "Linux-6.18.58.1-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+    "python": "3.12.3",
+    "requests": "2.34.2",
+    "repo": "/mnt/d/stock-tracker",
+    "git_head": "48d3e68fdb2705b5bced608e0d5ac063d3c6a526",
+    "cwd": "/mnt/d/stock-tracker"
+  },
+  "capture_env_ref": "manifest.json#capture_env",
+  "outcome": "采集成功：HTTP 200，112 字节，无异常",
+  "meta_schema_version": 1
 }

@@ -14,6 +14,7 @@
 | `<key>.meta.json` | 采集元数据：URL、完整参数、HTTP 状态、Content-Type、字节数、sha256、请求时间、依赖关系、数据日期、失败原因 |
 | `manifest.json` | 8 份汇总 + sha256 清单 + 采集环境（host/python/requests/git_head） |
 | `field_spec.json` | 字段/类型/单位/可空性规格；测试据此发现上游结构漂移 |
+| `META_SCHEMA.md` | **元数据 13 项定义**（source/interface/url/params/method/requested_at/http_status/content_type/bytes/data_date/sha256/capture_env/outcome），文档/测试/JSON 三处口径以此为准 |
 | `CAPTURE_RUN.log` | 两轮采集的原始输出（证明每个接口只请求 1 次） |
 | `README.md` | 本文件 |
 

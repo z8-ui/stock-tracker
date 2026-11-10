@@ -41,6 +41,13 @@ KEYS = [
 ]
 PE_CHAIN = KEYS[4:7]
 
+# 任务书口径：每份报文记录 13 项（含"采集环境"与"采集结果及异常说明"）
+REQUIRED_13 = (
+    "source", "interface", "url", "params", "method", "requested_at",
+    "http_status", "content_type", "bytes", "data_date", "sha256",
+    "capture_env", "outcome",
+)
+
 
 def raw(key):
     with open(os.path.join(FIX, key + ".raw"), "rb") as f:
@@ -151,6 +158,60 @@ class TestCaptureMetadata(unittest.TestCase):
         not_captured = re.findall(r"^\[NOT CAPTURED\] (\S+):", log, re.M)
         self.assertEqual(sorted(not_captured), sorted(PE_CHAIN[1:]),
                          "只有行业 PE 的 2/3 步出现过未采集，且已补采")
+
+
+class TestMetadataContract(unittest.TestCase):
+    """13 项元数据口径：META_SCHEMA.md / 测试 / 实际 JSON 三者一致。
+
+    背景：S3-0 首轮只把"采集环境"写在 manifest、"结果说明"隐含在 status 里，
+    任务书要求的是每份 13 项，因此这里补上契约测试，防止再漂移。
+    """
+
+    def test_thirteen_required_fields_present_in_every_meta(self):
+        for key in KEYS:
+            m = meta(key)
+            missing = [f for f in REQUIRED_13 if f not in m]
+            self.assertEqual(missing, [], f"{key} 缺 13 项必填字段：{missing}")
+
+    def test_data_date_key_exists_even_when_null(self):
+        """没有数据日期必须是显式 null，不能省略键——省略等于把'接口不提供'变成'没记录'。"""
+        for key in KEYS:
+            m = meta(key)
+            self.assertIn("data_date", m, f"{key} 没有 data_date 键")
+            if m["data_date"] is not None:
+                self.assertRegex(str(m["data_date"]), r"^\d{4}-?\d{2}-?\d{2}$")
+
+    def test_capture_env_inline_matches_manifest(self):
+        env = manifest()["capture_env"]
+        for key in KEYS:
+            m = meta(key)
+            self.assertEqual(m["capture_env"], env,
+                             f"{key} 的 capture_env 与 manifest 不一致（口径漂移）")
+            self.assertEqual(m["capture_env_ref"], "manifest.json#capture_env")
+            for field in ("host", "platform", "python", "requests", "git_head"):
+                self.assertIn(field, m["capture_env"])
+
+    def test_outcome_is_plain_fact_not_adjective(self):
+        for key in KEYS:
+            m = meta(key)
+            outcome = m["outcome"]
+            self.assertIsInstance(outcome, str)
+            self.assertTrue(outcome.strip(), f"{key} outcome 为空")
+            if m["status"] == "CAPTURED":
+                self.assertTrue(outcome.startswith("采集成功"), outcome)
+                self.assertIn(str(m["http_status"]), outcome)
+                self.assertIn(str(m["bytes"]), outcome, "outcome 必须写出字节数")
+            else:
+                self.assertTrue(outcome.startswith("未采集") or outcome.startswith("异常"), outcome)
+
+    def test_schema_doc_lists_the_same_thirteen_fields(self):
+        """文档漂移守卫：META_SCHEMA.md 里必须逐个出现这 13 个字段名。"""
+        path = os.path.join(FIX, "META_SCHEMA.md")
+        self.assertTrue(os.path.exists(path), "缺 META_SCHEMA.md（13 项口径的唯一定义处）")
+        with open(path, encoding="utf-8") as f:
+            doc = f.read()
+        for field in REQUIRED_13:
+            self.assertIn(f"`{field}`", doc, f"META_SCHEMA.md 未定义字段 {field}")
 
 
 class TestManifest(unittest.TestCase):
