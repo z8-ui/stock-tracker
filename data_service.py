@@ -5,6 +5,7 @@
 
 import requests
 import json
+import math
 import random
 import os
 import time
@@ -953,10 +954,23 @@ def get_stock_real_money_flow(stock_code):
     def yi(v):
         return round(v / 1e8, 2)
 
-    def pct(v):
-        if turnover_yi is None or turnover_yi <= 0:
+    # 分母 = **真实成交额**（亿元）。S3-2：删除 `max(turnover, 0.01)` 的下限钳制。
+    #   None / 非数值 / NaN / <=0  → 占比不可计算 → None（页面显示 --）
+    #   有效成交额（>0）           → 直接做分母，不抬高也不压低
+    #   真实资金净额 0 且分母有效  → 0.0（真实零，不是 None）
+    def valid_turnover(t):
+        if isinstance(t, bool) or not isinstance(t, (int, float)):
             return None
-        return round(v / (max(turnover_yi, 0.01) * 1e8) * 100, 2)
+        if not math.isfinite(t) or t <= 0:
+            return None
+        return float(t)
+
+    denominator = valid_turnover(turnover_yi)
+
+    def pct(v):
+        if denominator is None:
+            return None
+        return round(v / (denominator * 1e8) * 100, 2)
 
     return {
         "main_force": yi(amounts["main_force"]),

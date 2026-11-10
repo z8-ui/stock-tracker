@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>S3-2 前端 null/零 展示验证（使用真实 static/js/format.js）</title>
+<link rel="stylesheet" href="../../static/css/style.css">
+<style>
+  body { background: #0f1521; color: #e0e0e0; font-family: "Microsoft YaHei", sans-serif; margin: 0; padding: 24px; }
+  h1 { font-size: 20px; margin: 0 0 6px; color: #ffd166; }
+  .note { color: #8892b0; font-size: 13px; margin-bottom: 18px; line-height: 1.7; }
+  .row { display: flex; gap: 18px; }
+  .flow-card { flex: 1; background: #1a2233; border: 1px solid #233054; border-radius: 10px; padding: 16px; }
+  .flow-card h2 { font-size: 15px; margin: 0 0 4px; color: #e0e0e0; }
+  .flow-card .sub { font-size: 12px; color: #8892b0; margin-bottom: 12px; }
+  .flow-row { display: flex; justify-content: space-between; align-items: baseline;
+              padding: 9px 0; border-bottom: 1px dashed #233054; }
+  .flow-row:last-child { border-bottom: 0; }
+  .flow-label { color: #8892b0; font-size: 13px; }
+  .flow-val { color: #e0e0e0; font-size: 15px; margin-left: auto; margin-right: 14px; }
+  .flow-pct { font-size: 15px; min-width: 96px; text-align: right; }
+  .badge { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 9px;
+           background: #233054; color: #8892b0; margin-left: 8px; }
+</style>
+</head>
+<body>
+<h1>S3-2：资金占比 null / 真实零 的页面展示</h1>
+<div class="note">
+  本页不是生产页面，是一个验证页：加载<strong>真实的 static/js/format.js</strong>，
+  用与 <code>templates/stock_flow.html</code> 完全相同的调用（<code>window.fmt.money(v,'亿')</code> /
+  <code>window.fmt.pct(p)</code>）渲染同一组字段。
+  生产页面本轮未改动。
+</div>
+
+<div class="row">
+  <div class="flow-card" id="card-null">
+    <h2>成交额缺失（turnover = null）<span class="badge">接口 5 个 *_pct 全为 null</span></h2>
+    <div class="sub">期望：占比显示 <code>--</code>，金额仍然显示真实数值</div>
+    <div id="rows-null"></div>
+  </div>
+
+  <div class="flow-card" id="card-zero">
+    <h2>真实零资金（turnover 有效，净额 = 0）<span class="badge">0 不是 null</span></h2>
+    <div class="sub">期望：占比显示 <code>0.00%</code>，不能显示 <code>--</code></div>
+    <div id="rows-zero"></div>
+  </div>
+</div>
+
+<script src="../../static/js/format.js"></script>
+<script>
+// 两组数据：一组 *_pct 为 null（成交额缺失/为 0），一组为真实 0
+var CASES = {
+  "rows-null": {
+    main_force: 1.0, main_force_pct: null,
+    super_large: 0.6, super_large_pct: null,
+    large: 0.4, large_pct: null,
+    middle: -0.2, middle_pct: null,
+    small: -0.1, small_pct: null
+  },
+  "rows-zero": {
+    main_force: 0, main_force_pct: 0,
+    super_large: 0, super_large_pct: 0,
+    large: 0, large_pct: 0,
+    middle: 0, middle_pct: 0,
+    small: 0, small_pct: 0
+  }
+};
+var LABELS = [
+  ["main_force", "主力净流入"], ["super_large", "超大单"], ["large", "大单（大单净量）"],
+  ["middle", "中单"], ["small", "小单"]
+];
+
+function render(containerId, d) {
+  var box = document.getElementById(containerId);
+  LABELS.forEach(function (pair) {
+    var key = pair[0], label = pair[1];
+    var v = d[key], p = d[key + "_pct"];
+    var row = document.createElement("div");
+    row.className = "flow-row";
+    var color = (window.fmt.toNum(v) === null) ? "#8892b0" : (v >= 0 ? "#ef5350" : "#26a69a");
+    row.innerHTML = '<span class="flow-label">' + label + '</span>' +
+                    '<span class="flow-val" style="color:' + color + '"></span>' +
+                    '<span class="flow-pct" style="color:' + color + '"></span>';
+    // 与 templates/stock_flow.html:249-254 完全相同的两行
+    row.querySelector(".flow-val").textContent = window.fmt.money(v, "亿");
+    row.querySelector(".flow-pct").textContent = window.fmt.pct(p);
+    box.appendChild(row);
+  });
+}
+
+render("rows-null", CASES["rows-null"]);
+render("rows-zero", CASES["rows-zero"]);
+
+// 供 CDP / 截图脚本断言的 DOM 结果
+window.__S3_2_RESULT__ = {
+  null_pcts: Array.from(document.querySelectorAll("#rows-null .flow-pct")).map(function (e) { return e.textContent; }),
+  zero_pcts: Array.from(document.querySelectorAll("#rows-zero .flow-pct")).map(function (e) { return e.textContent; }),
+  null_vals: Array.from(document.querySelectorAll("#rows-null .flow-val")).map(function (e) { return e.textContent; }),
+  zero_vals: Array.from(document.querySelectorAll("#rows-zero .flow-val")).map(function (e) { return e.textContent; })
+};
+</script>
+</body>
+</html>
