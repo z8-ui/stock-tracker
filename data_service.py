@@ -760,49 +760,85 @@ def cache_meta(cache_key):
     }
 
 
-def get_stock_quote(stock_code):
-    """个股实时行情"""
-    parts = _tencent_quote(stock_code)
-    if not parts:
-        return None
-    
-    try:
-        name = parts[1]
-        price = float(parts[3]) if parts[3] else 0
-        pre_close = float(parts[4]) if parts[4] else 0
-        open_price = float(parts[5]) if parts[5] else 0
-        high = float(parts[33]) if len(parts) > 33 and parts[33] else 0
-        low = float(parts[34]) if len(parts) > 34 and parts[34] else 0
-        change = float(parts[31]) if parts[31] else 0
-        change_pct = float(parts[32]) if parts[32] else 0
-        # ⚠️ 腾讯接口成交量可能带小数点(如 "43845.000"), 直接 int() 会 ValueError 被外层吞掉导致行情全挂
-        volume_lots = int(float(parts[6])) if parts[6] else 0
-        pe = float(parts[39]) if len(parts) > 39 and parts[39] else 0
-        pb = float(parts[46]) if len(parts) > 46 and parts[46] else 0
-        turnover_rate = float(parts[38]) if len(parts) > 38 and parts[38] else 0
-        market_cap = float(parts[44]) if len(parts) > 44 and parts[44] else 0
-        turnover = float(parts[57]) if len(parts) > 57 and parts[57] else 0
-        amplitude = float(parts[43]) if len(parts) > 43 and parts[43] else 0
-        high_52w = float(parts[47]) if len(parts) > 47 and parts[47] else 0
-        low_52w = float(parts[48]) if len(parts) > 48 and parts[48] else 0
+# 盘中同一证券 30 秒内只打一次上游（Q5=A：盘中 30s TTL，休市走文件缓存）
+QUOTE_CACHE_TTL = 30
 
-        # 价格缺失/为 0 不是"有效行情"：宁可让接口返回失败，也别让页面显示 0.00 元
-        if price <= 0:
+# 每只证券最近一次抓取的结果，仅用于把"实时/缓存降级/无数据"三态说清楚，
+# 不改 /api/stock-quote 的 18 字段返回结构。
+_QUOTE_ATTEMPT = {}
+
+
+def _note_quote_attempt(stock_code, ok, reason=""):
+    # 防御：这个字典按证券代码累积，且没有过期概念。正常页面只会涉及几十只，
+    # 但万一被脚本扫全市场，这里不能无限长——超过 1024 只就整体清空（只影响可观测性）。
+    if len(_QUOTE_ATTEMPT) > 1024:
+        _QUOTE_ATTEMPT.clear()
+    _QUOTE_ATTEMPT[stock_code] = {"ok": bool(ok), "ts": time.time(), "reason": reason}
+
+
+def quote_cache_meta(stock_code):
+    """行情的新鲜度与降级状态（给需要区分"实时/缓存/无数据"的调用方用）。
+
+    返回：asof / age_sec / is_stale / market_status（同 cache_meta）
+         + status：live（本次真实抓取成功）/ cached（抓取失败，返回的是旧缓存）
+                   / unavailable（抓取失败且无缓存）/ unknown（尚无抓取记录）
+         + reason：失败原因
+    """
+    key = f"quote_{stock_code}"
+    meta = cache_meta(key)
+    attempt = _QUOTE_ATTEMPT.get(stock_code)
+    if attempt is None:
+        # 本进程没抓过：要么休市直接读盘（定格快照），要么是重启后第一次读缓存
+        status = "cached" if meta["asof"] is not None else "unknown"
+        reason = "" if meta["asof"] is not None else meta["reason"]
+    elif attempt["ok"]:
+        status, reason = "live", ""
+    elif meta["asof"] is None:
+        status, reason = "unavailable", attempt["reason"]
+    else:
+        status, reason = "cached", attempt["reason"]
+    meta.update({"status": status, "reason": reason or meta["reason"]})
+    return meta
+
+
+def get_stock_quote(stock_code) -> dict | None:
+    """个股实时行情（对外仍是 18 个字段，API 契约不变）
+
+    S3-1 两点变化：
+      1. 解析从本函数搬到 TencentQuoteProvider.parse_quote()（业务有效性判断仍留在这里）；
+      2. 盘中 30 秒缓存（Q5=A）：同一证券 30 秒内连续请求只打一次上游；
+         休市直接用文件缓存（定格快照），不冒充实时；缓存命中不刷新 fetched_at。
+
+    返回的 18 个字段里不带任何元数据 —— 需要"这是不是缓存/多旧"时用 quote_cache_meta()，
+    避免为了内部可观测性去改动前端 API 契约。
+    """
+    provider = _providers.get("tencent_quote")
+
+    def _fetch():
+        parts = _tencent_quote(stock_code)
+        if not parts:
+            _note_quote_attempt(stock_code, False, "上游无数据")
             return None
+        try:
+            quote = provider.parse_quote(parts, stock_code)
+        except Exception as e:                      # 字段不合法 → 不可用，不缓存
+            _note_quote_attempt(stock_code, False, f"{type(e).__name__}: {str(e)[:120]}")
+            return None
+        # 价格缺失/为 0 不是"有效行情"：宁可接口失败，也别让页面显示 0.00 元
+        if quote["price"] <= 0:
+            _note_quote_attempt(stock_code, False, "价格无效（<=0）")
+            return None
+        _note_quote_attempt(stock_code, True)
+        return quote
 
-        return {
-            "name": name, "code": stock_code,
-            "price": price, "pre_close": pre_close, "open": open_price,
-            "high": high, "low": low,
-            "change": change, "change_pct": change_pct,
-            "volume_lots": volume_lots,
-            "turnover": round(turnover / 10000, 2),
-            "turnover_rate": turnover_rate, "amplitude": amplitude,
-            "pe": pe, "pb": pb, "market_cap": market_cap,
-            "high_52w": high_52w, "low_52w": low_52w
-        }
-    except:
+    data = _cached_get(f"quote_{stock_code}", _fetch,
+                       source="tencent_quote", ttl=QUOTE_CACHE_TTL)
+    if not isinstance(data, dict) or not data:
         return None
+    # 只投影 18 个契约字段：_asof/_stale/_market_status 等缓存标注不外泄
+    text_fields = ("name", "code")
+    return {f: (data.get(f) if f in text_fields else (data.get(f) or 0))
+            for f in provider.QUOTE_FIELDS}
 
 
 # ==============================================================
