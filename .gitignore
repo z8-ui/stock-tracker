@@ -20,6 +20,9 @@ Thumbs.db
 
 # 日志
 *.log
+# 例外：S3-0 采集运行记录是测试证据（tests/test_s3_0_fixtures.py 会读它，
+# 干净 clone 里缺了就无法复现全量测试），必须入库。只放行这一个文件。
+!tests/fixtures/s3_0/CAPTURE_RUN.log
 /tmp/
 
 # 环境变量（真实密钥只放本地 .env，示例可以入库）

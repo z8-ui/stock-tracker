@@ -619,5 +619,44 @@ class TestOfflineAndHonesty(unittest.TestCase):
             self.assertNotIn("mock", json.dumps(meta(key), ensure_ascii=False).lower())
 
 
+class TestEvidenceFilesAreCommitted(unittest.TestCase):
+    """教训（S3-2 复审发现）：CAPTURE_RUN.log 被 .gitignore 的 `*.log` 吞掉。
+
+    本地有文件，所以测试一直通过；但干净 clone 里没有它 →
+    `test_capture_log_shows_exactly_one_request_per_interface` 直接 FileNotFoundError，
+    报告出来的"全量全绿"在 bundle 里无法复现。这里把"证据必须入库"变成可执行断言。
+    """
+
+    def _git(self, *args):
+        import subprocess
+        return subprocess.run(["git", "-C", ROOT] + list(args),
+                              capture_output=True, text=True, encoding="utf-8")
+
+    def _require_git_repo(self):
+        if not os.path.isdir(os.path.join(ROOT, ".git")):
+            self.skipTest("不在 git 工作区（例如源码压缩包），无法校验入库状态；"
+                          "文件存在性由 TestCaptureMetadata 保证")
+
+    def test_capture_log_is_tracked_by_git(self):
+        self._require_git_repo()
+        out = self._git("ls-files", "--error-unmatch", "tests/fixtures/s3_0/CAPTURE_RUN.log")
+        self.assertEqual(out.returncode, 0,
+                         "CAPTURE_RUN.log 必须入库：干净 clone 里缺了就无法复现全量测试")
+        self.assertEqual(out.stdout.strip(), "tests/fixtures/s3_0/CAPTURE_RUN.log")
+
+    def test_no_fixture_file_is_left_untracked(self):
+        self._require_git_repo()
+        listed = {line for line in self._git("ls-files", "tests/fixtures/s3_0").stdout.splitlines() if line}
+        on_disk = {"tests/fixtures/s3_0/" + name for name in os.listdir(FIX)}
+        missing = sorted(on_disk - listed)
+        self.assertEqual(missing, [], f"以下夹具/证据文件没有入库：{missing}")
+
+    def test_capture_log_is_not_ignored(self):
+        self._require_git_repo()
+        out = self._git("check-ignore", "-v", "tests/fixtures/s3_0/CAPTURE_RUN.log")
+        self.assertEqual(out.returncode, 1,
+                         f"CAPTURE_RUN.log 仍被忽略规则命中：{out.stdout.strip()}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

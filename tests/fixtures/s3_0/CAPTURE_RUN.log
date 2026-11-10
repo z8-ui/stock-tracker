@@ -1,0 +1,27 @@
+S3-0 采集运行日志（原样摘录，未修改时间/状态/字节/sha256）
+============================================================
+采集时间：2026-11-10 20:44:45 ~ 20:45:44 CST
+采集脚本：scripts/capture_s3_0_fixtures.py
+python    ：3.12.3 / requests 2.34.2
+说明     ：第一轮跑了 8 个目标中的 6 个。行业 PE 第 2/3 步因脚本内派生键名不一致
+            （f127 vs industry_name）被判为"依赖缺失"，脚本按设计**没有发请求**、
+            没有产出文件。修正键名后以 --only 只补采这两个 key，其余 6 个未重发请求。
+            因此 8 个接口各自恰好 1 次真实请求，见下面两轮的 [CAPTURED] 行。
+
+---------- 第一轮（全量，8 个目标） ----------
+[CAPTURED] tencent_quote_sh600519           200     547B d2324d8c5d800f14c68c5b83c9564057247d406712e94f26705183c2f5d67289
+[CAPTURED] em_sector_flow                   200    4016B 2b841e069bf6d5bbdb2af69f455b3660d8e495cc5cc1de898b4f0ac403535ee6
+[CAPTURED] em_sector_valuation              200    6686B 82ca265d441e0d3a2c56ec6d4d0763cedc5d1f4d72637fe82c6b5514740a530f
+[CAPTURED] em_f10_600519                    200    4299B 5a5f3881febccdff9a7c38df1382dcb300301fd9c66c7e278e791df0f87e7ebe
+[CAPTURED] em_industry_pe_step1_stock       200     112B d2fcc423de6f7cac27dde1bb2349aaf59275ebe27292e835ee2e2dc0cb4b5156
+[NOT CAPTURED] em_industry_pe_step2_suggest: 依赖缺失
+[NOT CAPTURED] em_industry_pe_step3_ulist: 依赖缺失
+[CAPTURED] tencent_index_kline_sh000001     200    3942B 5b1a913d07b7280c02f86d62781c362a0902524edb5e2c265ce70b1baafde114
+
+采集 6/8 成功，2 未采集
+
+---------- 第二轮（只补采依赖的两步） ----------
+[CAPTURED] em_industry_pe_step2_suggest     200     361B b0ce66528cb2e9008a313cd7a8bc6b2aca1da2d7887a5accf62d9a5e32fdfc38
+[CAPTURED] em_industry_pe_step3_ulist       200     143B 38b67a24dc7bf72499ee0482783eb1ab76f37b9a22ff7f745d66352c10974051
+
+采集 8/8 成功，0 未采集
