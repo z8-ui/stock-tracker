@@ -1,0 +1,36 @@
+{
+  "key": "tencent_index_kline_sh000001",
+  "source": "tencent",
+  "interface": "web.ifzq fqkline 指数日K（sh000001, qfq）",
+  "method": "GET",
+  "url": "http://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+  "params": {
+    "param": "sh000001,day,2026-09-01,2026-11-10,30,qfq"
+  },
+  "headers": {
+    "User-Agent": "Mozilla/5.0"
+  },
+  "source_ref": "data_service.py:1164-1167",
+  "note": "http 会 302 到 https；redirect 链记进 meta.final_url / redirect_chain",
+  "depends_on": null,
+  "requested_at": "2026-11-10T20:44:49+08:00",
+  "http_status": 200,
+  "content_type": "text/html; charset=UTF-8",
+  "content_encoding": "gzip",
+  "bytes": 3942,
+  "sha256": "5b1a913d07b7280c02f86d62781c362a0902524edb5e2c265ce70b1baafde114",
+  "elapsed_ms": 311,
+  "final_url": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh000001%2Cday%2C2026-09-01%2C2026-11-10%2C30%2Cqfq",
+  "redirect_chain": [
+    "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=sh000001%2Cday%2C2026-09-01%2C2026-11-10%2C30%2Cqfq"
+  ],
+  "raw_file": "tencent_index_kline_sh000001.raw",
+  "status": "CAPTURED",
+  "derived": {
+    "row_count": 30,
+    "data_date": "2026-11-10",
+    "kline_field_len": 6
+  },
+  "data_date": "2026-11-10",
+  "finished_at": "2026-11-10T20:44:49+08:00"
+}

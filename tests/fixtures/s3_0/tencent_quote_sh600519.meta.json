@@ -1,0 +1,33 @@
+{
+  "key": "tencent_quote_sh600519",
+  "source": "tencent",
+  "interface": "qt.gtimg.cn 实时快照（个股行情）",
+  "method": "GET",
+  "url": "http://qt.gtimg.cn/q=sh600519",
+  "params": {},
+  "headers": {
+    "User-Agent": "Mozilla/5.0"
+  },
+  "source_ref": "services/data/providers/tencent.py:35",
+  "note": "腾讯快照不是 JSON，是 v_sh600519=\"...\" 的 ~ 分隔文本；按原始字节保存",
+  "depends_on": null,
+  "requested_at": "2026-11-10T20:44:45+08:00",
+  "http_status": 200,
+  "content_type": "text/html; charset=GBK",
+  "content_encoding": "gzip",
+  "bytes": 547,
+  "sha256": "d2324d8c5d800f14c68c5b83c9564057247d406712e94f26705183c2f5d67289",
+  "elapsed_ms": 113,
+  "final_url": "http://qt.gtimg.cn/q=sh600519",
+  "redirect_chain": [],
+  "raw_file": "tencent_quote_sh600519.raw",
+  "status": "CAPTURED",
+  "derived": {
+    "format": "tencent_tilde_text",
+    "field_count": 88,
+    "data_date": "20261110",
+    "sample_head": "v_sh600519=\"1~贵州茅台~600519~1439.00~1444.99~1438.23~23038~1178"
+  },
+  "data_date": "20261110",
+  "finished_at": "2026-11-10T20:44:45+08:00"
+}

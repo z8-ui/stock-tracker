@@ -1,0 +1,165 @@
+{
+  "stage": "S3-0",
+  "captured_at": "2026-11-10T20:45:44+08:00",
+  "purpose": "把 8 份真实报文的字段、类型、单位、可空性写成机器可校对的规格；测试据此发现上游结构漂移，不靠记忆。",
+  "units_policy": "unit 必须写明；语义确实未知的写 unknown 并在 notes 说明未使用，禁止猜测。",
+  "items": {
+    "tencent_quote_sh600519": {
+      "format": "tencent_tilde_text",
+      "raw_encoding": "gbk",
+      "declared_fields": 88,
+      "min_parts_for_parser": 51,
+      "fields": {
+        "0": {"type": "str", "unit": null, "desc": "v_sh600519=\"1 —— 含变量名前缀，切分后带引号"},
+        "1": {"type": "str", "unit": null, "desc": "证券名称"},
+        "2": {"type": "str", "unit": null, "desc": "代码"},
+        "3": {"type": "str", "unit": "元", "desc": "现价"},
+        "4": {"type": "str", "unit": "元", "desc": "昨收"},
+        "5": {"type": "str", "unit": "元", "desc": "今开"},
+        "6": {"type": "str", "unit": "手", "desc": "成交量；可能带小数点，必须 int(float(x))"},
+        "30": {"type": "str", "unit": null, "desc": "行情时间 YYYYMMDDHHMMSS"},
+        "31": {"type": "str", "unit": "元", "desc": "涨跌额"},
+        "32": {"type": "str", "unit": "%", "desc": "涨跌幅"},
+        "33": {"type": "str", "unit": "元", "desc": "最高"},
+        "34": {"type": "str", "unit": "元", "desc": "最低"},
+        "38": {"type": "str", "unit": "%", "desc": "换手率"},
+        "39": {"type": "str", "unit": "倍", "desc": "市盈率 TTM"},
+        "43": {"type": "str", "unit": "%", "desc": "振幅"},
+        "44": {"type": "str", "unit": "亿元", "desc": "总市值（原值即亿元，代码不再换算）"},
+        "46": {"type": "str", "unit": "倍", "desc": "市净率"},
+        "47": {"type": "str", "unit": "元", "desc": "52 周最高"},
+        "48": {"type": "str", "unit": "元", "desc": "52 周最低"},
+        "57": {"type": "str", "unit": "万元", "desc": "成交额；代码 turnover/10000 即亿元"}
+      },
+      "notes": [
+        "索引来自 data_service.get_stock_quote 实际读取位置（L770-787），不是腾讯官方文档推断。",
+        "整个响应不是 JSON，是 ~ 分隔文本，按 GBK 解码。"
+      ]
+    },
+    "em_sector_flow": {
+      "format": "json",
+      "row_path": "data.diff",
+      "declared_rows": 60,
+      "declared_total": 496,
+      "fields": {
+        "f2": {"type": "number", "unit": "点", "desc": "板块指数现价"},
+        "f3": {"type": "number", "unit": "%", "desc": "涨跌幅"},
+        "f14": {"type": "str", "unit": null, "desc": "板块名称"},
+        "f62": {"type": "number", "unit": "元", "desc": "主力净流入；代码 /1e8 转亿元"}
+      },
+      "notes": [
+        "data.total=496 而 pz=60 只回 60 行 —— 该接口本身分页截断，现有实现只拿前 60 个板块，S3-3 要决定是否翻页。",
+        "本采集未出现 f62=0 的行，真实零值样例由 em_f10_600519 提供。"
+      ]
+    },
+    "em_sector_valuation": {
+      "format": "json",
+      "row_path": "data.diff",
+      "declared_rows": 60,
+      "declared_total": 496,
+      "fields": {
+        "f2": {"type": "number", "unit": "点", "desc": "板块指数现价"},
+        "f3": {"type": "number", "unit": "%", "desc": "涨跌幅"},
+        "f9": {"type": "number", "unit": "倍", "desc": "动态市盈率；可为负（亏损板块）"},
+        "f14": {"type": "str", "unit": null, "desc": "板块名称"},
+        "f20": {"type": "number", "unit": "元", "desc": "总市值；代码 /1e8 转亿元"},
+        "f23": {"type": "str", "unit": "倍", "desc": "市净率；本次采集 60/60 全为 \"-\"（缺失，不是 0）"},
+        "f25": {"type": "number", "unit": "unknown", "desc": "本系统未使用，语义未确认，仅留证"},
+        "f37": {"type": "str", "unit": "unknown", "desc": "本系统未使用；本次采集 60/60 全为 \"-\"，语义未确认"}
+      },
+      "notes": [
+        "关键证据：f23 与 f37 全部是字符串 \"-\"；现有 _num() 默认把它转 0.0，等于把\"缺失\"显示成 0 倍 PB —— S3-3 必须修。",
+        "f9 有 15 行负数，现有实现按 pe>0 过滤，等于丢掉 15 个亏损板块（不是 bug，但要在页面口径里说清）。"
+      ]
+    },
+    "em_f10_600519": {
+      "format": "json",
+      "row_path": "result.data",
+      "declared_rows": 1,
+      "declared_pages": 104,
+      "declared_columns": 165,
+      "fields": {
+        "SECUCODE": {"type": "str", "unit": null, "desc": "带交易所后缀的代码 600519.SH"},
+        "SECURITY_NAME_ABBR": {"type": "str", "unit": null, "desc": "证券简称"},
+        "REPORT_DATE": {"type": "str", "unit": null, "desc": "报告期，格式 YYYY-MM-DD 00:00:00"},
+        "REPORT_DATE_NAME": {"type": "str", "unit": null, "desc": "报告期中文名，如 2026三季报"},
+        "NOTICE_DATE": {"type": "str", "unit": null, "desc": "公告日，格式 YYYY-MM-DD 00:00:00"},
+        "CURRENCY": {"type": "str", "unit": null, "desc": "币种代码 CNY"},
+        "EPSJB": {"type": "number", "unit": "元/股", "desc": "基本每股收益"},
+        "BPS": {"type": "number", "unit": "元/股", "desc": "每股净资产"},
+        "TOTALOPERATEREVE": {"type": "number", "unit": "元", "desc": "营业总收入"},
+        "TOTALOPERATEREVETZ": {"type": "number", "unit": "%", "desc": "营收同比"},
+        "PARENTNETPROFIT": {"type": "number", "unit": "元", "desc": "归母净利润"},
+        "PARENTNETPROFITTZ": {"type": "number", "unit": "%", "desc": "净利润同比"},
+        "ROEJQ": {"type": "number", "unit": "%", "desc": "加权 ROE"},
+        "EPSJBTZ": {"type": "number", "unit": "%", "desc": "每股收益同比；本记录真实 0.0（不是缺失）"},
+        "EPSKCJB": {"type": "null", "unit": "元/股", "desc": "扣非每股收益；本记录为 JSON null（缺失）"},
+        "B_FREE_SHARE": {"type": "number", "unit": "股", "desc": "流通股；本记录真实 0.0"}
+      },
+      "notes": [
+        "同一行里同时存在 null（56 个字段）与真实 0.0（EPSJBTZ、B_FREE_SHARE）——这是\"缺失≠0\"最硬的证据。",
+        "columns=ALL 返回 165 列，未使用字段不解释语义，避免编造。"
+      ]
+    },
+    "em_industry_pe_step1_stock": {
+      "format": "json",
+      "row_path": "data",
+      "declared_rows": 1,
+      "fields": {
+        "f57": {"type": "str", "unit": null, "desc": "证券代码"},
+        "f127": {"type": "str", "unit": null, "desc": "所属行业名（如 白酒Ⅱ），第 2 步的检索词"}
+      },
+      "notes": ["单对象不是数组；data 里只有这两个字段。"]
+    },
+    "em_industry_pe_step2_suggest": {
+      "format": "json",
+      "row_path": "QuotationCodeTable.Data",
+      "declared_rows": 1,
+      "fields": {
+        "Code": {"type": "str", "unit": null, "desc": "板块代码 BKxxxx"},
+        "Name": {"type": "str", "unit": null, "desc": "板块名称"},
+        "PinYin": {"type": "str", "unit": null, "desc": "拼音缩写"},
+        "ID": {"type": "str", "unit": null, "desc": "内部 ID"},
+        "JYS": {"type": "str", "unit": null, "desc": "交易所编号字符串"},
+        "Classify": {"type": "str", "unit": null, "desc": "分类，板块为 BK"},
+        "MarketType": {"type": "str", "unit": null, "desc": "市场类型"},
+        "SecurityTypeName": {"type": "str", "unit": null, "desc": "证券类型名，板块为 板块"},
+        "SecurityType": {"type": "str", "unit": null, "desc": "证券类型代码"},
+        "MktNum": {"type": "str", "unit": null, "desc": "市场号字符串 \"90\""},
+        "TypeUS": {"type": "str", "unit": null, "desc": "未使用，语义未确认"},
+        "QuoteID": {"type": "str", "unit": null, "desc": "行情 ID，形如 90.BK1277"},
+        "UnifiedCode": {"type": "str", "unit": null, "desc": "统一代码"},
+        "InnerCode": {"type": "str", "unit": null, "desc": "内部编码"}
+      },
+      "notes": ["type=14 限定板块；返回条数 1。"]
+    },
+    "em_industry_pe_step3_ulist": {
+      "format": "json",
+      "row_path": "data.diff",
+      "declared_rows": 1,
+      "fields": {
+        "f12": {"type": "str", "unit": null, "desc": "板块代码"},
+        "f14": {"type": "str", "unit": null, "desc": "板块名称"},
+        "f9": {"type": "number", "unit": "倍", "desc": "动态 PE ×100（2274 → 22.74），必须 /100"}
+      },
+      "notes": ["f9 是整数放大 100 倍，与 clist 的 f9（已是浮点倍数）口径不同，不能混用。"]
+    },
+    "tencent_index_kline_sh000001": {
+      "format": "json",
+      "row_path": "data.sh000001.day",
+      "declared_rows": 30,
+      "fields": {
+        "[0]": {"type": "str", "unit": null, "desc": "交易日 YYYY-MM-DD"},
+        "[1]": {"type": "str", "unit": "点", "desc": "开（指数点位，字符串）"},
+        "[2]": {"type": "str", "unit": "点", "desc": "收"},
+        "[3]": {"type": "str", "unit": "点", "desc": "高"},
+        "[4]": {"type": "str", "unit": "点", "desc": "低"},
+        "[5]": {"type": "str", "unit": "手", "desc": "成交量；形如 \"404865177.000\"，必须 int(float(x))"}
+      },
+      "notes": [
+        "请求 2026-09-01 起 30 根，实际回 2026-09-22…2026-11-10 共 30 根 —— 参数是\"根数\"不是\"起始日\"保证。",
+        "data.sh000001 下除 day 外还有 qt/prec/version/mx_price，现有实现只读 day，其余留证。"
+      ]
+    }
+  }
+}

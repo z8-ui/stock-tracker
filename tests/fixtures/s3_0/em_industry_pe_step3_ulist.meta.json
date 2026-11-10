@@ -1,0 +1,39 @@
+{
+  "key": "em_industry_pe_step3_ulist",
+  "source": "eastmoney",
+  "interface": "行业PE 第3步：板块 → 动态PE（f9，放大100倍）",
+  "method": "GET",
+  "url": "https://push2.eastmoney.com/api/qt/ulist.np/get",
+  "params": {
+    "secids": "90.BK1277",
+    "fields": "f12,f14,f9"
+  },
+  "headers": {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Referer": "https://data.eastmoney.com/"
+  },
+  "source_ref": "data_service.py:982-985",
+  "note": "f9 需 /100 才是 PE",
+  "depends_on": "em_industry_pe_step2_suggest",
+  "requested_at": "2026-11-10T20:45:43+08:00",
+  "derived_from": {
+    "bk_code": "BK1277"
+  },
+  "http_status": 200,
+  "content_type": "application/json; charset=UTF-8",
+  "content_encoding": "gzip",
+  "bytes": 143,
+  "sha256": "38b67a24dc7bf72499ee0482783eb1ab76f37b9a22ff7f745d66352c10974051",
+  "elapsed_ms": 869,
+  "final_url": "https://push2.eastmoney.com/api/qt/ulist.np/get?secids=90.BK1277&fields=f12%2Cf14%2Cf9",
+  "redirect_chain": [],
+  "raw_file": "em_industry_pe_step3_ulist.raw",
+  "status": "CAPTURED",
+  "derived": {
+    "row_count": 1,
+    "f9_raw": 2274,
+    "data_date": null
+  },
+  "data_date": null,
+  "finished_at": "2026-11-10T20:45:44+08:00"
+}

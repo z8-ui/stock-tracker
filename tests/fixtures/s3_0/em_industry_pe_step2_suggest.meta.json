@@ -1,0 +1,40 @@
+{
+  "key": "em_industry_pe_step2_suggest",
+  "source": "eastmoney",
+  "interface": "行业PE 第2步：行业名 → 板块代码（suggest type=14）",
+  "method": "GET",
+  "url": "https://searchapi.eastmoney.com/api/suggest/get",
+  "params": {
+    "input": "白酒Ⅱ",
+    "type": "14",
+    "count": "5"
+  },
+  "headers": {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Referer": "https://data.eastmoney.com/"
+  },
+  "source_ref": "data_service.py:973-976",
+  "note": "取第一个 BK 开头的 Code；type=14 表示板块",
+  "depends_on": "em_industry_pe_step1_stock",
+  "requested_at": "2026-11-10T20:45:43+08:00",
+  "derived_from": {
+    "industry_name": "白酒Ⅱ"
+  },
+  "http_status": 200,
+  "content_type": "application/json",
+  "content_encoding": "gzip",
+  "bytes": 361,
+  "sha256": "b0ce66528cb2e9008a313cd7a8bc6b2aca1da2d7887a5accf62d9a5e32fdfc38",
+  "elapsed_ms": 587,
+  "final_url": "https://searchapi.eastmoney.com/api/suggest/get?input=%E7%99%BD%E9%85%92%E2%85%A1&type=14&count=5",
+  "redirect_chain": [],
+  "raw_file": "em_industry_pe_step2_suggest.raw",
+  "status": "CAPTURED",
+  "derived": {
+    "bk_code": "BK1277",
+    "suggest_rows": 1,
+    "data_date": null
+  },
+  "data_date": null,
+  "finished_at": "2026-11-10T20:45:43+08:00"
+}

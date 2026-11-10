@@ -1,0 +1,35 @@
+{
+  "key": "em_industry_pe_step1_stock",
+  "source": "eastmoney",
+  "interface": "行业PE 第1步：个股 → 行业名（f57,f127）",
+  "method": "GET",
+  "url": "https://push2.eastmoney.com/api/qt/stock/get",
+  "params": {
+    "secid": "1.600519",
+    "fields": "f57,f127"
+  },
+  "headers": {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Referer": "https://data.eastmoney.com/"
+  },
+  "source_ref": "data_service.py:964-967",
+  "note": "第2步的 input 必须取本响应里的 f127",
+  "depends_on": null,
+  "requested_at": "2026-11-10T20:44:48+08:00",
+  "http_status": 200,
+  "content_type": "application/json; charset=UTF-8",
+  "content_encoding": "gzip",
+  "bytes": 112,
+  "sha256": "d2fcc423de6f7cac27dde1bb2349aaf59275ebe27292e835ee2e2dc0cb4b5156",
+  "elapsed_ms": 142,
+  "final_url": "https://push2.eastmoney.com/api/qt/stock/get?secid=1.600519&fields=f57%2Cf127",
+  "redirect_chain": [],
+  "raw_file": "em_industry_pe_step1_stock.raw",
+  "status": "CAPTURED",
+  "derived": {
+    "industry_name": "白酒Ⅱ",
+    "data_date": null
+  },
+  "data_date": null,
+  "finished_at": "2026-11-10T20:44:49+08:00"
+}

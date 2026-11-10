@@ -1,0 +1,191 @@
+{
+  "stage": "S3-0",
+  "purpose": "真实上游报文采集（离线夹具基线），不迁移 Provider、不改业务逻辑",
+  "captured_at": "2026-11-10T20:45:44+08:00",
+  "capture_env": {
+    "host": "localhost",
+    "platform": "Linux-6.18.58.1-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+    "python": "3.12.3",
+    "requests": "2.34.2",
+    "repo": "/mnt/d/stock-tracker",
+    "git_head": "48d3e68fdb2705b5bced608e0d5ac063d3c6a526",
+    "cwd": "/mnt/d/stock-tracker"
+  },
+  "counts": {
+    "targets": 8,
+    "captured": 8,
+    "not_captured": 0
+  },
+  "items": [
+    {
+      "key": "tencent_quote_sh600519",
+      "source": "tencent",
+      "interface": "qt.gtimg.cn 实时快照（个股行情）",
+      "status": "CAPTURED",
+      "url": "http://qt.gtimg.cn/q=sh600519",
+      "params": {},
+      "http_status": 200,
+      "content_type": "text/html; charset=GBK",
+      "bytes": 547,
+      "sha256": "d2324d8c5d800f14c68c5b83c9564057247d406712e94f26705183c2f5d67289",
+      "raw_file": "tencent_quote_sh600519.raw",
+      "data_date": "20261110",
+      "requested_at": "2026-11-10T20:44:45+08:00",
+      "depends_on": null
+    },
+    {
+      "key": "em_sector_flow",
+      "source": "eastmoney",
+      "interface": "push2 clist 行业板块资金流（fs=m:90+t:2, fields=f14,f2,f3,f62）",
+      "status": "CAPTURED",
+      "url": "https://push2.eastmoney.com/api/qt/clist/get",
+      "params": {
+        "pn": "1",
+        "pz": "60",
+        "po": "1",
+        "np": "1",
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+        "fltt": "2",
+        "invt": "2",
+        "fid": "f3",
+        "fs": "m:90+t:2",
+        "fields": "f14,f2,f3,f62"
+      },
+      "http_status": 200,
+      "content_type": "application/json; charset=UTF-8",
+      "bytes": 4016,
+      "sha256": "2b841e069bf6d5bbdb2af69f455b3660d8e495cc5cc1de898b4f0ac403535ee6",
+      "raw_file": "em_sector_flow.raw",
+      "data_date": null,
+      "requested_at": "2026-11-10T20:44:45+08:00",
+      "depends_on": null
+    },
+    {
+      "key": "em_sector_valuation",
+      "source": "eastmoney",
+      "interface": "push2 clist 行业板块估值（fields=f14,f2,f3,f9,f20,f23,f25,f37）",
+      "status": "CAPTURED",
+      "url": "https://push2.eastmoney.com/api/qt/clist/get",
+      "params": {
+        "pn": "1",
+        "pz": "60",
+        "po": "1",
+        "np": "1",
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+        "fltt": "2",
+        "invt": "2",
+        "fid": "f3",
+        "fs": "m:90+t:2",
+        "fields": "f14,f2,f3,f9,f20,f23,f25,f37"
+      },
+      "http_status": 200,
+      "content_type": "application/json; charset=UTF-8",
+      "bytes": 6686,
+      "sha256": "82ca265d441e0d3a2c56ec6d4d0763cedc5d1f4d72637fe82c6b5514740a530f",
+      "raw_file": "em_sector_valuation.raw",
+      "data_date": null,
+      "requested_at": "2026-11-10T20:44:48+08:00",
+      "depends_on": null
+    },
+    {
+      "key": "em_f10_600519",
+      "source": "eastmoney",
+      "interface": "datacenter-web F10 主要财务指标（RPT_F10_FINANCE_MAINFINADATA）",
+      "status": "CAPTURED",
+      "url": "https://datacenter-web.eastmoney.com/api/data/v1/get",
+      "params": {
+        "reportName": "RPT_F10_FINANCE_MAINFINADATA",
+        "columns": "ALL",
+        "filter": "(SECUCODE=\"600519.SH\")",
+        "pageNumber": "1",
+        "pageSize": "1",
+        "sortColumns": "REPORT_DATE",
+        "sortTypes": "-1"
+      },
+      "http_status": 200,
+      "content_type": "text/plain;charset=UTF-8",
+      "bytes": 4299,
+      "sha256": "5a5f3881febccdff9a7c38df1382dcb300301fd9c66c7e278e791df0f87e7ebe",
+      "raw_file": "em_f10_600519.raw",
+      "data_date": "2026-09-30",
+      "requested_at": "2026-11-10T20:44:48+08:00",
+      "depends_on": null
+    },
+    {
+      "key": "em_industry_pe_step1_stock",
+      "source": "eastmoney",
+      "interface": "行业PE 第1步：个股 → 行业名（f57,f127）",
+      "status": "CAPTURED",
+      "url": "https://push2.eastmoney.com/api/qt/stock/get",
+      "params": {
+        "secid": "1.600519",
+        "fields": "f57,f127"
+      },
+      "http_status": 200,
+      "content_type": "application/json; charset=UTF-8",
+      "bytes": 112,
+      "sha256": "d2fcc423de6f7cac27dde1bb2349aaf59275ebe27292e835ee2e2dc0cb4b5156",
+      "raw_file": "em_industry_pe_step1_stock.raw",
+      "data_date": null,
+      "requested_at": "2026-11-10T20:44:48+08:00",
+      "depends_on": null
+    },
+    {
+      "key": "em_industry_pe_step2_suggest",
+      "source": "eastmoney",
+      "interface": "行业PE 第2步：行业名 → 板块代码（suggest type=14）",
+      "status": "CAPTURED",
+      "url": "https://searchapi.eastmoney.com/api/suggest/get",
+      "params": {
+        "input": "白酒Ⅱ",
+        "type": "14",
+        "count": "5"
+      },
+      "http_status": 200,
+      "content_type": "application/json",
+      "bytes": 361,
+      "sha256": "b0ce66528cb2e9008a313cd7a8bc6b2aca1da2d7887a5accf62d9a5e32fdfc38",
+      "raw_file": "em_industry_pe_step2_suggest.raw",
+      "data_date": null,
+      "requested_at": "2026-11-10T20:45:43+08:00",
+      "depends_on": "em_industry_pe_step1_stock"
+    },
+    {
+      "key": "em_industry_pe_step3_ulist",
+      "source": "eastmoney",
+      "interface": "行业PE 第3步：板块 → 动态PE（f9，放大100倍）",
+      "status": "CAPTURED",
+      "url": "https://push2.eastmoney.com/api/qt/ulist.np/get",
+      "params": {
+        "secids": "90.BK1277",
+        "fields": "f12,f14,f9"
+      },
+      "http_status": 200,
+      "content_type": "application/json; charset=UTF-8",
+      "bytes": 143,
+      "sha256": "38b67a24dc7bf72499ee0482783eb1ab76f37b9a22ff7f745d66352c10974051",
+      "raw_file": "em_industry_pe_step3_ulist.raw",
+      "data_date": null,
+      "requested_at": "2026-11-10T20:45:43+08:00",
+      "depends_on": "em_industry_pe_step2_suggest"
+    },
+    {
+      "key": "tencent_index_kline_sh000001",
+      "source": "tencent",
+      "interface": "web.ifzq fqkline 指数日K（sh000001, qfq）",
+      "status": "CAPTURED",
+      "url": "http://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+      "params": {
+        "param": "sh000001,day,2026-09-01,2026-11-10,30,qfq"
+      },
+      "http_status": 200,
+      "content_type": "text/html; charset=UTF-8",
+      "bytes": 3942,
+      "sha256": "5b1a913d07b7280c02f86d62781c362a0902524edb5e2c265ce70b1baafde114",
+      "raw_file": "tencent_index_kline_sh000001.raw",
+      "data_date": "2026-11-10",
+      "requested_at": "2026-11-10T20:44:49+08:00",
+      "depends_on": null
+    }
+  ]
+}

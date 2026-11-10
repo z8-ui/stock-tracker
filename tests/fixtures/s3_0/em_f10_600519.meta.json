@@ -1,0 +1,41 @@
+{
+  "key": "em_f10_600519",
+  "source": "eastmoney",
+  "interface": "datacenter-web F10 主要财务指标（RPT_F10_FINANCE_MAINFINADATA）",
+  "method": "GET",
+  "url": "https://datacenter-web.eastmoney.com/api/data/v1/get",
+  "params": {
+    "reportName": "RPT_F10_FINANCE_MAINFINADATA",
+    "columns": "ALL",
+    "filter": "(SECUCODE=\"600519.SH\")",
+    "pageNumber": "1",
+    "pageSize": "1",
+    "sortColumns": "REPORT_DATE",
+    "sortTypes": "-1"
+  },
+  "headers": {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Referer": "https://data.eastmoney.com/"
+  },
+  "source_ref": "data_service.py:920-929",
+  "note": "columns=ALL 字段极多，只记录用到的字段",
+  "depends_on": null,
+  "requested_at": "2026-11-10T20:44:48+08:00",
+  "http_status": 200,
+  "content_type": "text/plain;charset=UTF-8",
+  "content_encoding": "",
+  "bytes": 4299,
+  "sha256": "5a5f3881febccdff9a7c38df1382dcb300301fd9c66c7e278e791df0f87e7ebe",
+  "elapsed_ms": 267,
+  "final_url": "https://datacenter-web.eastmoney.com/api/data/v1/get?reportName=RPT_F10_FINANCE_MAINFINADATA&columns=ALL&filter=%28SECUCODE%3D%22600519.SH%22%29&pageNumber=1&pageSize=1&sortColumns=REPORT_DATE&sortTypes=-1",
+  "redirect_chain": [],
+  "raw_file": "em_f10_600519.raw",
+  "status": "CAPTURED",
+  "derived": {
+    "row_count": 1,
+    "data_date": "2026-09-30",
+    "report_name": "2026三季报"
+  },
+  "data_date": "2026-09-30",
+  "finished_at": "2026-11-10T20:44:48+08:00"
+}

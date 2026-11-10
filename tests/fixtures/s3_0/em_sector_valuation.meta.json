@@ -1,0 +1,53 @@
+{
+  "key": "em_sector_valuation",
+  "source": "eastmoney",
+  "interface": "push2 clist 行业板块估值（fields=f14,f2,f3,f9,f20,f23,f25,f37）",
+  "method": "GET",
+  "url": "https://push2.eastmoney.com/api/qt/clist/get",
+  "params": {
+    "pn": "1",
+    "pz": "60",
+    "po": "1",
+    "np": "1",
+    "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+    "fltt": "2",
+    "invt": "2",
+    "fid": "f3",
+    "fs": "m:90+t:2",
+    "fields": "f14,f2,f3,f9,f20,f23,f25,f37"
+  },
+  "headers": {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Referer": "https://data.eastmoney.com/"
+  },
+  "source_ref": "data_service.py:1327-1331",
+  "note": "f9=动态PE f23=PB f20=总市值(元) f25/f37 目前未使用，先留证",
+  "depends_on": null,
+  "requested_at": "2026-11-10T20:44:48+08:00",
+  "http_status": 200,
+  "content_type": "application/json; charset=UTF-8",
+  "content_encoding": "gzip",
+  "bytes": 6686,
+  "sha256": "82ca265d441e0d3a2c56ec6d4d0763cedc5d1f4d72637fe82c6b5514740a530f",
+  "elapsed_ms": 511,
+  "final_url": "https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=60&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&fid=f3&fs=m%3A90%2Bt%3A2&fields=f14%2Cf2%2Cf3%2Cf9%2Cf20%2Cf23%2Cf25%2Cf37",
+  "redirect_chain": [],
+  "raw_file": "em_sector_valuation.raw",
+  "status": "CAPTURED",
+  "derived": {
+    "row_count": 60,
+    "data_date": null,
+    "sample_row_keys": [
+      "f14",
+      "f2",
+      "f20",
+      "f23",
+      "f25",
+      "f3",
+      "f37",
+      "f9"
+    ]
+  },
+  "data_date": null,
+  "finished_at": "2026-11-10T20:44:48+08:00"
+}
