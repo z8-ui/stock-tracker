@@ -345,7 +345,8 @@ def _has_valid_data(data):
     return True
 
 
-def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force=False):
+def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force=False,
+                trace=None):
     """统一的缓存读写（SWR + single-flight + 数据标注注入）
 
     cache_key:    字符串标识
@@ -354,6 +355,9 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
     source:       数据源名称（如 "tencent"/"eastmoney"），注入返回数据
     ttl:          内存缓存秒数（默认 _IN_MEMORY_TTL）
     force:        为 True 时跳过全部缓存，强制同步拉取并写回缓存（手动更新按钮用）
+    trace:        可选 dict；本函数在**实际决定返回数据的那条路径**里写入
+                  {"served": "network|memory|stale|file|file_fallback|none"}，
+                  调用方据此判断"这次是从哪拿到的"，不用靠调用前的缓存状态去猜。
 
     行为：
     - 交易时段：TTL 内命中内存直接返回；过期先返回旧数据并后台重建（SWR）；
@@ -365,6 +369,12 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
     status, is_trading = _market_status()
     ttl = ttl or _IN_MEMORY_TTL
     now = time.time()
+
+    def _mark(where):
+        """记录本次实际返回来源（只在真正返回的路径上调一次）。"""
+        if trace is not None:
+            trace["served"] = where
+        return where
 
     def _inject(value, asof):
         if isinstance(value, dict):
@@ -437,9 +447,11 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
         _bump("miss")
         fresh = _timed_fetch()
         if _ok(fresh):
+            _mark("network")
             return _inject(_store(fresh), now)
         cached = _file_cache()
         if cached is not None:
+            _mark("file")
             return cached
         return fresh
 
@@ -448,12 +460,14 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
         # 1) 新鲜内存 → 直接返回
         if mem and (now - mem["time"]) < ttl:
             _bump("hit")
+            _mark("memory")
             return _inject(mem["data"], mem["time"])
         # 2) 过期内存 → SWR：先返回旧数据，后台异步重建
         if mem:
             _bump("stale_served")
             _bump("refresh")
             _spawn_refresh(cache_key, _timed_fetch, validate_fn)
+            _mark("stale")
             return _inject(mem["data"], mem["time"])
         # 3) 无内存 → single-flight 同步构建（并发只建一次，检查+注册原子化）
         evt, other = _inflight_acquire(cache_key)
@@ -464,6 +478,7 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
             mem = _IN_MEMORY_CACHE.get(cache_key)
             if mem:
                 _bump("hit")
+                _mark("memory")      # 等别人构建完再读内存 = 内存命中，不是读文件
                 return _inject(mem["data"], mem["time"])
             cached = _file_cache()
             if cached is not None:
@@ -473,16 +488,20 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
             _bump("miss")
             fresh = _timed_fetch()
             if _ok(fresh):
+                _mark("network")
                 return _inject(_store(fresh), now)
             # 构建失败（含网络异常）→ 文件缓存兜底
             cached = _file_cache()
             if cached is not None:
+                _mark("file_fallback")
                 return cached
             return fresh
         except Exception:
             # 抓取抛异常（超时/连接失败）不能把整个请求打成 500：
             # 有旧缓存就返回旧缓存（带 _stale），没有就返回 None 让路由给"暂无数据"
             cached = _file_cache()
+            if cached is not None:
+                _mark("file_fallback")
             return cached if cached is not None else None
         finally:
             _inflight_release(cache_key, evt)
@@ -492,6 +511,7 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
     # 注意：缓存值可能是 list（板块资金流），list 没有 _stale 字段，不能直接 .get()
     if cached is not None and not (isinstance(cached, dict) and cached.get("_stale")):
         _bump("closed_served")
+        _mark("file")
         return cached
     # 无缓存，或缓存已经旧到不能代表"最近一次收盘"（例如停在两个月前）：
     # 先尝试抓一次；抓到就存，抓不到才退回旧缓存并保留 _stale 标记。
@@ -500,7 +520,10 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
     except Exception:
         fresh = None
     if _ok(fresh):
+        _mark("network")
         return _inject(_store(fresh), now)
+    if cached is not None:
+        _mark("file")
     return cached if cached is not None else fresh
 
 
@@ -779,25 +802,10 @@ def _note_quote_attempt(stock_code, ok, reason=""):
     _QUOTE_ATTEMPT[stock_code] = {"ok": bool(ok), "ts": time.time(), "reason": reason}
 
 
-def _classify_served(call_state, mem_ts_before, data, trading):
-    """判定这次返回的数据来自哪一层 —— 不能靠"上次抓取成功"来推断。
-
-    call_state["sync_fetch"] 只由**本次调用线程**写入（None=没抓 / True=抓到 / False=抓失败），
-    后台 SWR 线程的抓取结果不算"本次"，避免把旧数据标成实时。
-    """
-    if not isinstance(data, dict) or not data:
-        return "none"
-    sync = call_state.get("sync_fetch")
-    if sync is True:
-        return "network"
-    if sync is False:
-        return "file_fallback"        # 本次抓取失败，返回的是文件缓存
-    if not trading:
-        return "file"                 # 休市：直接读盘（定格快照）
-    age = data.get("_age_sec")
-    if age is not None and age >= QUOTE_CACHE_TTL:
-        return "memory_stale"         # SWR：先给旧值，后台重建
-    return "memory" if mem_ts_before is not None else "file"
+def _served_from_trace(trace):
+    """读取 _cached_get 记录的实际来源；内部用词 stale → 对外 memory_stale。"""
+    where = (trace or {}).get("served") or "none"
+    return "memory_stale" if where == "stale" else where
 
 
 def quote_cache_meta(stock_code):
@@ -822,10 +830,9 @@ def quote_cache_meta(stock_code):
         status = "live"
     elif served_from in ("memory", "memory_stale", "file", "file_fallback"):
         status = "cached"
-    elif meta["asof"] is None:
-        status = "unavailable" if last_status == "failed" else "unknown"
     else:
-        status = "cached"
+        # 本次没有返回任何数据：历史 _LAST_SUCCESS（asof）不能证明"现在有缓存可用"
+        status = "unavailable" if last_status == "failed" else "unknown"
     reason = ""
     if last_status == "failed" and attempt:
         reason = attempt["reason"]
@@ -851,48 +858,33 @@ def get_stock_quote(stock_code) -> dict | None:
     """
     key = f"quote_{stock_code}"
     provider = _providers.get("tencent_quote")
-    caller = threading.current_thread()
-    call_state: dict = {"sync_fetch": None}      # 只由本次调用线程写入
+    trace: dict = {}                        # _cached_get 写入本次真实来源
 
     def _fetch():
         parts = _tencent_quote(stock_code)
         if not parts:
             _note_quote_attempt(stock_code, False, "上游无数据")
-            if threading.current_thread() is caller:
-                call_state["sync_fetch"] = False
             return None
         try:
             quote = provider.parse_quote(parts, stock_code)
         except Exception as e:                      # 截断/字段不合法 → 不可用，不缓存
             _note_quote_attempt(stock_code, False, f"{type(e).__name__}: {str(e)[:120]}")
-            if threading.current_thread() is caller:
-                call_state["sync_fetch"] = False
             return None
         # 价格缺失/为 0 不是"有效行情"：宁可接口失败，也别让页面显示 0.00 元
-        if quote["price"] <= 0:
-            _note_quote_attempt(stock_code, False, "价格无效（<=0）")
-            if threading.current_thread() is caller:
-                call_state["sync_fetch"] = False
+        if quote.get("price") is None or quote["price"] <= 0:
+            _note_quote_attempt(stock_code, False, "价格无效（空或 <=0）")
             return None
         _note_quote_attempt(stock_code, True)
-        if threading.current_thread() is caller:
-            call_state["sync_fetch"] = True
         return quote
 
-    mem_before = _IN_MEMORY_CACHE.get(key)
-    mem_ts_before = mem_before["time"] if mem_before else None
-    _, trading = _market_status()
-
-    data = _cached_get(key, _fetch, source="tencent_quote", ttl=QUOTE_CACHE_TTL)
-    served = _classify_served(call_state, mem_ts_before, data, trading)
-    _QUOTE_SERVED[stock_code] = {"from": served, "ts": time.time()}
+    data = _cached_get(key, _fetch, source="tencent_quote", ttl=QUOTE_CACHE_TTL, trace=trace)
+    _QUOTE_SERVED[stock_code] = {"from": _served_from_trace(trace), "ts": time.time()}
 
     if not isinstance(data, dict) or not data:
         return None
-    # 只投影 18 个契约字段：_asof/_stale/_market_status 等缓存标注不外泄
-    text_fields = ("name", "code")
-    return {f: (data.get(f) if f in text_fields else (data.get(f) or 0))
-            for f in provider.QUOTE_FIELDS}
+    # 只投影 18 个契约字段：_asof/_stale/_market_status 等缓存标注不外泄；
+    # 空值保持 None（"源没给"≠0），不在这里二次补零
+    return {f: data.get(f) for f in provider.QUOTE_FIELDS}
 
 
 # ==============================================================
@@ -946,7 +938,9 @@ def get_stock_real_money_flow(stock_code):
     quote = get_stock_quote(stock_code)
     if not quote:
         return None
-    turnover_yi = max(quote.get("turnover", 0.1), 0.01)  # 亿元
+    # 成交额缺失 ≠ 0：没有分母就不给比例（None），不再用 max(..., 0.01) 造一个有效百分比。
+    # 完整的"停牌 0 成交额"口径统一留给 S3-2，这里只保证空值不冒充 0。
+    turnover_yi = quote.get("turnover")
 
     result = _providers.call("eastmoney_flow", mode="today", code=stock_code)
     if not result.ok():
@@ -957,7 +951,9 @@ def get_stock_real_money_flow(stock_code):
         return round(v / 1e8, 2)
 
     def pct(v):
-        return round(v / (turnover_yi * 1e8) * 100, 2) if turnover_yi > 0 else 0
+        if turnover_yi is None or turnover_yi <= 0:
+            return None
+        return round(v / (max(turnover_yi, 0.01) * 1e8) * 100, 2)
 
     return {
         "main_force": yi(amounts["main_force"]),
@@ -1123,13 +1119,14 @@ def get_stock_valuation(stock_code, refresh=False):
     if not quote:
         return None
 
-    pe = quote.get("pe", 0) or 0
-    pb = quote.get("pb", 0) or 0
+    pe = quote.get("pe")
+    pb = quote.get("pb")
     ind = get_industry_pe(stock_code, refresh=refresh)
     industry_pe = ind["pe"]
     industry_name = ind.get("industry", "未知")
 
-    if pe > 0 and industry_pe:
+    pe_missing = pe is None or pe <= 0
+    if not pe_missing and industry_pe:
         deviation_pe = round((pe - industry_pe) / industry_pe * 100, 1)
         level = "偏高" if deviation_pe > 20 else ("偏低" if deviation_pe < -20 else "合理")
         reason = ""
@@ -1139,12 +1136,12 @@ def get_stock_valuation(stock_code, refresh=False):
         level = "数据不可用"
         available = False
         reason = ("PE 缺失（亏损股 / 停牌 / 行情源未返回），无法计算估值偏离"
-                  if pe <= 0 else "行业 PE 不可用（未取到实时板块 PE，且该股票不在静态表内），无法计算偏离度")
+                  if pe_missing else "行业 PE 不可用（未取到实时板块 PE，且该股票不在静态表内），无法计算偏离度")
 
     result = {
-        "pe": round(pe, 2) if pe > 0 else None,
-        "pb": round(pb, 2) if pb else 0,
-        "pe_ttm": round(pe, 2) if pe > 0 else None,
+        "pe": round(pe, 2) if not pe_missing else None,
+        "pb": round(pb, 2) if pb is not None else None,
+        "pe_ttm": round(pe, 2) if not pe_missing else None,
         # 腾讯行情 f39 本身就是市盈率(TTM)，与 pe 同源同口径，这里显式说明，避免被当成两个独立指标
         "pe_ttm_note": "与 PE 同源（腾讯行情 f39 = 市盈率TTM），非独立口径",
         "industry_pe": industry_pe,
@@ -1315,8 +1312,8 @@ def estimate_intrinsic_value(stock_quote):
        改成一个独立的 pe_reference（相对 PE 参考估值），明确标注不是财报口径
     3. 行业 PE 拿不到就 available=False，不再有"默认 25 倍"
     """
-    pe = stock_quote.get("pe", 0) or 0
-    price = stock_quote.get("price", 0)
+    pe = stock_quote.get("pe")
+    price = stock_quote.get("price")
     code = stock_quote.get("code", "")
 
     ind = get_industry_pe(code)
@@ -1357,7 +1354,7 @@ def estimate_intrinsic_value(stock_quote):
 
     # 相对 PE 参考：个股 PE 回归行业 PE 时的理论价，用途是"横向比较"，不是内在价值
     pe_reference = None
-    if pe > 0 and price and industry_pe:
+    if pe is not None and pe > 0 and price and industry_pe:
         pe_reference = {
             "available": True,
             "value": round(price * industry_pe / pe, 2),
@@ -1381,7 +1378,7 @@ def estimate_intrinsic_value(stock_quote):
         return {
             "price": price, "intrinsic_value": None, "gap": None,
             "available": False, "reason": reason,
-            "pe": round(pe, 2) if pe > 0 else None,
+            "pe": round(pe, 2) if pe is not None and pe > 0 else None,
             "industry_pe": industry_pe, "industry_name": industry_name,
             "industry_pe_source": ind.get("source", "unknown"),
             "industry_pe_is_static": bool(ind.get("is_static")),
@@ -1396,7 +1393,7 @@ def estimate_intrinsic_value(stock_quote):
         "price": price, "intrinsic_value": intrinsic,
         "gap": round((price - intrinsic) / intrinsic * 100, 1) if intrinsic else None,
         "available": True, "reason": "",
-        "pe": round(pe, 2) if pe > 0 else None,
+        "pe": round(pe, 2) if pe is not None and pe > 0 else None,
         "industry_pe": industry_pe,
         "industry_name": industry_name,
         "industry_pe_source": ind.get("source", "unknown"),

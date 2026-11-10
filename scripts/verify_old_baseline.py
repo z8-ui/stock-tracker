@@ -104,7 +104,8 @@ def main():
             print(f"  ✗ 副本独有的守卫（不允许）：{s}")
 
     print()
-    print("结论：" + ("逐行一致，未添加/删除任何边界判断" if bad == 0 else f"发现 {bad} 处不一致"))
+    print("结论：" + ("字段取值表达式与 len(parts) 守卫一致（不是整函数 AST 级逐行比对）"
+                     if bad == 0 else f"发现 {bad} 处不一致"))
     return 1 if bad else 0
 
 

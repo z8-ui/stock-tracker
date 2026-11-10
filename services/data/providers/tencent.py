@@ -20,7 +20,8 @@ from ..base import Provider
 from ..exceptions import ProviderEmpty, ProviderNetworkError, ProviderFormatError, ProviderTimeout
 from ..normalizers import split_tencent_snapshot, parse_trade_time, market_prefix
 
-# 腾讯快照至少这么多字段才够解析（调用方用到的最大下标是 48）
+# 传输层门槛（历史值，保持不动）：少于 51 个片段就当报文明显被截断、连请求都不该算成功。
+# 注意它**不是**解析门槛 —— 18 个业务字段真正要读到下标 57，见下方 REQUIRED_PARTS。
 MIN_PARTS = 51
 
 UA = {"User-Agent": "Mozilla/5.0"}
@@ -98,14 +99,21 @@ class TencentQuoteProvider(Provider):
         "amplitude", "pe", "pb", "market_cap", "high_52w", "low_52w",
     )
 
-    def parse_quote(self, parts, code):
-        """把 ~ 快照解析成 18 字段业务字典；缺必需字段/非数字都抛 ProviderFormatError。
+    # 结构性必需的业务字段：为空/缺失即"没有行情"，不是"值未知"
+    # （其余数值字段为空 → None，交由上层与前端显示"--"）
+    REQUIRED_NUMERIC = ("price",)
 
-        与迁移前（`git show 0f7afe1:data_service.py`）的差别只有两处，都是**收紧**：
-          1. 报文少于 REQUIRED_PARTS(58) 直接失败 —— 旧实现在 51~57 字段时会把
-             成交额等字段静默补 0，产出"看起来正常"的行情，这正是截断报文混入的路径；
-          2. 字段有值但不是数字时抛异常而不是被 `except:` 吞成 None，
-             上层依旧得到 None，但失败原因能在 ProviderResult / record_source 里看到。
+    def parse_quote(self, parts, code):
+        """把 ~ 快照解析成 18 字段业务字典。
+
+        空值语义（本轮修正）：**空字段 ≠ 真实零值**。
+          - 字段存在但为空（`""`）→ `None`（该源没给这个值）
+          - 字段是 `"0"` → `0.0`（真实零，例如亏损股 PE=0、停牌成交额=0）
+          - 字段有值但不是数字 → `ProviderFormatError`
+          - 报文不足 REQUIRED_PARTS / 结构性必需字段（price）为空 → `ProviderFormatError`
+
+        与迁移前（`git show 0f7afe1:data_service.py`）的差别：旧实现把空字段补成 0，
+        这里改成 None；其余取值表达式与守卫完全一致（见 scripts/verify_old_baseline.py）。
         """
         if len(parts) < self.REQUIRED_PARTS:
             raise ProviderFormatError(
@@ -116,18 +124,24 @@ class TencentQuoteProvider(Provider):
         if len(parts) < 2:
             raise ProviderEmpty(self.name, "快照字段不足以解析行情", url=self.build_url(code))
 
-        def num(label, idx):
+        def num(label, idx, required=False):
             if idx >= len(parts):
                 # 理论上不可达（上面已卡 REQUIRED_PARTS），但绝不靠"补 0"蒙过去
                 raise ProviderFormatError(
                     self.name, f"缺少必需字段 {label}(下标 {idx})", url=self.build_url(code))
-            if not parts[idx]:
-                return 0.0                     # 字段存在但为空：这是"该源没给值"，不是截断
+            raw = parts[idx]
+            if raw is None or raw == "":
+                # 结构性必需（现价）为空 = 这份报文没有行情；可选字段为空 = 源没给值
+                if required:
+                    raise ProviderFormatError(
+                        self.name, f"必需字段 {label}(下标 {idx}) 为空，无法判定行情",
+                        url=self.build_url(code))
+                return None
             try:
-                return float(parts[idx])
+                return float(raw)
             except (TypeError, ValueError):
                 raise ProviderFormatError(
-                    self.name, f"{label}(下标 {idx}) 不是数字：{parts[idx]!r}",
+                    self.name, f"{label}(下标 {idx}) 不是数字：{raw!r}",
                     url=self.build_url(code))
 
         def lots(idx):
@@ -135,19 +149,22 @@ class TencentQuoteProvider(Provider):
             if idx >= len(parts):
                 raise ProviderFormatError(
                     self.name, f"缺少必需字段 volume_lots(下标 {idx})", url=self.build_url(code))
-            if not parts[idx]:
-                return 0
+            raw = parts[idx]
+            if raw is None or raw == "":
+                return None
             try:
-                return int(float(parts[idx]))
+                return int(float(raw))
             except (TypeError, ValueError):
                 raise ProviderFormatError(
-                    self.name, f"volume_lots(下标 {idx}) 不是数字：{parts[idx]!r}",
+                    self.name, f"volume_lots(下标 {idx}) 不是数字：{raw!r}",
                     url=self.build_url(code))
 
         quote = {"name": parts[1], "code": code}
         for label, idx in self.FIELD_INDEX:
-            quote[label] = num(label, idx)
+            quote[label] = num(label, idx, required=(label in self.REQUIRED_NUMERIC))
         quote["volume_lots"] = lots(6)
-        # 成交额：腾讯给"万元"，对外统一成"亿元"（1 亿 = 10000 万），保留两位
-        quote["turnover"] = round(quote["turnover"] / 10000, 2)
+        # 成交额：腾讯给"万元"，对外统一成"亿元"（1 亿 = 10000 万），保留两位；
+        # 成交额为空时保持 None —— 不要拿 None/10000 去造一个 0 亿元的"有效"成交额
+        if quote["turnover"] is not None:
+            quote["turnover"] = round(quote["turnover"] / 10000, 2)
         return {f: quote[f] for f in self.QUOTE_FIELDS}

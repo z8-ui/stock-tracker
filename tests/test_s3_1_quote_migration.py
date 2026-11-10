@@ -195,12 +195,11 @@ class TestMigrationDiff(QuoteCacheCase):
             "合成 88 字段": snapshot(),
             "刚好到解析下限（58 数据字段）": snapshot(n=59),
             "成交量小数（43845.000）": snapshot(**{"6": "43845.000"}),
-            "成交量为空": snapshot(**{"6": ""}),
-            "PE/PB 为空": snapshot(**{"39": "", "46": ""}),
-            "52 周高低缺失（字段为空）": snapshot(**{"47": "", "48": ""}),
-            "价格为 0（停牌）": snapshot(**{"3": "0"}),
+            "成交量为真实 0": snapshot(**{"6": "0"}),
             "涨跌为负": snapshot(**{"31": "-12.30", "32": "-0.84"}),
         }
+        # 注：字段为空（""）的用例不放在这里 —— 本轮把"空"改为 None（旧实现是 0.0），
+        # 差异由 TestNullSemantics 显式对照，不再混进"等价性"断言。
         provider = TencentQuoteProvider()
         for label, text in cases.items():
             with self.subTest(case=label):
@@ -368,7 +367,222 @@ class TestQuoteCache(QuoteCacheCase):
         self.assertEqual(d.quote_cache_meta("600519")["status"], "unavailable")
 
 
-# ------------------------------------------------------- 11 API 契约不变
+# ------------------------------------------------- 空值 ≠ 真实零值（本轮必改 1）
+class TestNullSemantics(QuoteCacheCase):
+    """上游没给值 → null；上游给了 "0" → 真实 0。两者不能混。"""
+
+    def _quote(self, text):
+        parts = TencentQuoteProvider().normalize(text, code="600519")[0]
+        return TencentQuoteProvider().parse_quote(parts, "600519")
+
+    def test_empty_pe_is_null_not_zero(self):
+        q = self._quote(snapshot(**{"39": ""}))
+        self.assertIsNone(q["pe"])
+        self.assertNotEqual(q["pe"], 0)
+
+    def test_empty_pb_is_null_not_zero(self):
+        q = self._quote(snapshot(**{"46": ""}))
+        self.assertIsNone(q["pb"])
+
+    def test_empty_52w_bounds_are_null(self):
+        q = self._quote(snapshot(**{"47": "", "48": ""}))
+        self.assertIsNone(q["high_52w"])
+        self.assertIsNone(q["low_52w"])
+
+    def test_empty_turnover_is_null(self):
+        q = self._quote(snapshot(**{"57": ""}))
+        self.assertIsNone(q["turnover"])
+
+    def test_empty_volume_is_null(self):
+        q = self._quote(snapshot(**{"6": ""}))
+        self.assertIsNone(q["volume_lots"])
+
+    def test_string_zero_is_a_real_zero(self):
+        q = self._quote(snapshot(**{"39": "0", "46": "0", "57": "0", "6": "0"}))
+        for f in ("pe", "pb", "turnover"):
+            self.assertEqual(q[f], 0.0, f"{f} 的 \"0\" 必须是真实 0，不是 None")
+        self.assertEqual(q["volume_lots"], 0)
+
+    def test_old_implementation_turned_empty_into_zero(self):
+        """把差异写清楚：旧实现空字段→0.0，新实现→None。这是本轮有意的语义修正。"""
+        parts = snapshot(**{"39": "", "46": "", "57": "", "6": ""}).split("~")
+        old = old_parse(parts, "600519")
+        new = self._quote(snapshot(**{"39": "", "46": "", "57": "", "6": ""}))
+        for f in ("pe", "pb", "turnover", "volume_lots"):
+            self.assertEqual(old[f], 0, f"旧实现把 {f} 补成了 0")
+            self.assertIsNone(new[f], f"新实现必须保留 null")
+
+    def test_empty_price_is_structural_failure(self):
+        """必需字段为空 = 这份报文没有行情，不是"价格未知"。"""
+        with self.assertRaises(ProviderFormatError):
+            self._quote(snapshot(**{"3": ""}))
+        with self.serve(snapshot(**{"3": ""})):
+            self.assertIsNone(d.get_stock_quote("600519"))
+
+    def test_public_function_keeps_null_and_json_shows_null(self):
+        with self.serve(snapshot(**{"39": "", "46": "", "57": ""})):
+            q = d.get_stock_quote("600519")
+        self.assertIsNone(q["pe"])
+        self.assertIsNone(q["pb"])
+        self.assertIsNone(q["turnover"])
+        payload = json.loads(json.dumps(q))
+        self.assertIsNone(payload["pe"], "JSON 里必须是 null，不能变成 0")
+        self.assertEqual(len(q), 18, "键结构不变，只是值可以是 null")
+
+    def test_valuation_handles_null_pe_and_keeps_null_pb(self):
+        quote = {"code": "600519", "price": 100.0, "pe": None, "pb": None}
+        with mock.patch.object(d, "get_stock_quote", return_value=quote), \
+             mock.patch.object(d, "get_industry_pe",
+                               return_value={"pe": 25.0, "industry": "白酒", "source": "eastmoney"}), \
+             mock.patch.object(d, "get_latest_financials", return_value=None), \
+             mock.patch.object(d, "get_policy_notes", return_value=[]):
+            v = d.get_stock_valuation("600519")
+        self.assertIsNone(v["pe"])
+        self.assertIsNone(v["pb"], "pb 缺失保持 null，不再补 0")
+        self.assertFalse(v["valuation_available"])
+        self.assertEqual(v["level"], "数据不可用")
+
+    def test_intrinsic_value_handles_null_pe(self):
+        with mock.patch.object(d, "get_industry_pe",
+                               return_value={"pe": 25.0, "industry": "白酒", "source": "eastmoney"}), \
+             mock.patch.object(d, "get_latest_financials",
+                               return_value={"eps": 1.2, "report_date": "2026-09-30"}):
+            iv = d.estimate_intrinsic_value({"code": "600519", "price": 100.0, "pe": None})
+        self.assertIsNone(iv["pe"])
+        self.assertIsNone(iv["pe_reference"], "PE 为 null 时不得算出相对 PE 参考值")
+
+    def test_real_money_flow_without_turnover_has_null_pct(self):
+        amounts = {"main_force": 1e8, "super_large": 5e7, "large": 5e7, "middle": 0, "small": 0}
+        fake = SimpleNamespace(ok=lambda: True, data={"amounts_yuan": amounts})
+        quote = {"code": "600519", "price": 1439.0, "turnover": None}
+        with mock.patch.object(d, "get_stock_quote", return_value=quote), \
+             mock.patch.object(d._providers, "call", return_value=fake):
+            out = d.get_stock_real_money_flow("600519")
+        self.assertEqual(out["main_force"], 1.0, "金额本身照常给")
+        for f in ("main_force_pct", "super_large_pct", "large_pct", "middle_pct", "small_pct"):
+            self.assertIsNone(out[f], f"{f}：没有分母就必须是 null，不是 0%，也不是 0.01 亿算出的假比例")
+
+    def test_real_money_flow_zero_turnover_is_null_not_fake_ratio(self):
+        amounts = {"main_force": 1e8, "super_large": 0, "large": 0, "middle": 0, "small": 0}
+        fake = SimpleNamespace(ok=lambda: True, data={"amounts_yuan": amounts})
+        quote = {"code": "600519", "price": 1439.0, "turnover": 0.0}
+        with mock.patch.object(d, "get_stock_quote", return_value=quote), \
+             mock.patch.object(d._providers, "call", return_value=fake):
+            out = d.get_stock_real_money_flow("600519")
+        self.assertIsNone(out["main_force_pct"],
+                          "停牌 0 成交额不得被 max(...,0.01) 放大成有效百分比")
+
+
+# --------------------------- 无数据时不得靠历史成功时间标成 cached（必改 2）
+class TestNoDataWithHistory(QuoteCacheCase):
+    def test_history_success_does_not_make_current_call_cached(self):
+        # 1) 先成功一次，留下历史 _LAST_SUCCESS
+        with self.serve():
+            d.get_stock_quote("600519")
+        self.assertEqual(d.quote_cache_meta("600519")["status"], "live")
+        self.assertIn("quote_600519", d._LAST_SUCCESS)
+
+        # 2) 清掉内存缓存 + 文件缓存（模拟缓存被清空/损坏），保留历史成功时间
+        d._IN_MEMORY_CACHE.clear()
+        d._CACHE_FILE = os.path.join(self.tmp.name, "corrupted.json")
+        with open(d._CACHE_FILE, "w", encoding="utf-8") as f:
+            f.write("{ this is not json")          # 损坏的缓存文件
+        self.assertIn("quote_600519", d._LAST_SUCCESS, "历史成功时间仍然在")
+
+        # 3) 下一次上游失败
+        with self.serve(exc=real_requests.Timeout("t")):
+            self.assertIsNone(d.get_stock_quote("600519"))
+
+        meta = d.quote_cache_meta("600519")
+        self.assertEqual(meta["served_from"], "none")
+        self.assertEqual(meta["last_fetch_status"], "failed")
+        self.assertEqual(meta["status"], "unavailable",
+                         "历史 asof 存在也不能把当前无数据说成 cached")
+
+    def test_normal_cache_paths_still_cached(self):
+        """修复不能误伤正常路径：内存/文件/降级三种来源仍标记为 cached。"""
+        with self.serve():
+            d.get_stock_quote("600519")
+            d.get_stock_quote("600519")
+        self.assertEqual(d.quote_cache_meta("600519")["status"], "cached")   # memory
+
+        d._IN_MEMORY_CACHE.clear()
+        d._market_status = lambda: ("已收盘", False)
+        with self.serve():
+            d.get_stock_quote("600519")
+        self.assertEqual(d.quote_cache_meta("600519")["status"], "cached")   # file
+
+        d._IN_MEMORY_CACHE.clear()
+        d._market_status = lambda: ("交易中", True)
+        with self.serve(exc=real_requests.Timeout("t")):
+            d.get_stock_quote("600519")
+        self.assertEqual(d.quote_cache_meta("600519")["status"], "cached")   # file_fallback
+
+
+# --------------------- 并发 single-flight：来源由 _cached_get 记录（必改 3）
+class TestConcurrentSingleFlight(QuoteCacheCase):
+    def test_waiter_is_memory_not_file(self):
+        import threading as _t
+
+        entered = _t.Event()      # A 已进入上游请求
+        release = _t.Event()      # 允许 A 返回
+        b_waiting = _t.Event()    # B 已进入 single-flight 等待
+        results = {}
+        served_log = []
+
+        text = snapshot()
+
+        def fake_get(url, **kw):
+            self.calls += 1
+            entered.set()
+            self.assertTrue(release.wait(5), "A 的上游请求必须被放行")
+            return Resp(text)
+
+        # 记录每次写入 _QUOTE_SERVED 的 (线程名, 来源)
+        real_served = d._QUOTE_SERVED
+
+        class _ServedLog(dict):
+            def __setitem__(self, k, v):
+                super().__setitem__(k, v)
+                served_log.append((_t.current_thread().name, v["from"]))
+
+        logged = _ServedLog()
+        real_acquire = d._inflight_acquire
+
+        def acquire(key):
+            evt, other = real_acquire(key)
+            if evt is None:                 # 没抢到 = 正在等待别人
+                b_waiting.set()
+            return evt, other
+
+        def run(name):
+            results[name] = d.get_stock_quote("600519")
+
+        with mock.patch.object(tp.requests, "get", side_effect=fake_get), \
+             mock.patch.object(d, "_QUOTE_SERVED", logged), \
+             mock.patch.object(d, "_inflight_acquire", side_effect=acquire):
+            a = _t.Thread(target=run, args=("A",), name="A")
+            a.start()
+            self.assertTrue(entered.wait(5), "A 必须真的发起上游请求")
+
+            b = _t.Thread(target=run, args=("B",), name="B")
+            b.start()
+            self.assertTrue(b_waiting.wait(5), "B 必须进入 single-flight 等待（不是自己去抓）")
+
+            release.set()
+            a.join(5)
+            b.join(5)
+            self.assertFalse(a.is_alive() or b.is_alive(), "两个线程都必须结束")
+
+        self.assertEqual(self.calls, 1, "并发同一只证券只允许 1 次上游请求")
+        self.assertIsNotNone(results["A"])
+        self.assertIsNotNone(results["B"])
+        self.assertEqual(results["A"], results["B"])
+
+        by_thread = dict(served_log)
+        self.assertEqual(by_thread.get("A"), "network", "A 是真正抓取的一方")
+        self.assertEqual(by_thread.get("B"), "memory",
+                         "B 等 A 写完后读内存 → memory，绝不是 file")
 class TestApiContract(QuoteCacheCase):
     def test_exactly_eighteen_fields_no_metadata_leak(self):
         with self.serve():
@@ -406,6 +620,21 @@ class TestTruncatedSnapshot(QuoteCacheCase):
                 with self.assertRaises(ProviderFormatError) as ctx:
                     TencentQuoteProvider().parse_quote(parts, "600519")
                 self.assertIn("截断", str(ctx.exception))
+
+    def test_fifty_eight_fields_boundary_is_still_rejected(self):
+        """58 个片段仍不够：片段里最后一个"字段"其实是结尾 `";` 的一部分。
+
+        也就是"58 个数据字段"需要 59 个片段才成立；58 片段 → 下标 57 不是数字，
+        旧实现会把它补成 0 当有效成交额，现在必须拒绝。
+        """
+        parts = snapshot(n=58).split("~")
+        self.assertEqual(len(parts), 58)
+        with self.assertRaises(ProviderFormatError):
+            TencentQuoteProvider().parse_quote(parts, "600519")
+        with self.serve(snapshot(n=58)):
+            self.assertIsNone(d.get_stock_quote("600519"))
+        self.assertNotIn("quote_600519", d._IN_MEMORY_CACHE)
+        self.assertNotIn("quote_600519", d._load_cache())
 
     def test_truncated_snapshot_never_becomes_quote_or_enters_cache(self):
         for n in (51, 52, 57):
