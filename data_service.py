@@ -451,7 +451,7 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
             return _inject(_store(fresh), now)
         cached = _file_cache()
         if cached is not None:
-            _mark("file")
+            _mark("file_fallback")      # 强制刷新失败 → 返回旧缓存，同样是降级
             return cached
         return fresh
 
@@ -482,6 +482,8 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
                 return _inject(mem["data"], mem["time"])
             cached = _file_cache()
             if cached is not None:
+                # 等到的是"别人没建成、只剩旧文件缓存"→ 这是降级，不是休市读盘
+                _mark("file_fallback")
                 return cached
             return None
         try:
@@ -523,7 +525,8 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
         _mark("network")
         return _inject(_store(fresh), now)
     if cached is not None:
-        _mark("file")
+        # 上游刷新没成功，退回的是旧快照：file_fallback（不是"休市直接读盘"）
+        _mark("file_fallback")
     return cached if cached is not None else fresh
 
 

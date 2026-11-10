@@ -583,6 +583,100 @@ class TestConcurrentSingleFlight(QuoteCacheCase):
         self.assertEqual(by_thread.get("A"), "network", "A 是真正抓取的一方")
         self.assertEqual(by_thread.get("B"), "memory",
                          "B 等 A 写完后读内存 → memory，绝不是 file")
+# ------------------ 文件缓存回退的来源标记（第四轮必改）
+class TestFileFallbackSource(QuoteCacheCase):
+    """file_fallback = "上游没成功，退回旧文件缓存"；file = "休市直接读盘"。"""
+
+    def test_waiter_reads_file_cache_marked_fallback(self):
+        """A 抓取失败 → B 等到的是旧文件缓存，必须记 file_fallback（不是 none/file）。"""
+        import threading as _t
+
+        self.seed_file_cache(price=1440.00)      # 预先有一份有效文件缓存
+        entered, release, b_waiting = _t.Event(), _t.Event(), _t.Event()
+        results, served_log = {}, []
+
+        def fake_get(url, **kw):
+            self.calls += 1
+            entered.set()
+            self.assertTrue(release.wait(5), "A 的上游请求必须被放行")
+            raise real_requests.Timeout("upstream down")
+
+        class _ServedLog(dict):
+            def __setitem__(self, k, v):
+                super().__setitem__(k, v)
+                served_log.append((_t.current_thread().name, v["from"]))
+
+        real_acquire = d._inflight_acquire
+
+        def acquire(key):
+            evt, other = real_acquire(key)
+            if evt is None:
+                b_waiting.set()
+            return evt, other
+
+        def run(name):
+            results[name] = d.get_stock_quote("600519")
+
+        with mock.patch.object(tp.requests, "get", side_effect=fake_get), \
+             mock.patch.object(d, "_QUOTE_SERVED", _ServedLog()), \
+             mock.patch.object(d, "_inflight_acquire", side_effect=acquire):
+            a = _t.Thread(target=run, args=("A",), name="A")
+            a.start()
+            self.assertTrue(entered.wait(5))
+            b = _t.Thread(target=run, args=("B",), name="B")
+            b.start()
+            self.assertTrue(b_waiting.wait(5), "B 必须进入 single-flight 等待")
+            release.set()
+            a.join(5)
+            b.join(5)
+            self.assertFalse(a.is_alive() or b.is_alive())
+
+        self.assertEqual(self.calls, 1, "只允许 A 打一次上游")
+        self.assertIsNotNone(results["B"], "B 应当拿到文件缓存里的有效行情")
+        self.assertEqual(results["B"]["price"], 1440.00)
+        by_thread = dict(served_log)
+        self.assertEqual(by_thread.get("B"), "file_fallback",
+                         "B 读的是旧文件缓存 → file_fallback，不能是 none")
+
+        # 状态必须与实际可用性一致：有数据就 cached，但绝不是 live
+        meta = d.quote_cache_meta("600519")
+        self.assertEqual(meta["last_fetch_status"], "failed")
+        self.assertIn(meta["status"], ("cached",))
+        self.assertNotEqual(meta["status"], "live")
+
+    def test_closed_market_stale_cache_refresh_failure_is_fallback(self):
+        """休市 + 过期文件缓存 + 刷新失败：返回旧数据，但标 file_fallback 且保留原抓取时间。"""
+        self.seed_file_cache(age_sec=30 * 86400, price=1400.00)
+        with d._CACHE_LOCK:
+            old_ts = d._load_cache()["quote_600519"]["fetched_at"]
+        old_asof = d.datetime.fromtimestamp(old_ts).strftime("%Y-%m-%d %H:%M:%S")
+        self.assertIsNotNone(old_asof)
+        d._market_status = lambda: ("已收盘", False)   # 非交易时段
+
+        with self.serve(exc=real_requests.Timeout("t")):
+            q = d.get_stock_quote("600519")
+
+        self.assertIsNotNone(q, "有旧缓存就必须返回旧数据，不能报无数据")
+        self.assertEqual(q["price"], 1400.00)
+        meta = d.quote_cache_meta("600519")
+        self.assertEqual(meta["served_from"], "file_fallback")
+        self.assertEqual(meta["last_fetch_status"], "failed")
+        self.assertEqual(meta["status"], "cached")
+        self.assertTrue(meta["is_stale"], "30 天前的快照必须标记为过期/降级")
+        self.assertEqual(meta["asof"], old_asof, "fetched_at 必须是原始抓取时间，不得伪装成现在")
+        self.assertNotEqual(meta["status"], "live")
+
+    def test_closed_market_fresh_file_cache_stays_plain_file(self):
+        """对照：休市且缓存不过期 → file（不是 fallback），本轮修复不能把两者混为一谈。"""
+        self.seed_file_cache(age_sec=60, price=1453.00)
+        d._market_status = lambda: ("已收盘", False)
+        with self.serve():
+            q = d.get_stock_quote("600519")
+        self.assertEqual(q["price"], 1453.00)
+        self.assertEqual(d.quote_cache_meta("600519")["served_from"], "file")
+        self.assertEqual(self.calls, 0, "休市读盘不应打上游")
+
+
 class TestApiContract(QuoteCacheCase):
     def test_exactly_eighteen_fields_no_metadata_leak(self):
         with self.serve():
