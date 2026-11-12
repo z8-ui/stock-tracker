@@ -984,5 +984,230 @@ class TestGroupI_CachedFinancialsGuard(unittest.TestCase):
         self.assertIn("NaN", diag["reason"])
 
 
+
+class TestGroupJ_LayeredCacheBoundaries(unittest.TestCase):
+    """J：分层淘汰与有界恢复（S3-4A r4）。
+
+    覆盖授权文档 §四 A~H：内存坏≠文件坏、过期内存坏值不同时触发 SWR+同步重抓、
+    多 key 隔离、严格 JSON 与业务回归。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        self.tmp.close()
+        os.remove(self.tmp.name)
+        self._orig_file = d._CACHE_FILE
+        d._CACHE_FILE = self.tmp.name
+        d._IN_MEMORY_CACHE.clear()
+        d._LAST_SUCCESS.clear()
+        d._IN_FLIGHT.clear()
+        self.calls = []
+
+    def tearDown(self):
+        d._CACHE_FILE = self._orig_file
+        d._IN_MEMORY_CACHE.clear()
+        d._LAST_SUCCESS.clear()
+        d._IN_FLIGHT.clear()
+        if os.path.exists(self.tmp.name):
+            os.remove(self.tmp.name)
+
+    # ---- 夹具 ----
+    def _good_fin(self, **overrides):
+        fin = dict(EastMoneyF10Provider().normalize(load_raw(), "600519")[0])
+        fin.update(overrides)
+        return fin
+
+    def _write_file_cache(self, payload):
+        with open(d._CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+
+    def _read_file_cache(self):
+        with open(d._CACHE_FILE, encoding="utf-8") as f:
+            return json.load(f)
+
+    def _preload_file(self, fin, ts=None):
+        ts = time.time() if ts is None else ts
+        self._write_file_cache({"fin_600519": {"__data": fin, "fetched_at": ts}})
+        return ts
+
+    def _preload_memory(self, fin, age_sec=0):
+        d._IN_MEMORY_CACHE["fin_600519"] = {"data": fin, "time": time.time() - age_sec}
+
+    def _provider_ok(self):
+        def call(name, *args, **kwargs):
+            self.calls.append(name)
+            return FakeF10(load_raw()).fetch(args[0])
+        return call
+
+    def _provider_fail(self):
+        def call(name, *args, **kwargs):
+            self.calls.append(name)
+            return ProviderResult(None, PROVIDER_NAME, "failed", "", 0.0, False,
+                                  {"message": "模拟上游不可用"})
+        return call
+
+    # ---- A. 非法内存 + 合法文件 ----
+    def test_invalid_memory_does_not_delete_valid_file(self):
+        ts = self._preload_file(self._good_fin())             # 文件：合法
+        self._preload_memory(self._good_fin(eps=float("inf")))  # 内存：非法
+        with mock.patch.object(d._providers, "call", side_effect=self._provider_fail()), \
+             mock.patch.object(d, "_market_status", return_value=("交易中", True)):
+            fin = d.get_latest_financials("600519")
+        self.assertIsNotNone(fin, "合法文件缓存应该被保留并返回")
+        self.assertEqual(fin["eps"], 51.53)
+        self.assertTrue(all(not isinstance(v, float) or math.isfinite(v) for v in fin.values()))
+        self.assertEqual(fin["_asof"], ts, "文件缓存的原始抓取时间不能被刷新")
+        self.assertEqual(len(self.calls), 1)
+        self.assertNotIn("fin_600519", d._IN_MEMORY_CACHE, "非法内存应被淘汰")
+        self.assertIn("fin_600519", self._read_file_cache(), "合法文件缓存不得被误删")
+
+    # ---- B. 合法内存 + 非法文件 ----
+    def test_valid_memory_not_deleted_by_invalid_file(self):
+        self._preload_file(self._good_fin(eps=float("nan")))   # 文件：非法
+        self._preload_memory(self._good_fin())                 # 内存：合法
+        with mock.patch.object(d._providers, "call", side_effect=self._provider_fail()), \
+             mock.patch.object(d, "_market_status", return_value=("交易中", True)):
+            fin = d.get_latest_financials("600519")
+        self.assertEqual(fin["eps"], 51.53)
+        self.assertEqual(self.calls, [], "命中合法内存不该请求上游")
+        self.assertIn("fin_600519", d._IN_MEMORY_CACHE, "合法内存不得被删除")
+        stored = self._read_file_cache()["fin_600519"]["__data"]["eps"]
+        self.assertTrue(math.isnan(stored), "没被读到的非法文件在本次调用中不应被改动")
+
+    # ---- C. 两层都非法 ----
+    def test_both_layers_invalid(self):
+        self._preload_file(self._good_fin(eps=float("nan")))
+        self._preload_memory(self._good_fin(eps=float("inf")))
+        quote = {"code": "600519", "price": 1500.0, "pe": 30.0}
+        with mock.patch.object(d._providers, "call", side_effect=self._provider_fail()), \
+             mock.patch.object(d, "_market_status", return_value=("交易中", True)), \
+             mock.patch.object(d, "get_industry_pe", return_value={"pe": 25.0, "industry": "白酒"}):
+            self.assertIsNone(d.get_latest_financials("600519"))
+            iv = d.estimate_intrinsic_value(quote)
+        self.assertFalse(iv["available"])
+        json.dumps(iv, allow_nan=False)
+        self.assertNotIn("fin_600519", self._read_file_cache(), "非法文件应被淘汰")
+        self.assertNotIn("fin_600519", d._IN_MEMORY_CACHE, "非法内存应被淘汰")
+        # 两次业务取数（直接取 + 内在价值内部再取）各一次上游尝试，没有额外重复请求
+        self.assertEqual(len(self.calls), 2, "两层都坏时每轮只保留一次上游尝试")
+
+    # ---- D. 过期非法内存：不得 SWR + 同步重抓 ----
+    def test_expired_invalid_memory_has_bounded_recovery(self):
+        self._preload_memory(self._good_fin(eps=float("inf")), age_sec=7 * 3600)
+        spawned = []
+        with mock.patch.object(d._providers, "call", side_effect=self._provider_fail()), \
+             mock.patch.object(d, "_market_status", return_value=("交易中", True)), \
+             mock.patch.object(d, "_spawn_refresh", side_effect=lambda *a, **k: spawned.append(a)):
+            fin = d.get_latest_financials("600519")
+        self.assertIsNone(fin)
+        self.assertEqual(len(self.calls), 1, "一次业务调用最多一次恢复请求")
+        self.assertEqual(spawned, [], "非法过期内存不得被当作 SWR 旧数据启动后台刷新")
+
+    def test_expired_invalid_memory_does_not_loop(self):
+        self._preload_memory(self._good_fin(eps=float("inf")), age_sec=7 * 3600)
+        with mock.patch.object(d._providers, "call", side_effect=self._provider_fail()), \
+             mock.patch.object(d, "_market_status", return_value=("交易中", True)):
+            for _ in range(3):
+                self.assertIsNone(d.get_latest_financials("600519"))
+        self.assertEqual(len(self.calls), 3, "每次调用一次，无内部循环放大")
+
+    # ---- E. 合法过期内存：SWR 保持原样 ----
+    def test_expired_valid_memory_still_uses_swr(self):
+        self._preload_memory(self._good_fin(), age_sec=7 * 3600)
+        spawned = []
+        with mock.patch.object(d._providers, "call", side_effect=self._provider_ok()), \
+             mock.patch.object(d, "_market_status", return_value=("交易中", True)), \
+             mock.patch.object(d, "_spawn_refresh", side_effect=lambda *a, **k: spawned.append(a)):
+            fin = d.get_latest_financials("600519")
+        self.assertEqual(fin["eps"], 51.53)
+        self.assertEqual(self.calls, [], "SWR 先返回旧数据，不该同步抓取")
+        self.assertEqual(len(spawned), 1, "合法过期内存应照旧触发一次后台刷新")
+        # 后台刷新的校验函数必须能拒掉坏数据、放行好数据
+        validate = spawned[0][2]
+        self.assertTrue(validate(self._good_fin()))
+        self.assertFalse(validate(self._good_fin(eps=float("inf"))))
+
+    def test_expired_valid_memory_refresh_updates_cache(self):
+        self._preload_memory(self._good_fin(eps=1.0), age_sec=7 * 3600)
+        captured = {}
+        with mock.patch.object(d, "_market_status", return_value=("交易中", True)), \
+             mock.patch.object(d, "_spawn_refresh",
+                               side_effect=lambda key, fetcher, validate: captured.update(
+                                   key=key, fetcher=fetcher, validate=validate)):
+            with mock.patch.object(d._providers, "call", side_effect=self._provider_ok()):
+                d.get_latest_financials("600519")
+                fresh = captured["fetcher"]()          # 模拟后台刷新真正抓取
+        self.assertEqual(fresh["eps"], 51.53)
+        self.assertTrue(captured["validate"](fresh))
+
+    # ---- F. 刷新成功 / 失败 / 恢复 ----
+    def test_invalid_cache_then_failure_then_recovery(self):
+        self._preload_file(self._good_fin(eps=float("inf")))
+        with mock.patch.object(d._providers, "call", side_effect=self._provider_fail()), \
+             mock.patch.object(d, "_market_status", return_value=("已收盘", False)):
+            self.assertIsNone(d.get_latest_financials("600519"))
+        with mock.patch.object(d._providers, "call", side_effect=self._provider_ok()), \
+             mock.patch.object(d, "_market_status", return_value=("已收盘", False)):
+            recovered = d.get_latest_financials("600519")
+        self.assertEqual(recovered["eps"], 51.53)
+        calls_before = len(self.calls)
+        with mock.patch.object(d._providers, "call", side_effect=self._provider_fail()), \
+             mock.patch.object(d, "_market_status", return_value=("已收盘", False)):
+            again = d.get_latest_financials("600519")
+        self.assertEqual(again["eps"], 51.53, "恢复后应命中缓存，不再依赖上游")
+        self.assertEqual(len(self.calls), calls_before)
+
+    # ---- G. 多 key 隔离 ----
+    def test_other_keys_and_stocks_untouched(self):
+        good_other = self._good_fin(eps=1.94)
+        self._write_file_cache({
+            "fin_600519": {"__data": self._good_fin(eps=float("inf")), "fetched_at": time.time()},
+            "fin_000001": {"__data": good_other, "fetched_at": time.time()},
+            "sector_flow": {"__data": [{"name": "板块A", "flow": 1.0}], "fetched_at": time.time()},
+            "__data_meta__": {"fin_000001": {"completeness": "complete"}},
+        })
+        with mock.patch.object(d._providers, "call", side_effect=self._provider_fail()), \
+             mock.patch.object(d, "_market_status", return_value=("已收盘", False)):
+            self.assertIsNone(d.get_latest_financials("600519"))
+            other = d.get_latest_financials("000001")
+        disk = self._read_file_cache()
+        self.assertNotIn("fin_600519", disk)
+        self.assertIn("fin_000001", disk)
+        self.assertIn("sector_flow", disk)
+        self.assertIn("__data_meta__", disk)
+        self.assertEqual(other["eps"], 1.94)
+        self.assertEqual(self.calls, ["eastmoney_f10"], "合法股票不该触发上游")
+
+    # ---- H. 严格 JSON 与业务回归 ----
+    def test_business_fields_unchanged_after_guard(self):
+        fin = self._good_fin()
+        self._preload_file(fin)
+        with mock.patch.object(d._providers, "call",
+                               side_effect=AssertionError("合法缓存不该请求上游")), \
+             mock.patch.object(d, "_market_status", return_value=("已收盘", False)):
+            got = d.get_latest_financials("600519")
+        self.assertEqual(sorted(got.keys() & set(k for k, _, _ in FIELD_MAP)),
+                         sorted([k for k, _, _ in FIELD_MAP]))
+        self.assertEqual(got["bps"], 216.949629787912)
+        self.assertEqual(got["revenue"], 133283652508.95)
+        self.assertEqual(got["notice_date"], "2026-10-31")
+
+    def test_zero_none_and_intrinsic_not_infinite(self):
+        for override in ({"eps": 0}, {"eps": None}, {"notice_date": None}):
+            self._preload_file(self._good_fin(**override))
+            with mock.patch.object(d._providers, "call",
+                                   side_effect=AssertionError("合法缓存不该请求上游")), \
+                 mock.patch.object(d, "_market_status", return_value=("已收盘", False)):
+                got = d.get_latest_financials("600519")
+            self.assertIsNotNone(got, str(override))
+        quote = {"code": "600519", "price": 1500.0, "pe": 30.0}
+        with mock.patch.object(d._providers, "call", side_effect=self._provider_ok()), \
+             mock.patch.object(d, "_market_status", return_value=("已收盘", False)), \
+             mock.patch.object(d, "get_industry_pe", return_value={"pe": 25.0, "industry": "白酒"}):
+            iv = d.estimate_intrinsic_value(quote)
+        json.dumps(iv, allow_nan=False)
+        self.assertTrue(math.isfinite(iv["intrinsic_value"]))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

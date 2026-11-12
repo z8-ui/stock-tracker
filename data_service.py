@@ -1439,14 +1439,19 @@ INDUSTRY_PE_MAP = {
 }
 
 
-# ---- S3-4A r3：F10 财报缓存的数值真实性闸门 -------------------------------
+# ---- S3-4A r3/r4：F10 财报缓存的数值真实性与分层安全 ---------------------
 # Provider 只保证"这次网络抓到的"是有限值。历史 _data_cache.json 或进程内缓存里的
 # 旧条目不会再经过 normalize()：一份 eps=inf 的旧财报照样会被读出来，估值侧就会得到
 # available=True、内在价值 inf、偏离度 nan，严格 JSON 序列化直接抛错。
-# 所以出缓存之后必须再验一次，并且把坏条目就地淘汰、最多重抓一次（不做无限重试）。
+#
+# r4 修正两个边界（GPT 复审）：
+#   1. 内存坏 ≠ 文件坏。旧实现"发现坏值就两层全删"，会把一份合法文件缓存一起误删。
+#      现在按层判定：哪一层坏了删哪一层，另一层不动。
+#   2. 过期内存坏值不能既被当 SWR 旧数据启动后台刷新、又被同步强制重抓。
+#      现在进 _cached_get 之前先把明显非法的内存条目摘掉，同一轮只有一次恢复请求。
 _F10_NUMERIC_FIELDS = ("eps", "bps", "revenue", "revenue_yoy",
                        "net_profit", "profit_yoy", "roe")
-_FIN_LAST_DIAG = {}     # code -> {"status","reason"}；S3-4B 页面状态呈现的预留侧通道
+_FIN_LAST_DIAG = {}     # code -> 最近一次 F10 取数状态（仅供排查/S3-4B 设计参考）
 
 
 def _fin_values_finite(fin):
@@ -1467,35 +1472,45 @@ def _fin_values_finite(fin):
     return True
 
 
-def _drop_fin_cache(stock_code):
-    """只淘汰 fin_{code}：内存条目 + _LAST_SUCCESS + 文件缓存里的这一个 key。
+def _fin_memory_invalid(stock_code):
+    """内存里那条 F10 是否存在且非法（不存在 → False，不构成问题）。"""
+    entry = _IN_MEMORY_CACHE.get(f"fin_{stock_code}")
+    if not isinstance(entry, dict):
+        return False
+    return not _fin_values_finite(entry.get("data"))
 
-    不碰其它 key、不整份清空 _data_cache.json、不动板块缓存与其旁路元数据。
-    返回 True 表示确实删掉了东西（文件或内存）。
-    """
+
+def _drop_fin_memory(stock_code):
+    """只淘汰内存条目（含它自己的 _LAST_SUCCESS 时间）。文件缓存一个字不动。"""
     key = f"fin_{stock_code}"
-    removed = False
     with _CACHE_LOCK:
-        if _IN_MEMORY_CACHE.pop(key, None) is not None:
-            removed = True
+        had = _IN_MEMORY_CACHE.pop(key, None) is not None
         _LAST_SUCCESS.pop(key, None)
+    return had
+
+
+def _drop_fin_file(stock_code):
+    """只淘汰 _data_cache.json 里的 fin_{code}（及其旁路元数据）。内存不动。"""
+    key = f"fin_{stock_code}"
+    with _CACHE_LOCK:
         cache = _load_cache()
-        if key in cache:
-            cache.pop(key, None)
-            meta_store = cache.get(_META_NAMESPACE)
-            if isinstance(meta_store, dict):
-                meta_store.pop(key, None)
-                if not meta_store:
-                    cache.pop(_META_NAMESPACE, None)
-            _save_cache(cache)
-            removed = True
-    return removed
+        if key not in cache:
+            return False
+        cache.pop(key, None)
+        meta_store = cache.get(_META_NAMESPACE)
+        if isinstance(meta_store, dict):
+            meta_store.pop(key, None)
+            if not meta_store:
+                cache.pop(_META_NAMESPACE, None)
+        _save_cache(cache)
+    return True
 
 
 def get_financials_diagnostic(stock_code):
-    """最近一次 F10 取数的状态（ok / empty / failed / cache_rejected）。
+    """最近一次 F10 取数状态（ok / cache_hit / empty / failed / cache_rejected）。
 
-    S3-4B 页面状态呈现预留：不改变 get_latest_financials() 的返回值契约。
+    ⚠️ 只是排查用的模块级最新值，不具备逐请求绑定：并发或连续调用会被后一次覆盖。
+    S3-4B 做页面状态时必须按"本次请求的来源与实际返回值"现场生成，不能直接拿这个当状态源。
     """
     return dict(_FIN_LAST_DIAG.get(stock_code) or {})
 
@@ -1517,6 +1532,8 @@ def get_latest_financials(stock_code, refresh=False):
     + RPT_F10_FINANCE_MAINFINADATA）。改接口请改 Provider，不要复制到这里。
     """
     key = f"fin_{stock_code}"
+    diag = {"status": "pending", "reason": "", "cache_reason": "",
+            "served": None, "cache_rejected": False}
 
     def fetch():
         # S3-4A：请求/市场后缀/字段解析全部在 EastMoneyF10Provider 里，
@@ -1525,53 +1542,70 @@ def get_latest_financials(stock_code, refresh=False):
         if not result.ok():
             # empty（没有财报）与 failed（接口/结构异常）在 Provider 层已区分，
             # 但旧契约两者都返回 None；状态不塞进十字段 dict，避免估值代码把状态当财报。
-            _FIN_LAST_DIAG[stock_code] = {
-                "status": result.status,
-                "reason": (result.error or {}).get("message", ""),
-            }
+            diag["status"] = result.status
+            diag["reason"] = (result.error or {}).get("message", "")
             return None
-        _FIN_LAST_DIAG[stock_code] = {"status": "ok", "reason": ""}
+        diag["status"] = "ok"
         return result.data
 
     def read(force=False):
-        # validate_fn 同时作用于新抓取结果与后台刷新结果（_cached_get / _spawn_refresh
-        # 都走同一个校验），所以非有限财报不会被写进缓存。
-        return _cached_get(key, fetch, validate_fn=_fin_values_finite,
-                           source="eastmoney", ttl=6 * 3600, force=force)
+        trace = {}
+        value = _cached_get(key, fetch, validate_fn=_fin_values_finite,
+                            source="eastmoney", ttl=6 * 3600, force=force,
+                            trace=trace)
+        diag["served"] = trace.get("served")
+        return value
+
+    # 进缓存层之前先摘掉"明显非法的内存条目"：
+    # 它不能当 SWR 旧数据（否则会先起一个后台刷新），也不该挡住后面那份合法文件缓存。
+    if _fin_memory_invalid(stock_code):
+        _drop_fin_memory(stock_code)
+        diag["cache_rejected"] = True
+        diag["cache_reason"] = "内存缓存中的财报含 NaN/Infinity，已淘汰内存条目"
 
     fin = read(force=refresh)
+
     if fin is not None and not _fin_values_finite(fin):
-        # 命中了一条坏缓存（历史落盘 / 老进程内存）：淘汰这一条后强制重抓一次。
-        _drop_fin_cache(stock_code)
-        _FIN_LAST_DIAG[stock_code] = {
-            "status": "cache_rejected",
-            "reason": "缓存中的财报含 NaN/Infinity，已淘汰并重抓",
-            "cache_rejected": True,
-        }
+        # 走到这里说明坏值来自文件缓存（内存已预检），只删文件那一层，内存/其它 key 不动。
+        served = diag.get("served")
+        if served in ("memory", "stale"):
+            _drop_fin_memory(stock_code)
+        else:
+            _drop_fin_file(stock_code)
+        diag["cache_rejected"] = True
+        diag["cache_reason"] = f"缓存中的财报含 NaN/Infinity（来源 {served}），已淘汰该层"
+        if served == "file_fallback":
+            # 本轮上游刚刚已经失败过一次，坏文件只是兜底数据：淘汰即可，不再重复请求
+            diag["status"] = "failed"
+            diag["reason"] = f"{diag['cache_reason']}；本轮上游已失败，不再重试"
+            _FIN_LAST_DIAG[stock_code] = dict(diag)
+            return None
+        diag["cache_reason"] = f"{diag['cache_reason']}并重抓一次"
         fin = read(force=True)
         if fin is not None and not _fin_values_finite(fin):
             # 重抓拿回来的仍然不可用：宁可不给财报，也不能把非法值送进估值模型
-            _FIN_LAST_DIAG[stock_code] = {
-                "status": "cache_rejected",
-                "reason": "重抓后财报仍含 NaN/Infinity，拒绝返回",
-                "cache_rejected": True,
-            }
+            diag["status"] = "cache_rejected"
+            diag["reason"] = (diag["cache_reason"] + "；重抓后仍含 NaN/Infinity，拒绝返回").strip("；")
+            _FIN_LAST_DIAG[stock_code] = dict(diag)
             return None
-        if fin is None:
-            # 重抓也失败：状态以"本次失败"为准，但保留"缓存曾含非法值"这个事实
-            upstream = (_FIN_LAST_DIAG.get(stock_code) or {}).get("reason") or "上游不可用"
-            _FIN_LAST_DIAG[stock_code] = {
-                "status": "failed",
-                "reason": f"缓存中的财报含 NaN/Infinity，已淘汰；重抓未取得有效财报（{upstream}）",
-                "cache_rejected": True,
-            }
-        else:
-            _FIN_LAST_DIAG[stock_code] = {
-                "status": "ok",
-                "reason": "缓存中的财报含 NaN/Infinity，已重抓替换",
-                "cache_rejected": True,
-            }
-    return fin
+
+    if fin is not None:
+        if diag["status"] != "ok":
+            diag["status"] = "ok" if diag.get("served") == "network" else "cache_hit"
+        if diag["cache_reason"]:
+            diag["reason"] = diag["cache_reason"]
+        _FIN_LAST_DIAG[stock_code] = dict(diag)
+        return fin
+
+    # 没拿到财报：状态以 Provider 结果为准（empty / failed），并保留缓存曾被拒的事实
+    if diag["status"] == "pending":
+        diag["status"] = "failed"
+    if diag["cache_reason"]:
+        diag["reason"] = f"{diag['cache_reason']}；本次未取得财报（{diag['reason'] or '上游不可用'}）"
+    elif not diag["reason"]:
+        diag["reason"] = "本次未取得财报"
+    _FIN_LAST_DIAG[stock_code] = dict(diag)
+    return None
 
 
 def get_industry_pe(stock_code, refresh=False):
