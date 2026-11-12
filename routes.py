@@ -54,6 +54,28 @@ DATA_HEADER_NAMES = (
 )
 
 
+def _staleness_from_meta(meta, cm):
+    """JSON 的 is_stale 与 X-Data-Freshness 必须同源（S3-3B r1）。
+
+    语义：is_stale = 本次返回的这份数据**不能被当作新鲜可用**。
+      - 本次抓上游失败、退回旧缓存（file_fallback）→ stale，并给出明确原因；
+      - 元数据可信但已过期 → stale；
+      - 无法确认新鲜度（元数据缺失/不可信/没落盘）→ stale（不知道就不能说新鲜）；
+      - 其余按 cache_meta 的年龄口径。
+    返回 (is_stale, reason)，键名与旧 JSON 完全一致，只是取值不再与 Headers 矛盾。
+    """
+    cm = cm or {}
+    reason = cm.get("reason") or ""
+    if meta.get("served_from") == "file_fallback":
+        return True, "上游抓取失败，返回旧缓存（本次未拿到新数据）"
+    fresh = meta.get("freshness")
+    if fresh == "stale":
+        return True, reason or "缓存已过期"
+    if fresh != "fresh":
+        return True, reason or "缺少可信元数据，无法确认新鲜度"
+    return bool(cm.get("is_stale")), reason
+
+
 def _attach_data_headers(resp, meta):
     """把 data_meta() 的结果写进响应头（失败响应也写，方便前端区分"接口挂了"和"数据不全"）。"""
     meta = meta or {}
@@ -219,16 +241,18 @@ def api_heatmap():
     trace = {}
     sectors = get_sector_flow(trace=trace)
     chart = build_heatmap_chart(sectors)
-    meta = data_meta("sector_flow", served_from=trace.get("served"), trace=trace)
+    meta = data_meta("sector_flow", served_from=trace.get("served"), trace=trace,
+                     data=sectors)
     if chart:
         # 附加市场状态
         from data_service import _market_status as _ms
         status, _ = _ms()
         is_mock = any(bool(s.get("is_mock")) for s in (sectors or []) if isinstance(s, dict))
         cm = cache_meta("sector_flow")
+        is_stale, stale_reason = _staleness_from_meta(meta, cm)
         resp = jsonify({"code": 200, "data": chart, "_market_status": status,
-                        "is_mock": is_mock, "is_stale": cm["is_stale"],
-                        "asof": cm["asof"], "stale_reason": cm["reason"]})
+                        "is_mock": is_mock, "is_stale": is_stale,
+                        "asof": cm["asof"], "stale_reason": stale_reason})
         return _attach_data_headers(resp, meta)
     if sectors is None:
         resp = jsonify({"code": 500, "msg": "暂无板块资金数据（接口未返回，未启用模拟兜底）"})
@@ -456,7 +480,8 @@ def api_sector_valuation():
     """板块估值数据（JSON 结构不变；三维度与行数走 X-Data-* 响应头）"""
     trace = {}
     data = get_sector_valuation(trace=trace)
-    meta = data_meta("sector_valuation", served_from=trace.get("served"), trace=trace)
+    meta = data_meta("sector_valuation", served_from=trace.get("served"), trace=trace,
+                     data=data)
     if data:
         is_mock = any(bool(s.get("is_mock")) for s in data if isinstance(s, dict))
         resp = jsonify({"code": 200, "data": data, "is_mock": is_mock})

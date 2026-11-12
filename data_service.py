@@ -51,6 +51,9 @@ def _save_cache(cache_dict):
 
     注意：写单 key 请用 _cache_update()。整份覆盖只适合"我已经持有最新全量快照"的场景，
     否则并发下会把别人刚写进去的 key 覆盖掉。
+
+    返回 True/False：写盘成功与否必须能被调用方识别（S3-3B r1）。
+    失败时旧文件保持原样（tmp + atomic replace），不会破坏已有合法缓存。
     """
     try:
         with _CACHE_LOCK:
@@ -58,11 +61,12 @@ def _save_cache(cache_dict):
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(cache_dict, f, ensure_ascii=False, indent=2)
             os.replace(tmp, _CACHE_FILE)
-    except:
-        pass
+        return True
+    except Exception:
+        return False
 
 
-def _cache_update(cache_key, data, fetched_at, meta=None):
+def _cache_update(cache_key, data, fetched_at, meta=None, drop_meta=False):
     """只更新一个 key：读-改-写全程持锁。
 
     修复的问题：原实现的 _cached_get 在请求开始时 _load_cache() 拿一份快照，
@@ -72,17 +76,28 @@ def _cache_update(cache_key, data, fetched_at, meta=None):
     S3-3B：可选 `meta`（旁路元数据）与数据在**同一次**读-改-写里落盘，
     避免"数据已更新、元数据还是旧的"被当成完整数据。业务数据本身的信封
     `{"__data": ..., "fetched_at": ...}` 一个字都不变。
+
+    S3-3B r1：
+      - `meta=None, drop_meta=True` → 同一次更新里删掉该 key 的旧元数据。
+        元数据生成失败时必须走这里，否则"新数据 + 旧元数据"可能因内容相同而继续被信任。
+      - 返回写盘结果（True/False）。失败时内存可能已更新、磁盘仍是旧数据，
+        调用方必须据此把本次响应的完整性降级为 unknown。
     """
     with _CACHE_LOCK:
         cache = _load_cache()
         cache[cache_key] = {"__data": data, "fetched_at": fetched_at}
+        store = cache.get(_META_NAMESPACE)
+        if not isinstance(store, dict):
+            store = {}
         if meta is not None:
-            store = cache.get(_META_NAMESPACE)
-            if not isinstance(store, dict):
-                store = {}
             store[cache_key] = meta
+        elif drop_meta:
+            store.pop(cache_key, None)
+        if store:
             cache[_META_NAMESPACE] = store
-        _save_cache(cache)
+        elif _META_NAMESPACE in cache:
+            cache.pop(_META_NAMESPACE, None)
+        return _save_cache(cache)
 
 
 # ==============================================================
@@ -148,41 +163,78 @@ def _freshness_of(fetched_at, served_from):
     return "fresh" if age <= limit else "stale"
 
 
-def data_meta(cache_key, served_from=None, trace=None):
+def _meta_trust(record, data, fetched_at):
+    """元数据可信性判定 —— 唯一入口，data_meta 与 _needs_legacy_migration 共用。
+
+    返回：
+      ok          可信
+      missing     没有元数据
+      schema      版本不认识（不能拿当前规则解释旧/新格式）
+      mismatch    data_hash 与当前数据不一致
+      fetched_at  元数据不是这一轮抓取的（时间对不上 / 缺时间）
+
+    r1 复审新增后两条：只比 hash 不够 —— 同样内容的两轮抓取 hash 相同，
+    但完整性可能已经从 complete 变成 partial，不能继续复用旧结论。
+    """
+    if not isinstance(record, dict):
+        return "missing"
+    if record.get("schema") != _META_SCHEMA:
+        return "schema"
+    if not record.get("data_hash") or record.get("data_hash") != _fingerprint(data):
+        return "mismatch"
+    rec_ts = record.get("fetched_at")
+    if rec_ts is None or fetched_at is None:
+        return "fetched_at"
+    try:
+        if abs(float(rec_ts) - float(fetched_at)) > 1e-6:
+            return "fetched_at"
+    except (TypeError, ValueError):
+        return "fetched_at"
+    return "ok"
+
+
+def data_meta(cache_key, served_from=None, trace=None, data=None):
     """S3-3B：把持久化旁路元数据 + 当前缓存数据合成对外三维度。
 
     返回字段（缺信息一律 unknown，绝不默认 complete）：
-      meta_status    ok / missing / mismatch / orphan
-      fetch_status   success / failed / not_attempted / unknown
+      meta_status    ok / missing / schema / mismatch / fetched_at / orphan / not_persisted
+      fetch_status   success / failed / empty / not_attempted / unknown
       completeness   complete / partial / unknown
       freshness      fresh / stale / unknown
       rows/total     int 或 None（未知）
-      missing        缺失项（分页号、duplicates:N、meta:hash_mismatch…）
+      missing        缺失项（分页号、duplicates:N、meta:* 等）
       fetched_at     epoch（本地抓取时刻，不是交易所时间）
       asof           上游数据时间；上游不提供时 "unknown"
       served_from    本次请求的数据来源（由 _cached_get 的 trace 传入）
 
+    参数：
+      data   本次**实际返回**的业务数据（r1）。写盘失败时磁盘还是旧数据，
+             只有传进来才能保证 Headers 描述的是本次真正返回的这份数据。
+      trace  _cached_get 的来源记录：fetch_failed / fetch_empty / persisted。
+
     `served_from == "file_fallback"` 表示本次抓上游失败、退回旧数据：
     freshness 必须是 stale，fetch_status 记本次失败（failed）。
-    `trace` 为 _cached_get 的来源记录；带 fetch_failed=True 时同样记 failed。
     """
-    data, fetched_at = _cache_payload(cache_key)
+    persisted, persisted_at = _cache_payload(cache_key)
     record = _meta_record(cache_key)
     served = served_from or "none"
+    trace = trace or {}
+    served_data = data if data is not None else persisted
     out = {
         "cache_key": cache_key,
         "meta_status": "missing",
         "fetch_status": "unknown",
         "completeness": "unknown",
         "freshness": "unknown",
-        "rows": len(data) if isinstance(data, (list, dict)) else (1 if data is not None else None),
+        "rows": (len(served_data) if isinstance(served_data, (list, dict))
+                 else (1 if served_data is not None else None)),
         "total": None,
         "missing": [],
         "missing_pages": [],
         "notes": [],
         "duplicates": 0,
-        "fetched_at": fetched_at,
-        "fetched_at_iso": _fmt_ts(fetched_at) if fetched_at else None,
+        "fetched_at": persisted_at,
+        "fetched_at_iso": _fmt_ts(persisted_at) if persisted_at else None,
         "asof": "unknown",
         "source": "",
         "served_from": served,
@@ -190,36 +242,45 @@ def data_meta(cache_key, served_from=None, trace=None):
         "data_hash": None,
     }
 
-    if data is None:
+    if served_data is None:
         out["rows"] = None
         out["meta_status"] = "orphan" if record else "missing"
-        if (trace or {}).get("fetch_failed"):
+        if trace.get("fetch_failed"):
             out["fetch_status"] = "failed"      # 本次确实打了上游、并且失败了
-        elif (trace or {}).get("fetch_empty"):
+        elif trace.get("fetch_empty"):
             out["fetch_status"] = "empty"       # 接口成功，但确实没有数据（≠ 接口挂了）
         return out
 
-    fingerprint = _fingerprint(data)
-    out["data_hash"] = fingerprint
+    out["data_hash"] = _fingerprint(served_data)
 
-    if record is None:
-        # 旧缓存（S3-3A 及以前写入）：没有可信元数据 → 全部 unknown，绝不猜"完整"。
-        # 唯一例外是"本次抓取失败后退回旧数据"：新鲜度必须 stale、抓取结果必须 failed。
+    # ---- r1：写盘失败 → 磁盘上没有能描述这份数据的记录，完整性/新鲜度一律 unknown ----
+    if data is not None and trace.get("persisted") is False:
+        out["meta_status"] = "not_persisted"
+        out["missing"] = ["meta:not_persisted"]
+        if trace.get("fetch_failed"):
+            out["fetch_status"] = "failed"
+        elif trace.get("fetch_empty"):
+            out["fetch_status"] = "empty"
+        elif served == "network":
+            out["fetch_status"] = "success"     # 抓取本身成功，只是没能落盘
+        return out
+
+    status = _meta_trust(record, served_data, persisted_at)
+    if status != "ok":
+        out["meta_status"] = status
+        out["missing"] = {
+            "mismatch": ["meta:hash_mismatch"],
+            "fetched_at": ["meta:fetched_at_mismatch"],
+            "schema": ["meta:schema_unsupported"],
+        }.get(status, [])
+        # 本次抓取失败后退回旧数据：新鲜度与抓取结果必须如实反映降级
         if served == "file_fallback":
             out["freshness"] = "stale"
             out["fetch_status"] = "failed"
         return out
 
-    if record.get("data_hash") != fingerprint:
-        # 数据被改写（或元数据描述的是另一份数据）→ 旧元数据不得冒充当前状态
-        out["meta_status"] = "mismatch"
-        out["missing"] = ["meta:hash_mismatch"]
-        if served == "file_fallback":
-            out["freshness"] = "stale"
-            out["fetch_status"] = "failed"
-        return out
-
-    rows = len(data)
+    record = record if isinstance(record, dict) else {}
+    rows = len(served_data)
     completeness = str(record.get("completeness") or "unknown")
     total = record.get("total")
     if completeness == "complete" and (total is None or rows != total):
@@ -235,7 +296,7 @@ def data_meta(cache_key, served_from=None, trace=None):
         "missing_pages": list(record.get("missing_pages") or []),
         "notes": [str(n) for n in (record.get("notes") or [])],
         "duplicates": int(record.get("duplicates") or 0),
-        "fetched_at": record.get("fetched_at") or fetched_at,
+        "fetched_at": record.get("fetched_at") or persisted_at,
         "asof": (str(record.get("asof") or "").strip() or "unknown"),
         "source": record.get("source") or "",
         "is_mock": bool(record.get("is_mock")),
@@ -429,13 +490,16 @@ def _spawn_refresh(cache_key, fetcher, validate_fn, meta_fn=None):
                 with _CACHE_LOCK:
                     _IN_MEMORY_CACHE[cache_key] = {"data": fresh, "time": ts}
                     _LAST_SUCCESS[cache_key] = ts
-                meta = None
+                meta, meta_failed = None, False
                 if meta_fn is not None:
                     try:
                         meta = meta_fn(fresh, ts)
                     except Exception:
                         meta = None
-                _cache_update(cache_key, fresh, ts, meta=meta)
+                    if not isinstance(meta, dict) or not meta:
+                        meta, meta_failed = None, True
+                _cache_update(cache_key, fresh, ts, meta=meta,
+                              drop_meta=meta_failed)
         except Exception:
             pass          # 后台刷新失败不影响前台：旧内存/文件缓存原样保留
         finally:
@@ -589,15 +653,21 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
         _IN_MEMORY_CACHE[cache_key] = {"data": value, "time": ts}
         _LAST_SUCCESS[cache_key] = ts
         # 旁路元数据与业务数据同一次落盘（S3-3B）；生成失败也不能影响主流程，
-        # 只是这份数据下次读到时因为"没有可信元数据"而降级成 unknown。
-        meta = None
+        # 但必须**同一次**把旧元数据删掉 —— 否则"新数据 + 旧元数据"可能因内容
+        # 相同（hash 相同）继续被当成可信，把旧的 complete 复用到新一轮数据上（r1）。
+        meta, meta_failed = None, False
         if meta_fn is not None:
             try:
                 meta = meta_fn(value, ts)
             except Exception:
                 meta = None
+            if not isinstance(meta, dict) or not meta:
+                meta, meta_failed = None, True
         # 落盘结构与 _spawn_refresh 完全一致：{"__data": ..., "fetched_at": ...}
-        _cache_update(cache_key, value, ts, meta=meta)
+        persisted = _cache_update(cache_key, value, ts, meta=meta,
+                                  drop_meta=meta_failed)
+        if trace is not None:
+            trace["persisted"] = bool(persisted)
         return value
 
     def _file_cache():
@@ -948,12 +1018,13 @@ def _needs_legacy_migration(cache_key):
     判据只有一条：**有没有与当前数据哈希绑定的可信元数据**。
     刷新失败时调用方仍会退回旧数据，只是如实标 unknown/stale（见 data_meta）。
     """
-    data, _ = _cache_payload(cache_key)
+    data, fetched_at = _cache_payload(cache_key)
     if data is None:
         return False
-    record = _meta_record(cache_key)
-    if record and record.get("data_hash") == _fingerprint(data):
-        return False                      # 元数据齐全且绑定当前数据 → 不需要迁移
+    # r1：与 data_meta 用**同一套**可信性规则（schema + hash + fetched_at），
+    # 不能只比 hash —— 否则 schema 不对/时间对不上的旧元数据会让迁移永远不触发。
+    if _meta_trust(_meta_record(cache_key), data, fetched_at) == "ok":
+        return False                      # 元数据可信且绑定当前数据 → 不需要迁移
     last = _LEGACY_MIGRATION_AT.get(cache_key)
     if last is not None and (time.time() - last) < LEGACY_MIGRATION_INTERVAL:
         return False                      # 冷却中：避免每个请求都打一遍 5 页上游
@@ -1032,7 +1103,7 @@ def _sector_cached_get(cache_key, mode, ttl, trace=None):
         return _sector_meta_from(captured.get("res"), value, ts, cache_key, mode)
 
     def _finish(out):
-        """Provider 内部把异常转成 failed 状态，不会往上抛 —— 
+        """Provider 内部把异常转成 failed 状态，不会往上抛 ——
         所以"这次到底成没成"要从 ProviderResult 回填到 trace，供 Headers 使用。"""
         if out is None and trace is not None:
             res = captured.get("res")
