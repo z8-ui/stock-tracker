@@ -33,9 +33,10 @@ GET https://datacenter-web.eastmoney.com/api/data/v1/get
 | net_profit | PARENTNETPROFIT | 归母净利润（元） |
 | profit_yoy | PARENTNETPROFITTZ | 净利润同比（%） |
 | roe | ROEJQ | 净资产收益率（%） |
-| notice_date | NOTICE_DATE | 披露日期，取前 10 位 |
+| notice_date | NOTICE_DATE | 披露日期，取前 10 位；**可缺失**（→ None），非法仍失败 |
 
 不 round、不换单位、不补零；null 保持 None，真实 0 保持 0。
+NaN / Infinity / -Infinity / 溢出（"1e309"）不是财务数据，直接 failed，不做任何替换。
 
 ## 状态语义
 
@@ -45,7 +46,10 @@ GET https://datacenter-web.eastmoney.com/api/data/v1/get
   与 failed 严格区分：empty 不能当失败重试，失败也不能当"没财报"。
 - `failed`（ProviderTimeout / ProviderNetworkError / ProviderFormatError）：
   HTTP 非 200、超时、连接失败、JSON 非法、`result` 缺失或非对象、
-  `result.data` 不是列表、`data[0]` 不是对象、必需日期字段缺失或不可解析、数值字段不可解析。
+  `result.data` 不是列表、`data[0]` 不是对象、REPORT_DATE 缺失或不可解析、
+  数值字段不可解析或非有限（NaN/Infinity）、NOTICE_DATE 非空但非法。
+注：NOTICE_DATE 缺失（null / "" / "-"）**不算失败**，返回 None，十个字段结构不变；
+  它不是 EPS/营收/利润的必要条件，旧实现也只是给空字符串。
 
 错误信息带 `field=XXX`，能直接定位到哪一个原始字段（例如 `field=REPORT_DATE`）。
 
@@ -57,6 +61,7 @@ GET https://datacenter-web.eastmoney.com/api/data/v1/get
 """
 
 import datetime as _dt
+import math
 
 import requests
 
@@ -89,20 +94,29 @@ FIELD_MAP = (
     ("net_profit", "PARENTNETPROFIT", "num"),
     ("profit_yoy", "PARENTNETPROFITTZ", "num"),
     ("roe", "ROEJQ", "num"),
-    ("notice_date", "NOTICE_DATE", "date"),
+    ("notice_date", "NOTICE_DATE", "date_opt"),
 )
 
 DASHES = ("-", "--", "—")
 
 
-def _date_field(row, field):
-    """日期字段：必须是合法日期，取前 10 位（YYYY-MM-DD）。缺失/非法 → ProviderFormatError。"""
+def _date_field(row, field, required=True):
+    """日期字段：合法日期取前 10 位（YYYY-MM-DD）。
+
+    required=True（REPORT_DATE）：缺失/空/非法一律 ProviderFormatError —— 没有报告期就没有财报。
+    required=False（NOTICE_DATE）：缺失（null / "" / "-" / "--"）返回 None，财报照常成功；
+        但**非空且非法**仍然报错，不拿 REPORT_DATE 或今天顶替。
+    """
     value = row.get(field)
     if value is None:
-        raise ProviderFormatError(PROVIDER_NAME, f"field={field} 缺失（null）")
+        if required:
+            raise ProviderFormatError(PROVIDER_NAME, f"field={field} 缺失（null）")
+        return None
     text = str(value).strip()
     if not text or text in DASHES:
-        raise ProviderFormatError(PROVIDER_NAME, f"field={field} 为空：{value!r}")
+        if required:
+            raise ProviderFormatError(PROVIDER_NAME, f"field={field} 为空：{value!r}")
+        return None
     day = text[:10]
     try:
         _dt.date.fromisoformat(day)
@@ -112,22 +126,33 @@ def _date_field(row, field):
 
 
 def _num_field(row, field):
-    """数值字段：null → None；真实 0 → 0；不 round、不换单位；不可解析 → ProviderFormatError。"""
+    """数值字段：null → None；真实 0 → 0；不 round、不换单位。
+
+    NaN / Infinity / -Infinity / 溢出（"1e309"）一律 ProviderFormatError：
+    非有限值不是财务数据，一旦放行会变成「available=True、内在价值=inf、偏离度=nan」，
+    既污染估值也会让严格 JSON 序列化直接报错。不改成 0，也不给默认值。
+    """
     value = row.get(field)
     if value is None:
         return None
     if isinstance(value, bool):          # bool 是 int 的子类，别把 True 当 1
         raise ProviderFormatError(PROVIDER_NAME, f"field={field} 是布尔值：{value!r}")
     if isinstance(value, (int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ProviderFormatError(PROVIDER_NAME, f"field={field} 不是有限数值：{value!r}")
         return value                     # 原样返回，保持上游精度
     if isinstance(value, str):
         text = value.strip().replace(",", "")
         if not text or text in DASHES or text.lower() in ("null", "none"):
             return None
         try:
-            return int(text) if text.lstrip("+-").isdigit() else float(text)
+            num = int(text) if text.lstrip("+-").isdigit() else float(text)
         except ValueError:
             raise ProviderFormatError(PROVIDER_NAME, f"field={field} 不可解析：{value!r}")
+        if isinstance(num, float) and not math.isfinite(num):
+            raise ProviderFormatError(
+                PROVIDER_NAME, f"field={field} 不是有限数值：{value!r}（解析为 {num!r}）")
+        return num
     raise ProviderFormatError(PROVIDER_NAME, f"field={field} 类型不支持：{type(value).__name__}")
 
 
@@ -205,7 +230,9 @@ class EastMoneyF10Provider(Provider):
         data = {}
         for name, field, kind in FIELD_MAP:
             if kind == "date":
-                data[name] = _date_field(row, field)
+                data[name] = _date_field(row, field, required=True)
+            elif kind == "date_opt":
+                data[name] = _date_field(row, field, required=False)
             elif kind == "text":
                 value = row.get(field)
                 data[name] = "" if value is None else str(value)

@@ -13,10 +13,13 @@
   F  业务回归：financials 结构、内在价值（正常/0/负/None/无财报/失败）、HTTP 接口 200
 """
 
+import copy
 import json
+import math
 import os
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -594,6 +597,198 @@ class TestGroupF_BusinessRegression(unittest.TestCase):
             rv = client.get("/api/valuation?code=600519")
         self.assertEqual(rv.status_code, 200)
         self.assertEqual(rv.get_json()["code"], 200)
+
+
+def mutate(**overrides):
+    """真实报文的深拷贝副本（原 fixture 不动），按业务/原始字段名覆盖 data[0]。"""
+    raw = copy.deepcopy(load_raw())
+    row = raw["result"]["data"][0]
+    for key, value in overrides.items():
+        row[_BIZ_TO_F10.get(key, key)] = value
+    return raw
+
+
+class TestGroupG_NonFiniteValues(unittest.TestCase):
+    """G：NaN / Infinity / -Infinity / 溢出 一律 failed，不做任何替换。"""
+
+    def _fetch(self, **overrides):
+        prov = FakeF10(mutate(**overrides))
+        return prov.fetch("600519")
+
+    def test_nan_string_fails(self):
+        res = self._fetch(eps="NaN")
+        self.assertEqual(res.status, "failed")
+        self.assertEqual(res.error["type"], "ProviderFormatError")
+        self.assertIn("field=EPSJB", res.error["message"])
+
+    def test_infinity_string_fails(self):
+        res = self._fetch(eps="Infinity")
+        self.assertEqual(res.status, "failed")
+        self.assertIn("field=EPSJB", res.error["message"])
+
+    def test_negative_infinity_string_fails(self):
+        res = self._fetch(eps="-Infinity")
+        self.assertEqual(res.status, "failed")
+        self.assertIn("field=EPSJB", res.error["message"])
+
+    def test_overflow_string_fails(self):
+        res = self._fetch(eps="1e309")
+        self.assertEqual(res.status, "failed")
+        self.assertIn("field=EPSJB", res.error["message"])
+
+    def test_float_nan_fails(self):
+        res = self._fetch(eps=float("nan"))
+        self.assertEqual(res.status, "failed")
+        self.assertIn("field=EPSJB", res.error["message"])
+
+    def test_float_inf_fails(self):
+        res = self._fetch(eps=float("inf"))
+        self.assertEqual(res.status, "failed")
+        self.assertIn("field=EPSJB", res.error["message"])
+
+    def test_other_numeric_fields_fail(self):
+        for field_name in ("TOTALOPERATEREVE", "PARENTNETPROFIT", "BPS", "ROEJQ"):
+            value = "NaN" if field_name == "TOTALOPERATEREVE" else "Infinity"
+            res = self._fetch(**{field_name: value})
+            self.assertEqual(res.status, "failed", field_name)
+            self.assertIn(f"field={field_name}", res.error["message"], field_name)
+
+    def test_zero_stays_zero(self):
+        res = self._fetch(eps=0)
+        self.assertEqual(res.status, "success")
+        self.assertEqual(res.data["eps"], 0)
+        self.assertIsInstance(res.data["eps"], int)
+
+    def test_null_stays_none(self):
+        res = self._fetch(eps=None)
+        self.assertEqual(res.status, "success")
+        self.assertIsNone(res.data["eps"])
+
+    def test_finite_values_keep_precision(self):
+        res = self._fetch(eps=51.53, bps=216.949629787912)
+        self.assertEqual(res.status, "success")
+        self.assertEqual(res.data["eps"], 51.53)
+        self.assertEqual(res.data["bps"], 216.949629787912)
+
+    def test_real_fixture_unaffected(self):
+        res = FakeF10(load_raw()).fetch("600519")
+        self.assertEqual(res.status, "success")
+        self.assertTrue(all(not isinstance(v, float) or math.isfinite(v)
+                            for v in res.data.values()))
+
+    def test_nonfinite_eps_never_becomes_intrinsic_value(self):
+        """端到端：非有限 EPS 不得产 available=True / inf / nan 的估值。"""
+        tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        tmp.close()
+        os.remove(tmp.name)
+        orig = d._CACHE_FILE
+        d._CACHE_FILE = tmp.name
+        d._IN_MEMORY_CACHE.clear()
+        d._LAST_SUCCESS.clear()
+
+        def provider_call(name, *args, **kwargs):
+            return FakeF10(mutate(eps="Infinity")).fetch(args[0])
+
+        quote = {"code": "600519", "price": 1500.0, "pe": 30.0, "pb": 8.0, "name": "贵州茅台"}
+        try:
+            with mock.patch.object(d._providers, "call", side_effect=provider_call), \
+                 mock.patch.object(d, "_market_status", return_value=("已收盘", False)), \
+                 mock.patch.object(d, "get_industry_pe",
+                                   return_value={"pe": 25.0, "industry": "白酒"}):
+                self.assertIsNone(d.get_latest_financials("600519"), "非有限值不得当成功财报")
+                iv = d.estimate_intrinsic_value(quote)
+        finally:
+            d._CACHE_FILE = orig
+            d._IN_MEMORY_CACHE.clear()
+            d._LAST_SUCCESS.clear()
+            if os.path.exists(tmp.name):
+                os.remove(tmp.name)
+
+        self.assertFalse(iv["available"])
+        self.assertIsNone(iv["intrinsic_value"])
+        self.assertIsNone(iv["model_params"]["raw_eps"])
+        payload = json.dumps(iv)              # 严格序列化：不允许 inf/nan 逃逸
+        self.assertNotIn("Infinity", payload)
+
+
+class TestGroupH_OptionalNoticeDate(unittest.TestCase):
+    """H：NOTICE_DATE 可缺失；REPORT_DATE 仍然强制。"""
+
+    def _fetch(self, **overrides):
+        return FakeF10(mutate(**overrides)).fetch("600519")
+
+    def test_both_dates_normal(self):
+        res = self._fetch()
+        self.assertEqual(res.status, "success")
+        self.assertEqual(res.data["report_date"], "2026-09-30")
+        self.assertEqual(res.data["notice_date"], "2026-10-31")
+
+    def test_notice_null_allows_success(self):
+        res = self._fetch(notice_date=None)
+        self.assertEqual(res.status, "success")
+        self.assertIsNone(res.data["notice_date"])
+        self.assertEqual(res.data["eps"], 51.53)
+
+    def test_notice_empty_string_allows_success(self):
+        res = self._fetch(notice_date="")
+        self.assertEqual(res.status, "success")
+        self.assertIsNone(res.data["notice_date"])
+
+    def test_notice_dash_allows_success(self):
+        for dash in ("-", "--"):
+            res = self._fetch(notice_date=dash)
+            self.assertEqual(res.status, "success", dash)
+            self.assertIsNone(res.data["notice_date"], dash)
+
+    def test_notice_invalid_nonempty_still_fails(self):
+        res = self._fetch(notice_date="2026-13-01")
+        self.assertEqual(res.status, "failed")
+        self.assertIn("field=NOTICE_DATE", res.error["message"])
+
+    def test_report_date_missing_still_fails(self):
+        res = self._fetch(report_date=None)
+        self.assertEqual(res.status, "failed")
+        self.assertIn("field=REPORT_DATE", res.error["message"])
+
+    def test_report_date_invalid_still_fails(self):
+        res = self._fetch(report_date="2026-13-99 00:00:00")
+        self.assertEqual(res.status, "failed")
+        self.assertIn("field=REPORT_DATE", res.error["message"])
+
+    def test_ten_fields_kept_when_notice_missing(self):
+        res = self._fetch(notice_date=None)
+        self.assertEqual(sorted(res.data.keys()), sorted([k for k, _, _ in FIELD_MAP]))
+        self.assertEqual(len(res.data), 10)
+
+    def test_notice_missing_no_substitution(self):
+        res = self._fetch(notice_date=None)
+        self.assertIsNone(res.data["notice_date"])          # 不是 ""、不是今天、不是报告期
+        self.assertNotEqual(res.data["notice_date"], res.data["report_date"])
+
+    def test_intrinsic_value_still_works_without_notice_date(self):
+        fin = self._fetch(notice_date=None).data
+        quote = {"code": "600519", "price": 1500.0, "pe": 30.0}
+        with mock.patch.object(d, "get_industry_pe", return_value={"pe": 25.0, "industry": "白酒"}), \
+             mock.patch.object(d, "get_latest_financials", return_value=fin):
+            iv = d.estimate_intrinsic_value(quote)
+        self.assertTrue(iv["available"])
+        self.assertEqual(iv["model_params"]["raw_eps"], 51.53)
+        self.assertAlmostEqual(iv["intrinsic_value"],
+                               round(51.53 * 4 / 3, 3) * 25.0 * iv["model_params"]["safety_margin"],
+                               places=2)
+
+    def test_valuation_financials_keeps_structure(self):
+        fin = self._fetch(notice_date=None).data
+        with mock.patch.object(d, "get_stock_quote",
+                               return_value={"code": "600519", "price": 1500.0, "pe": 30.0, "pb": 8.0}), \
+             mock.patch.object(d, "get_industry_pe",
+                               return_value={"pe": 25.0, "industry": "白酒", "source": "eastmoney",
+                                             "source_label": "实时", "is_static": False}), \
+             mock.patch.object(d, "get_latest_financials", return_value=fin), \
+             mock.patch.object(d, "get_policy_notes", return_value=[]):
+            val = d.get_stock_valuation("600519")
+        self.assertEqual(sorted(val["financials"].keys()), sorted([k for k, _, _ in FIELD_MAP]))
+        self.assertIsNone(val["financials"]["notice_date"])
 
 
 if __name__ == "__main__":
