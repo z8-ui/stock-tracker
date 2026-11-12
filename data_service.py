@@ -1550,6 +1550,14 @@ def get_financials_diagnostic(stock_code):
     return dict(_FIN_LAST_DIAG.get(stock_code) or {})
 
 
+_FIN_TRACE_LOCAL = threading.local()
+
+
+def _fin_sync_trace():
+    """当前线程正在为哪个请求做同步取数（没有 → None，例如后台 SWR 线程）。"""
+    return getattr(_FIN_TRACE_LOCAL, "trace", None)
+
+
 def _fin_build_status(trace, fin):
     """把一次请求的 trace 翻译成**请求级**财报状态对象（S3-4B）。
 
@@ -1624,9 +1632,11 @@ def _fin_build_status(trace, fin):
     elif served_from == "file":
         reason = "读取本地财报快照（本进程未请求上游）"
     elif served_from == "file_fallback":
-        reason = "本次抓取失败，回退到文件缓存"
+        reason = ("本次上游未返回财报记录，回退到文件缓存（历史快照）"
+                  if fetch_status == "empty" else "本次抓取失败，回退到文件缓存")
     elif served_from == "memory_fallback":
-        reason = "本次抓取失败，回退到内存中的财报快照"
+        reason = ("本次上游未返回财报记录，回退到内存中的财报快照"
+                  if fetch_status == "empty" else "本次抓取失败，回退到内存中的财报快照")
     elif fetch_status == "empty":
         reason = "上游正常响应但没有财报记录"
     elif fetch_status == "failed":
@@ -1670,18 +1680,25 @@ def _fin_get_with_cache(stock_code, refresh, trace):
 
     def fetch():
         result = _providers.call("eastmoney_f10", stock_code)
-        if not trace.get("_closed"):
-            # 请求已结束（例如后台 SWR 后到）时仍要真抓真返回，只是不再回写状态，
-            # 否则后台刷新会拿到 None、把缓存越刷越空。
-            trace["attempts"] = trace.get("attempts", 0) + 1
-            trace["provider_status"] = result.status if not result.ok() else "success"
-            trace["provider_reason"] = (result.error or {}).get("message", "") if not result.ok() else ""
+        # 只把状态记给"当前线程正在服务的那个同步请求"。后台 SWR 线程在这里拿不到
+        # trace（thread-local 为空），因此它抓到的新财报只会走缓存更新，
+        # 绝不会把前台这次响应的 fetch_status 改成 success。
+        tl = _fin_sync_trace()
+        if tl is not None:
+            tl["attempts"] = tl.get("attempts", 0) + 1
+            tl["provider_status"] = result.status if not result.ok() else "success"
+            tl["provider_reason"] = (result.error or {}).get("message", "") if not result.ok() else ""
         return result.data if result.ok() else None
 
     def read(force=False):
         sub = {}
-        value = _cached_get(key, fetch, validate_fn=_fin_values_finite,
-                            source="eastmoney", ttl=6 * 3600, force=force, trace=sub)
+        prev = getattr(_FIN_TRACE_LOCAL, "trace", None)
+        _FIN_TRACE_LOCAL.trace = trace          # 只在本线程、本次同步读期间有效
+        try:
+            value = _cached_get(key, fetch, validate_fn=_fin_values_finite,
+                                source="eastmoney", ttl=6 * 3600, force=force, trace=sub)
+        finally:
+            _FIN_TRACE_LOCAL.trace = prev
         trace["served"] = sub.get("served")
         return value
 
@@ -1724,7 +1741,10 @@ def _fin_get_with_cache(stock_code, refresh, trace):
         stock_code, "本次未取得新的财报，回退到内存中的财报快照（非本次网络结果）")
     if fb is not None:
         trace["served"] = "memory_fallback"
-        trace["reason"] = (str(trace.get("cache_reason") or "") + "；已回退到内存中的合法财报快照").strip("；")
+        if trace.get("cache_reason"):
+            trace["reason"] = f"{trace['cache_reason']}；已回退到内存中的合法财报快照"
+        # 没有缓存淘汰时不要在这里写 reason：交给 _fin_build_status 按
+        # empty / failed 分别生成（上游没返回财报 ≠ 抓取失败）
         return fb
 
     if trace.get("cache_reason"):

@@ -68,6 +68,22 @@ const invalid = st.view({fetch_status: 'failed', served_from: 'none', cache_reje
 check('cache rejected kind', invalid.kind, 'invalid');
 check('cache rejected message', invalid.message, '财报缓存数据无效，当前无法展示');
 
+// 7b. empty + fallback 与 failed + fallback 必须说两件事
+const fbEmptyFile = st.view({fetch_status: 'empty', served_from: 'file_fallback', freshness: 'stale'});
+const fbEmptyMem = st.view({fetch_status: 'empty', served_from: 'memory_fallback', freshness: 'stale'});
+const fbFailedFile = st.view({fetch_status: 'failed', served_from: 'file_fallback', freshness: 'stale'});
+const fbFailedMem = st.view({fetch_status: 'failed', served_from: 'memory_fallback', freshness: 'stale'});
+check('empty+file_fallback 文案', fbEmptyFile.message, '本次上游未返回财报记录，当前展示此前保存的财报快照。');
+check('empty+memory_fallback 文案与 file 一致', fbEmptyMem.message, fbEmptyFile.message);
+check('failed+file_fallback 文案', fbFailedFile.message, '本次财报获取失败，当前展示的是此前保存的财报（非本次抓取结果）');
+check('failed+memory_fallback 文案与 file 一致', fbFailedMem.message, fbFailedFile.message);
+checkTrue('empty 回退文案不含"获取失败"', fbEmptyFile.message.indexOf('获取失败') < 0);
+checkTrue('failed 回退文案不含"未返回财报记录"', fbFailedFile.message.indexOf('未返回财报记录') < 0);
+checkTrue('两种回退文案必须不同', fbEmptyFile.message !== fbFailedFile.message);
+checkTrue('empty 回退标记 empty_upstream', fbEmptyFile.empty_upstream === true);
+checkTrue('failed 回退不标记 empty_upstream', fbFailedFile.empty_upstream === false);
+checkTrue('两种回退都标降级', fbEmptyFile.degraded === true && fbFailedFile.degraded === true);
+
 // 8. 状态缺失
 check('missing status kind', st.view(null).kind, 'unknown');
 check('missing status message', st.view(undefined).message, '财报状态未知（接口未返回状态信息）');

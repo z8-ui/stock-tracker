@@ -389,6 +389,230 @@ class TestGroupC_ValuationAndRoutes(StatusTestBase):
         self.assertIsNone(iv["financials_status"]["report_date"])
 
 
+class TestGroupE_EmptyVsFailedFallback(StatusTestBase):
+    """E：empty / failed 与三种来源的组合 —— 上游"没有财报"不是"抓取失败"。"""
+
+    def _fallback_file(self, result, refresh=True):
+        self.preload_file("600519", normalized(), age=600)
+        trace = {}
+        with self.provider(result), self.closed():
+            fin = d.get_latest_financials("600519", refresh=refresh, trace=trace)
+        return fin, trace["status"]
+
+    def _fallback_memory(self, result):
+        ts = time.time() - 3600
+        self.preload_memory("600519", normalized(), age=3600)
+        trace = {}
+        with self.provider(result), self.trading():
+            fin = d.get_latest_financials("600519", refresh=True, trace=trace)
+        return fin, trace["status"], ts
+
+    def test_empty_file_fallback(self):
+        fin, st = self._fallback_file(empty_result())
+        self.assertEqual(fin["eps"], 51.53, "合法历史财报必须保留")
+        self.assertEqual(st["fetch_status"], "empty")
+        self.assertEqual(st["served_from"], "file_fallback")
+        self.assertEqual(st["freshness"], "stale")
+        self.assertNotIn("抓取失败", st["reason"])
+        self.assertIn("未返回财报记录", st["reason"])
+        self.assertEqual(st["report_date"], "2026-09-30")
+        self.assertIsNotNone(st["fetched_at"], "抓取时间仍对应旧缓存")
+
+    def test_failed_file_fallback(self):
+        fin, st = self._fallback_file(failed_result("timeout"))
+        self.assertEqual(fin["eps"], 51.53)
+        self.assertEqual(st["fetch_status"], "failed")
+        self.assertEqual(st["served_from"], "file_fallback")
+        self.assertEqual(st["freshness"], "stale")
+        self.assertIn("抓取失败", st["reason"])
+        self.assertNotIn("未返回财报记录", st["reason"])
+
+    def test_empty_memory_fallback(self):
+        fin, st, ts = self._fallback_memory(empty_result())
+        self.assertEqual(fin["eps"], 51.53)
+        self.assertEqual(st["fetch_status"], "empty")
+        self.assertEqual(st["served_from"], "memory_fallback")
+        self.assertEqual(st["freshness"], "stale")
+        self.assertNotIn("抓取失败", st["reason"])
+        self.assertIn("未返回财报记录", st["reason"])
+        self.assertAlmostEqual(time.mktime(time.strptime(st["fetched_at"], "%Y-%m-%d %H:%M:%S")),
+                               ts, delta=2)
+
+    def test_failed_memory_fallback(self):
+        fin, st, _ts = self._fallback_memory(failed_result("boom"))
+        self.assertEqual(fin["eps"], 51.53)
+        self.assertEqual(st["fetch_status"], "failed")
+        self.assertEqual(st["served_from"], "memory_fallback")
+        self.assertEqual(st["freshness"], "stale")
+        self.assertIn("抓取失败", st["reason"])
+
+    def test_empty_without_cache(self):
+        trace = {}
+        with self.provider(empty_result()), self.trading():
+            fin = d.get_latest_financials("600519", trace=trace)
+        st = trace["status"]
+        self.assertIsNone(fin)
+        self.assertEqual(st["fetch_status"], "empty")
+        self.assertEqual(st["served_from"], "none")
+        self.assertEqual(st["freshness"], "unknown")
+
+    def test_failed_without_cache(self):
+        trace = {}
+        with self.provider(failed_result()), self.trading():
+            fin = d.get_latest_financials("600519", trace=trace)
+        st = trace["status"]
+        self.assertIsNone(fin)
+        self.assertEqual(st["fetch_status"], "failed")
+        self.assertEqual(st["served_from"], "none")
+        self.assertEqual(st["freshness"], "unknown")
+
+    def test_reasons_of_six_combos_are_distinct(self):
+        """六个组合的 reason 两两不同（不允许把 empty 说成 failed）。"""
+        reasons = {}
+        _, st = self._fallback_file(empty_result()); reasons["empty_file"] = st["reason"]
+        self.tearDown(); self.setUp()
+        _, st = self._fallback_file(failed_result("x")); reasons["failed_file"] = st["reason"]
+        self.tearDown(); self.setUp()
+        _, st, _ = self._fallback_memory(empty_result()); reasons["empty_mem"] = st["reason"]
+        self.tearDown(); self.setUp()
+        _, st, _ = self._fallback_memory(failed_result("x")); reasons["failed_mem"] = st["reason"]
+        self.tearDown(); self.setUp()
+        with self.provider(empty_result()), self.trading():
+            t = {}; d.get_latest_financials("600519", trace=t)
+        reasons["empty_none"] = t["status"]["reason"]
+        with self.provider(failed_result("x")), self.trading():
+            t2 = {}; d.get_latest_financials("999999", trace=t2)
+        reasons["failed_none"] = t2["status"]["reason"]
+        self.assertEqual(reasons["empty_file"], reasons["failed_file"].replace(
+            "本次抓取失败，回退到文件缓存",
+            "本次上游未返回财报记录，回退到文件缓存（历史快照）"))
+        self.assertNotEqual(reasons["empty_file"], reasons["failed_file"])
+        self.assertNotEqual(reasons["empty_mem"], reasons["failed_mem"])
+        self.assertNotEqual(reasons["empty_none"], reasons["failed_none"])
+        self.assertEqual(len(set(reasons.values())), 6)
+
+
+class _InlineThread:
+    """可控线程调度：start() 在**另一个线程**里跑完再返回。
+
+    这样既模拟了"后台刷新比前台返回更早完成"，又保持真实线程边界：
+    thread-local 里没有前台 trace，fetch() 不具备污染前台状态的机会。
+    """
+
+    def __init__(self, target=None, daemon=None, name=None, args=(), kwargs=None):
+        self._target = target
+        self._args = args
+        self._kwargs = kwargs or {}
+
+    def start(self):
+        t = threading.Thread(target=self._target, args=self._args, kwargs=self._kwargs)
+        t.start()
+        t.join(5)
+
+
+class _ThreadingShim:
+    Thread = _InlineThread
+
+    def __getattr__(self, item):
+        return getattr(threading, item)
+
+
+class TestGroupF_BackgroundSwrIsolation(StatusTestBase):
+    """F：后台 SWR 不得篡改当前请求的同步状态（13 项复审必改 2）。"""
+
+    OLD, NEW = 40.0, 51.53
+
+    def _stale_memory(self, eps=OLD, age=7 * 3600):
+        payload = dict(normalized(), eps=eps)
+        d._IN_MEMORY_CACHE["fin_600519"] = {
+            "data": payload, "time": time.time() - age,
+            "source": "eastmoney", "ttl": 6 * 3600}
+        return payload
+
+    def test_background_finishes_before_foreground_returns(self):
+        self._stale_memory()
+        trace = {}
+        with mock.patch.object(d, "threading", _ThreadingShim()),              self.provider(ok_result(payload=dict(normalized(), eps=self.NEW))),              self.trading():
+            fin = d.get_latest_financials("600519", trace=trace)
+        st = trace["status"]
+        self.assertEqual(fin["eps"], self.OLD, "前台返回的仍是旧内存数据")
+        self.assertEqual(st["fetch_status"], "not_attempted",
+                         "后台成功不能把前台写成 success")
+        self.assertEqual(st["served_from"], "memory")
+        self.assertEqual(st["freshness"], "stale")
+        self.assertEqual(st["report_date"], "2026-09-30")
+        # 后台确实把新财报写进了缓存（原有 SWR 行为不变）
+        self.assertEqual(d._IN_MEMORY_CACHE["fin_600519"]["data"]["eps"], self.NEW)
+        # 下一次请求可以正常命中新缓存
+        trace2 = {}
+        with self.provider(failed_result()), self.trading():
+            nxt = d.get_latest_financials("600519", trace=trace2)
+        self.assertEqual(nxt["eps"], self.NEW)
+        self.assertEqual(trace2["status"]["fetch_status"], "not_attempted")
+
+    def test_background_finishes_after_foreground_snapshot(self):
+        self._stale_memory()
+        gate = threading.Event()
+        started = threading.Event()
+
+        def slow_call(name, code, *a, **kw):
+            started.set()
+            gate.wait(5)
+            return ok_result(payload=dict(normalized(), eps=self.NEW))
+
+        trace = {}
+        with mock.patch.object(d._providers, "call", side_effect=slow_call), self.trading():
+            fin = d.get_latest_financials("600519", trace=trace)
+            snapshot = copy.deepcopy(trace["status"])
+            started.wait(5)
+            gate.set()
+            time.sleep(0.2)          # 只等后台线程跑完，不参与任何断言时序
+            self.assertEqual(trace["status"], snapshot, "后台完成后不得改写已返回的状态")
+        self.assertEqual(fin["eps"], self.OLD)
+        self.assertEqual(snapshot["fetch_status"], "not_attempted")
+        self.assertEqual(snapshot["served_from"], "memory")
+        self.assertEqual(d._IN_MEMORY_CACHE["fin_600519"]["data"]["eps"], self.NEW)
+
+    def test_background_failure_keeps_cache_and_status(self):
+        self._stale_memory()
+        trace = {}
+        with mock.patch.object(d, "threading", _ThreadingShim()),              self.provider(failed_result("bg down")), self.trading():
+            fin = d.get_latest_financials("600519", trace=trace)
+        st = trace["status"]
+        self.assertEqual(fin["eps"], self.OLD)
+        self.assertEqual(st["fetch_status"], "not_attempted")
+        self.assertEqual(st["served_from"], "memory")
+        self.assertEqual(st["freshness"], "stale")
+        self.assertEqual(d._IN_MEMORY_CACHE["fin_600519"]["data"]["eps"], self.OLD,
+                         "后台失败不得清空合法缓存")
+
+    def test_foreground_sync_matrix_unchanged(self):
+        """D：正常同步路径四种基本结果与本轮之前一致（每种用独立股票，互不串缓存）。"""
+        trace = {}
+        with self.provider(ok_result()), self.trading():
+            d.get_latest_financials("600519", trace=trace)
+        self.assertEqual(trace["status"]["fetch_status"], "success")
+        self.assertEqual(trace["status"]["served_from"], "network")
+
+        trace = {}
+        with self.provider(empty_result()), self.trading():
+            d.get_latest_financials("000001", trace=trace)
+        self.assertEqual(trace["status"]["fetch_status"], "empty")
+        self.assertEqual(trace["status"]["served_from"], "none")
+
+        trace = {}
+        with self.provider(failed_result()), self.trading():
+            d.get_latest_financials("300750", trace=trace)
+        self.assertEqual(trace["status"]["fetch_status"], "failed")
+        self.assertEqual(trace["status"]["served_from"], "none")
+
+        self.preload_file("600519", normalized(), age=600)
+        trace = {}
+        with self.provider(failed_result()), self.closed():
+            d.get_latest_financials("600519", refresh=True, trace=trace)
+        self.assertEqual(trace["status"]["served_from"], "file_fallback")
+
+
 try:
     from flask import Flask
     import routes as routes_mod

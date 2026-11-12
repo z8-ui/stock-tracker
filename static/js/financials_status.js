@@ -52,10 +52,15 @@
         }
 
         if (degraded) {
+            // 上游"没有财报记录"和"请求失败"是两件事，回退时的文案必须分开
+            var emptyUpstream = (fetch === 'empty');
             return {
                 kind: 'degraded', tone: 'warn', badge: '旧数据',
-                message: '本次财报获取失败，当前展示的是此前保存的财报（非本次抓取结果）',
-                degraded: true
+                message: emptyUpstream
+                    ? '本次上游未返回财报记录，当前展示此前保存的财报快照。'
+                    : '本次财报获取失败，当前展示的是此前保存的财报（非本次抓取结果）',
+                degraded: true,
+                empty_upstream: emptyUpstream
             };
         }
 
