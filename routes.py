@@ -14,7 +14,7 @@ from data_service import (
     get_stock_quote, get_index_history, get_sector_valuation,
     get_stock_real_money_flow,
     estimate_intrinsic_value, INDUSTRY_PE_MAP, get_industry_pe,
-    cache_meta,
+    cache_meta, data_meta,
     _LAST_SUCCESS
 )
 # 技术分析纯函数独立模块（technical.py），与数据获取解耦
@@ -29,6 +29,53 @@ from chart_builder import (
 from config import APP_NAME, STOCK_WATCHLIST, VALUATION_WATCHLIST, DEEPSEEK_API_KEY
 
 bp = Blueprint("main", __name__)
+
+
+# ========== S3-3B：板块数据的 HTTP Headers 外露 ==========
+# JSON 主体结构一个字不改（heatmap 仍是 chart list，sector-valuation 仍是
+# {code, data, is_mock}）；三维度与行数信息走稳定的 X-Data-* 响应头，
+# 这样浏览器端和脚本都能读到"这份数据完不完整、新不新鲜、从哪来的"。
+#
+# 编码约定（缺信息一律写 unknown，绝不默认 complete）：
+#   X-Data-Fetch-Status  success / failed / not_attempted / unknown
+#   X-Data-Completeness  complete / partial / unknown
+#   X-Data-Freshness     fresh / stale / unknown
+#   X-Data-Meta-Status   ok / missing / mismatch / orphan（元数据自检结果）
+#   X-Data-Rows          int / unknown
+#   X-Data-Total         int / unknown（上游没给总数就是 unknown）
+#   X-Data-Fetched-At    "YYYY-MM-DD HH:MM:SS"（本地抓取时刻）/ unknown
+#   X-Data-AsOf          上游数据时间；上游不提供时 unknown（不拿本地时间冒充）
+#   X-Data-Served-From   network / memory / stale / file / file_fallback / none
+#   X-Data-Missing       "3,5" 这样逗号分隔的缺失项；无缺失写 "-"
+DATA_HEADER_NAMES = (
+    "X-Data-Fetch-Status", "X-Data-Completeness", "X-Data-Freshness",
+    "X-Data-Meta-Status", "X-Data-Rows", "X-Data-Total", "X-Data-Fetched-At",
+    "X-Data-AsOf", "X-Data-Served-From", "X-Data-Missing",
+)
+
+
+def _attach_data_headers(resp, meta):
+    """把 data_meta() 的结果写进响应头（失败响应也写，方便前端区分"接口挂了"和"数据不全"）。"""
+    meta = meta or {}
+    missing = meta.get("missing") or []
+    rows, total = meta.get("rows"), meta.get("total")
+    resp.headers["X-Data-Fetch-Status"] = str(meta.get("fetch_status") or "unknown")
+    resp.headers["X-Data-Completeness"] = str(meta.get("completeness") or "unknown")
+    resp.headers["X-Data-Freshness"] = str(meta.get("freshness") or "unknown")
+    resp.headers["X-Data-Meta-Status"] = str(meta.get("meta_status") or "missing")
+    resp.headers["X-Data-Rows"] = "unknown" if rows is None else str(rows)
+    resp.headers["X-Data-Total"] = "unknown" if total is None else str(total)
+    resp.headers["X-Data-Fetched-At"] = meta.get("fetched_at_iso") or "unknown"
+    resp.headers["X-Data-AsOf"] = str(meta.get("asof") or "unknown")
+    resp.headers["X-Data-Served-From"] = str(meta.get("served_from") or "none")
+    resp.headers["X-Data-Missing"] = ",".join(str(m) for m in missing) if missing else "-"
+    # 跨域访问（前端 dev server / 局域网）时，浏览器默认读不到自定义头
+    exposed = resp.headers.get("Access-Control-Expose-Headers") or ""
+    names = [n for n in DATA_HEADER_NAMES if n not in exposed]
+    if names:
+        resp.headers["Access-Control-Expose-Headers"] = \
+            ", ".join([x.strip() for x in exposed.split(",") if x.strip()] + names)
+    return resp
 
 
 # ========== AI 接口防护(限流 + 可选 token) ==========
@@ -169,20 +216,25 @@ def api_market_flow():
 
 @bp.route("/api/heatmap")
 def api_heatmap():
-    sectors = get_sector_flow()
+    trace = {}
+    sectors = get_sector_flow(trace=trace)
     chart = build_heatmap_chart(sectors)
+    meta = data_meta("sector_flow", served_from=trace.get("served"), trace=trace)
     if chart:
         # 附加市场状态
         from data_service import _market_status as _ms
         status, _ = _ms()
         is_mock = any(bool(s.get("is_mock")) for s in (sectors or []) if isinstance(s, dict))
-        meta = cache_meta("sector_flow")
-        return jsonify({"code": 200, "data": chart, "_market_status": status,
-                        "is_mock": is_mock, "is_stale": meta["is_stale"],
-                        "asof": meta["asof"], "stale_reason": meta["reason"]})
+        cm = cache_meta("sector_flow")
+        resp = jsonify({"code": 200, "data": chart, "_market_status": status,
+                        "is_mock": is_mock, "is_stale": cm["is_stale"],
+                        "asof": cm["asof"], "stale_reason": cm["reason"]})
+        return _attach_data_headers(resp, meta)
     if sectors is None:
-        return jsonify({"code": 500, "msg": "暂无板块资金数据（接口未返回，未启用模拟兜底）"})
-    return jsonify({"code": 500, "msg": "数据获取失败"})
+        resp = jsonify({"code": 500, "msg": "暂无板块资金数据（接口未返回，未启用模拟兜底）"})
+        return _attach_data_headers(resp, meta)
+    resp = jsonify({"code": 500, "msg": "数据获取失败"})
+    return _attach_data_headers(resp, meta)
 
 
 @bp.route("/api/stock-quote")
@@ -401,12 +453,16 @@ def api_swing_analysis():
 
 @bp.route("/api/sector-valuation")
 def api_sector_valuation():
-    """板块估值数据"""
-    data = get_sector_valuation()
+    """板块估值数据（JSON 结构不变；三维度与行数走 X-Data-* 响应头）"""
+    trace = {}
+    data = get_sector_valuation(trace=trace)
+    meta = data_meta("sector_valuation", served_from=trace.get("served"), trace=trace)
     if data:
         is_mock = any(bool(s.get("is_mock")) for s in data if isinstance(s, dict))
-        return jsonify({"code": 200, "data": data, "is_mock": is_mock})
-    return jsonify({"code": 500, "msg": "获取板块估值失败（接口未返回，未启用模拟兜底）"})
+        resp = jsonify({"code": 200, "data": data, "is_mock": is_mock})
+        return _attach_data_headers(resp, meta)
+    resp = jsonify({"code": 500, "msg": "获取板块估值失败（接口未返回，未启用模拟兜底）"})
+    return _attach_data_headers(resp, meta)
 
 
 @bp.route("/api/intrinsic-value")

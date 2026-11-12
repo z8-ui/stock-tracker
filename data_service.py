@@ -4,6 +4,7 @@
 """
 
 import requests
+import hashlib
 import json
 import math
 import random
@@ -61,17 +62,189 @@ def _save_cache(cache_dict):
         pass
 
 
-def _cache_update(cache_key, data, fetched_at):
+def _cache_update(cache_key, data, fetched_at, meta=None):
     """只更新一个 key：读-改-写全程持锁。
 
     修复的问题：原实现的 _cached_get 在请求开始时 _load_cache() 拿一份快照，
     请求结束再把整份快照写回。两个不同 cache_key 并发时，后写的会用旧快照
     把先写的那个 key 抹掉（lost update）——表现为"刚刷新的数据过一会儿又变回旧值"。
+
+    S3-3B：可选 `meta`（旁路元数据）与数据在**同一次**读-改-写里落盘，
+    避免"数据已更新、元数据还是旧的"被当成完整数据。业务数据本身的信封
+    `{"__data": ..., "fetched_at": ...}` 一个字都不变。
     """
     with _CACHE_LOCK:
         cache = _load_cache()
         cache[cache_key] = {"__data": data, "fetched_at": fetched_at}
+        if meta is not None:
+            store = cache.get(_META_NAMESPACE)
+            if not isinstance(store, dict):
+                store = {}
+            store[cache_key] = meta
+            cache[_META_NAMESPACE] = store
         _save_cache(cache)
+
+
+# ==============================================================
+#  旁路元数据（S3-3B）
+#
+#  业务数据保持裸结构（list 仍是 list，`{"__data": ..., "fetched_at": ...}`
+#  信封一个字不改）；元数据放 `_data_cache.json` 的独立命名空间
+#  `__data_meta__`，与业务 key 平级但永不混入数据本体。
+#
+#  为什么不是单独一个文件：数据与元数据必须能一次原子替换（否则崩溃后
+#  会出现"新数据 + 旧元数据"），且现有测试用 patch `_load_cache/_save_cache`
+#  隔离缓存 —— 同一份文件让隔离自动生效，不会把测试元数据写进真实目录。
+#
+#  绑定方式：元数据里存 `data_hash`（规范 JSON 的 sha256）。读取时重新算
+#  当前缓存数据的 hash，不一致就整条作废 → 三个维度全部 unknown，
+#  绝不让旧元数据冒充当前状态。
+# ==============================================================
+
+_META_NAMESPACE = "__data_meta__"
+_META_SCHEMA = 1
+LEGACY_MIGRATION_INTERVAL = 1800      # 旧缓存一次性安全刷新的冷却（秒）
+
+
+def _fingerprint(data):
+    """数据内容指纹：元数据靠它绑定"这份元数据描述的就是这份数据"。"""
+    try:
+        blob = json.dumps(data, ensure_ascii=False, sort_keys=True,
+                          separators=(",", ":"), default=str)
+    except (TypeError, ValueError):
+        return ""
+    return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _meta_record(cache_key):
+    """读一条持久化元数据（不存在或形态不对都返回 None）。"""
+    with _CACHE_LOCK:
+        store = _load_cache().get(_META_NAMESPACE) or {}
+        rec = store.get(cache_key) if isinstance(store, dict) else None
+    return rec if isinstance(rec, dict) else None
+
+
+def _cache_payload(cache_key):
+    """读缓存条目 → (数据, 抓取时间)。旧格式（裸数据）没有抓取时间。"""
+    with _CACHE_LOCK:
+        raw = _load_cache().get(cache_key)
+    if isinstance(raw, dict) and "__data" in raw:
+        return raw.get("__data"), raw.get("fetched_at")
+    return raw, None
+
+
+def _freshness_of(fetched_at, served_from):
+    """freshness 只看"这份数据有多旧"，和完整度是两件事。"""
+    if served_from == "file_fallback":
+        return "stale"
+    if not fetched_at:
+        return "unknown"
+    status, trading = _market_status()
+    limit = STALE_AFTER_SEC if trading else 3 * 86400
+    try:
+        age = time.time() - float(fetched_at)
+    except (TypeError, ValueError):
+        return "unknown"
+    return "fresh" if age <= limit else "stale"
+
+
+def data_meta(cache_key, served_from=None, trace=None):
+    """S3-3B：把持久化旁路元数据 + 当前缓存数据合成对外三维度。
+
+    返回字段（缺信息一律 unknown，绝不默认 complete）：
+      meta_status    ok / missing / mismatch / orphan
+      fetch_status   success / failed / not_attempted / unknown
+      completeness   complete / partial / unknown
+      freshness      fresh / stale / unknown
+      rows/total     int 或 None（未知）
+      missing        缺失项（分页号、duplicates:N、meta:hash_mismatch…）
+      fetched_at     epoch（本地抓取时刻，不是交易所时间）
+      asof           上游数据时间；上游不提供时 "unknown"
+      served_from    本次请求的数据来源（由 _cached_get 的 trace 传入）
+
+    `served_from == "file_fallback"` 表示本次抓上游失败、退回旧数据：
+    freshness 必须是 stale，fetch_status 记本次失败（failed）。
+    `trace` 为 _cached_get 的来源记录；带 fetch_failed=True 时同样记 failed。
+    """
+    data, fetched_at = _cache_payload(cache_key)
+    record = _meta_record(cache_key)
+    served = served_from or "none"
+    out = {
+        "cache_key": cache_key,
+        "meta_status": "missing",
+        "fetch_status": "unknown",
+        "completeness": "unknown",
+        "freshness": "unknown",
+        "rows": len(data) if isinstance(data, (list, dict)) else (1 if data is not None else None),
+        "total": None,
+        "missing": [],
+        "missing_pages": [],
+        "notes": [],
+        "duplicates": 0,
+        "fetched_at": fetched_at,
+        "fetched_at_iso": _fmt_ts(fetched_at) if fetched_at else None,
+        "asof": "unknown",
+        "source": "",
+        "served_from": served,
+        "is_mock": False,
+        "data_hash": None,
+    }
+
+    if data is None:
+        out["rows"] = None
+        out["meta_status"] = "orphan" if record else "missing"
+        if (trace or {}).get("fetch_failed"):
+            out["fetch_status"] = "failed"      # 本次确实打了上游、并且失败了
+        elif (trace or {}).get("fetch_empty"):
+            out["fetch_status"] = "empty"       # 接口成功，但确实没有数据（≠ 接口挂了）
+        return out
+
+    fingerprint = _fingerprint(data)
+    out["data_hash"] = fingerprint
+
+    if record is None:
+        # 旧缓存（S3-3A 及以前写入）：没有可信元数据 → 全部 unknown，绝不猜"完整"。
+        # 唯一例外是"本次抓取失败后退回旧数据"：新鲜度必须 stale、抓取结果必须 failed。
+        if served == "file_fallback":
+            out["freshness"] = "stale"
+            out["fetch_status"] = "failed"
+        return out
+
+    if record.get("data_hash") != fingerprint:
+        # 数据被改写（或元数据描述的是另一份数据）→ 旧元数据不得冒充当前状态
+        out["meta_status"] = "mismatch"
+        out["missing"] = ["meta:hash_mismatch"]
+        if served == "file_fallback":
+            out["freshness"] = "stale"
+            out["fetch_status"] = "failed"
+        return out
+
+    rows = len(data)
+    completeness = str(record.get("completeness") or "unknown")
+    total = record.get("total")
+    if completeness == "complete" and (total is None or rows != total):
+        # 防御：元数据自称完整，但行数对不上 total → 降级，不冒充完整
+        completeness = "partial" if total is not None else "unknown"
+    out.update({
+        "meta_status": "ok",
+        "fetch_status": record.get("fetch_status") or "unknown",
+        "completeness": completeness,
+        "rows": rows,
+        "total": total,
+        "missing": [str(m) for m in (record.get("missing") or [])],
+        "missing_pages": list(record.get("missing_pages") or []),
+        "notes": [str(n) for n in (record.get("notes") or [])],
+        "duplicates": int(record.get("duplicates") or 0),
+        "fetched_at": record.get("fetched_at") or fetched_at,
+        "asof": (str(record.get("asof") or "").strip() or "unknown"),
+        "source": record.get("source") or "",
+        "is_mock": bool(record.get("is_mock")),
+    })
+    out["fetched_at_iso"] = _fmt_ts(out["fetched_at"]) if out["fetched_at"] else None
+    out["freshness"] = _freshness_of(out["fetched_at"], served)
+    if served == "file_fallback":
+        out["fetch_status"] = "failed"      # 本次抓取失败后才退回的旧数据
+    return out
 
 
 # ==============================================================
@@ -230,7 +403,7 @@ def _refresh_is_valid(fresh, validate_fn, existing):
     return True
 
 
-def _spawn_refresh(cache_key, fetcher, validate_fn):
+def _spawn_refresh(cache_key, fetcher, validate_fn, meta_fn=None):
     """SWR 后台刷新：不阻塞当前请求，重建成功后更新内存 + 文件缓存。
 
     2026-11 修复三件事：
@@ -238,6 +411,9 @@ def _spawn_refresh(cache_key, fetcher, validate_fn):
     2. 文件缓存写入与 _store() 同构：{"__data": ..., "fetched_at": ...}
        原来写成裸数据，重启后 _file_cache() 认不出来源时间 → 页面显示"抓取时间未知"
     3. 同时更新 _LAST_SUCCESS（/api/ready 的硬过期判断依赖它）
+
+    S3-3B：`meta_fn` 与前台 _store() 用同一个函数生成旁路元数据 ——
+    否则后台刷新会把 partial 数据写成"没有元数据"，重启后退化成 unknown。
     """
     evt, _ = _inflight_acquire(cache_key)
     if evt is None:
@@ -253,7 +429,13 @@ def _spawn_refresh(cache_key, fetcher, validate_fn):
                 with _CACHE_LOCK:
                     _IN_MEMORY_CACHE[cache_key] = {"data": fresh, "time": ts}
                     _LAST_SUCCESS[cache_key] = ts
-                _cache_update(cache_key, fresh, ts)
+                meta = None
+                if meta_fn is not None:
+                    try:
+                        meta = meta_fn(fresh, ts)
+                    except Exception:
+                        meta = None
+                _cache_update(cache_key, fresh, ts, meta=meta)
         except Exception:
             pass          # 后台刷新失败不影响前台：旧内存/文件缓存原样保留
         finally:
@@ -347,7 +529,7 @@ def _has_valid_data(data):
 
 
 def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force=False,
-                trace=None):
+                trace=None, meta_fn=None):
     """统一的缓存读写（SWR + single-flight + 数据标注注入）
 
     cache_key:    字符串标识
@@ -359,6 +541,8 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
     trace:        可选 dict；本函数在**实际决定返回数据的那条路径**里写入
                   {"served": "network|memory|stale|file|file_fallback|none"}，
                   调用方据此判断"这次是从哪拿到的"，不用靠调用前的缓存状态去猜。
+    meta_fn:      可选 `fn(value, ts) -> dict`；写缓存时生成旁路元数据（S3-3B）。
+                  只对需要三维度可验证的 key（板块）传，其它 key 不传即老行为。
 
     行为：
     - 交易时段：TTL 内命中内存直接返回；过期先返回旧数据并后台重建（SWR）；
@@ -404,8 +588,16 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
         ts = ts if ts is not None else now
         _IN_MEMORY_CACHE[cache_key] = {"data": value, "time": ts}
         _LAST_SUCCESS[cache_key] = ts
+        # 旁路元数据与业务数据同一次落盘（S3-3B）；生成失败也不能影响主流程，
+        # 只是这份数据下次读到时因为"没有可信元数据"而降级成 unknown。
+        meta = None
+        if meta_fn is not None:
+            try:
+                meta = meta_fn(value, ts)
+            except Exception:
+                meta = None
         # 落盘结构与 _spawn_refresh 完全一致：{"__data": ..., "fetched_at": ...}
-        _cache_update(cache_key, value, ts)
+        _cache_update(cache_key, value, ts, meta=meta)
         return value
 
     def _file_cache():
@@ -467,7 +659,10 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
         if mem:
             _bump("stale_served")
             _bump("refresh")
-            _spawn_refresh(cache_key, _timed_fetch, validate_fn)
+            if meta_fn is None:
+                _spawn_refresh(cache_key, _timed_fetch, validate_fn)
+            else:
+                _spawn_refresh(cache_key, _timed_fetch, validate_fn, meta_fn=meta_fn)
             _mark("stale")
             return _inject(mem["data"], mem["time"])
         # 3) 无内存 → single-flight 同步构建（并发只建一次，检查+注册原子化）
@@ -505,6 +700,10 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
             cached = _file_cache()
             if cached is not None:
                 _mark("file_fallback")
+            else:
+                _mark("none")
+                if trace is not None:
+                    trace["fetch_failed"] = True   # 让 X-Data-Fetch-Status 如实记 failed
             return cached if cached is not None else None
         finally:
             _inflight_release(cache_key, evt)
@@ -679,8 +878,86 @@ SECTOR_LIST = [
 SECTOR_FLOW_TTL = 60          # 板块资金流：分钟级变量，5 页抓取成本高，60s 足够
 SECTOR_VALUATION_TTL = 300    # 板块估值：PE/PB 是日频基本面，5 分钟粒度已过剩
 
-# 最近一次 Provider 结果（S3-3A：只记在内存供观察；S3-3B 会换成持久化旁路元数据）
+# 最近一次 Provider 结果（S3-3A：只记在内存供观察）
 _SECTOR_LAST_RESULT = {}
+
+# 旧缓存一次性安全刷新：key -> 上次尝试时刻（进程内；重启后再试一次是期望行为）
+_LEGACY_MIGRATION_AT = {}
+
+
+def _sector_meta_from(res, value, ts, cache_key, mode):
+    """把 ProviderResult 的三维度固化成可持久化的旁路元数据（S3-3B）。
+
+    这里只记录**这次抓取的事实**（是否成功、行数 vs total、哪些页失败、
+    哪些字段缺失、上游有没有给时间）。不记录"这次请求从哪读的"——
+    那是 data_meta(served_from=...) 在读取时补的，属于请求维度，不落盘。
+    """
+    rows = len(value) if isinstance(value, (list, dict)) else None
+    is_mock = isinstance(value, list) and any(
+        isinstance(r, dict) and r.get("is_mock") for r in value)
+    meta = {
+        "schema": _META_SCHEMA,
+        "cache_key": cache_key,
+        "mode": mode,
+        "source": (res.source if res is not None else "") or "eastmoney_sector",
+        "fetch_status": "not_attempted",
+        "completeness": "unknown",
+        "rows": rows,
+        "total": None,
+        "missing_pages": [],
+        "missing": [],
+        "notes": [],
+        "duplicates": 0,
+        "fetched_at": float(ts),
+        "asof": "",
+        "asof_source": "unknown",
+        "is_mock": bool(is_mock),
+        "data_hash": _fingerprint(value),
+        "written_at": time.time(),
+    }
+    if is_mock or res is None:
+        # 模拟数据永远不标 success/complete：它只是界面演示，不是上游事实
+        meta["notes"] = ["mock_fallback"] if is_mock else ["no_provider_result"]
+        return meta
+
+    extra = res.extra or {}
+    dims = res.dimensions()
+    completeness = extra.get("completeness") or dims.get("completeness") or "unknown"
+    total = extra.get("total")
+    if completeness == "complete" and (total is None or rows != total):
+        # 防御：自称完整但行数对不上 total → 降级，绝不冒充完整
+        completeness = "partial" if total is not None else "unknown"
+    meta.update({
+        "fetch_status": dims.get("fetch_status") or "unknown",
+        "completeness": completeness,
+        "total": total,
+        "missing_pages": list(extra.get("missing_pages") or []),
+        "missing": [str(m) for m in (extra.get("missing") or [])],
+        "notes": [str(n) for n in (extra.get("notes") or [])],
+        "duplicates": int(extra.get("duplicates") or 0),
+        "asof": res.asof or "",
+        "asof_source": "upstream" if res.asof else "unknown",
+    })
+    return meta
+
+
+def _needs_legacy_migration(cache_key):
+    """旧缓存（无旁路元数据 / 元数据与数据对不上）是否需要一次性安全刷新。
+
+    不用 `len(data) < N` 这种通用阈值 —— 合法的 5 行测试数据不能被当成坏缓存删掉。
+    判据只有一条：**有没有与当前数据哈希绑定的可信元数据**。
+    刷新失败时调用方仍会退回旧数据，只是如实标 unknown/stale（见 data_meta）。
+    """
+    data, _ = _cache_payload(cache_key)
+    if data is None:
+        return False
+    record = _meta_record(cache_key)
+    if record and record.get("data_hash") == _fingerprint(data):
+        return False                      # 元数据齐全且绑定当前数据 → 不需要迁移
+    last = _LEGACY_MIGRATION_AT.get(cache_key)
+    if last is not None and (time.time() - last) < LEGACY_MIGRATION_INTERVAL:
+        return False                      # 冷却中：避免每个请求都打一遍 5 页上游
+    return True
 
 
 def _mock_sector_flow():
@@ -733,7 +1010,57 @@ def _validate_sectors(data):
     return False
 
 
-def get_sector_flow():
+def _sector_cached_get(cache_key, mode, ttl, trace=None):
+    """板块两个接口共用的取数路径：Provider → 缓存 → 旁路元数据 → 旧缓存迁移。
+
+    - `meta_fn` 让 metadata 与数据同一次落盘（partial 不会在缓存里变成 complete）
+    - 旧缓存（无可信元数据）先做**一次**安全刷新；刷新失败仍返回旧数据，
+      由 data_meta() 如实标 unknown/stale（绝不冒充完整）
+    """
+    captured = {}
+
+    def _fetch():
+        res = _sector_provider_result(mode)
+        captured["res"] = res
+        if res.status in ("failed", "empty") or not res.data:
+            if ALLOW_MOCK_FALLBACK:
+                return _mock_sector_flow() if mode == "flow" else _mock_sector_valuation()
+            return None
+        return res.data
+
+    def _meta(value, ts):
+        return _sector_meta_from(captured.get("res"), value, ts, cache_key, mode)
+
+    def _finish(out):
+        """Provider 内部把异常转成 failed 状态，不会往上抛 —— 
+        所以"这次到底成没成"要从 ProviderResult 回填到 trace，供 Headers 使用。"""
+        if out is None and trace is not None:
+            res = captured.get("res")
+            if res is not None:
+                if res.status == "failed":
+                    trace["fetch_failed"] = True
+                elif res.status == "empty":
+                    trace["fetch_empty"] = True
+        return out
+
+    if _needs_legacy_migration(cache_key):
+        _LEGACY_MIGRATION_AT[cache_key] = time.time()
+        try:
+            return _finish(_cached_get(cache_key, _fetch, validate_fn=_validate_sectors,
+                                       source="eastmoney_sector", ttl=ttl, force=True,
+                                       trace=trace, meta_fn=_meta))
+        except Exception:
+            # 一次性安全刷新失败：继续走正常路径（有旧缓存就返回旧缓存）
+            if trace is not None:
+                trace.pop("served", None)
+            if captured.get("res") is None:
+                captured.clear()
+    return _finish(_cached_get(cache_key, _fetch, validate_fn=_validate_sectors,
+                               source="eastmoney_sector", ttl=ttl,
+                               trace=trace, meta_fn=_meta))
+
+
+def get_sector_flow(trace=None):
     """行业板块资金流（全量 496：pz=100 × 5 页，按 f12 去重；60s 缓存）。
 
     与迁移前的区别：
@@ -742,21 +1069,15 @@ def get_sector_flow():
       - 单页失败 → Provider 返回 partial + missing_pages，此处保留已抓到的行，
         不会把"部分成功"伪装成完整成功（异常/全失败才降级到 Mock 或 None）。
 
-    ⚠️ 部署提示：旧版本写入的 `sector_flow` 缓存只有 60 行（pz=60 时代）。休市时
-       `_cached_get` 会直接返回文件缓存，因此**升级后需清一次该缓存键**
-       （`_data_cache.json` 里删掉 `sector_flow`），否则页面会继续显示 60 个板块，
-       直到下一次交易时段刷新。S3-3B 会用持久化元数据记录 rows/total 来根治。
+    S3-3B（旧 60 行缓存根治）：
+      升级前写入的 `sector_flow` 缓存只有 60 行且没有旁路元数据。这里**不用行数阈值**
+      判断好坏，只看有没有与数据哈希绑定的可信元数据：
+        - 有元数据且 rows == total → complete；rows < total → partial；
+        - 没有元数据 → unknown，并触发一次安全刷新（冷却 30 分钟）；
+        - 刷新失败仍返回旧数据，但元数据保持 unknown/stale，不冒充完整。
+      合法的 5 行测试缓存同样不会被删，只会在下一次成功刷新时被真实数据替换。
     """
-    def _fetch():
-        res = _sector_provider_result("flow")
-        if res.status in ("failed", "empty") or not res.data:
-            if ALLOW_MOCK_FALLBACK:
-                return _mock_sector_flow()
-            return None
-        return res.data
-
-    return _cached_get("sector_flow", _fetch, validate_fn=_validate_sectors,
-                       source="eastmoney_sector", ttl=SECTOR_FLOW_TTL)
+    return _sector_cached_get("sector_flow", "flow", SECTOR_FLOW_TTL, trace=trace)
 
 
 def _get_market_change():
@@ -1437,25 +1758,20 @@ def estimate_intrinsic_value(stock_quote):
 #  9. 板块估值
 # ==============================================================
 
-def get_sector_valuation():
+def get_sector_valuation(trace=None):
     """各行业板块估值（PE/PB/市值）。
 
     与迁移前的区别（S3-3 D3/D4）：
       - 不再 `if pe > 0` 丢掉亏损板块：496 个全返回，负 PE 保留原值；
       - `f23(PB)` 实测 496/496 为 "-" → `pb=None`（**不是 0.0**）；
       - 不可解析的字段抛格式错，不再 `except:` 吞成 Mock/None；
-      - 带 300s 缓存，避免每次刷新都打 5 页（Phase B 接缓存元数据）。
-    """
-    def _fetch():
-        res = _sector_provider_result("valuation")
-        if res.status in ("failed", "empty") or not res.data:
-            if ALLOW_MOCK_FALLBACK:
-                return _mock_sector_valuation()
-            return None
-        return res.data
+      - 带 300s 缓存，避免每次刷新都打 5 页。
 
-    return _cached_get("sector_valuation", _fetch, validate_fn=_validate_sectors,
-                       source="eastmoney_sector", ttl=SECTOR_VALUATION_TTL)
+    S3-3B：PB 全为 null 是上游真实口径（只记 notes=pb_unavailable:N），
+    496 行对齐 total 时完整性仍然是 complete —— 不能因为字段缺失就把整份数据判成 partial。
+    """
+    return _sector_cached_get("sector_valuation", "valuation", SECTOR_VALUATION_TTL,
+                              trace=trace)
 
 
 
