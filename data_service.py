@@ -1550,114 +1550,220 @@ def get_financials_diagnostic(stock_code):
     return dict(_FIN_LAST_DIAG.get(stock_code) or {})
 
 
-def get_latest_financials(stock_code, refresh=False):
-    """最新一期财报（东方财富 F10 主要财务指标）
+def _fin_build_status(trace, fin):
+    """把一次请求的 trace 翻译成**请求级**财报状态对象（S3-4B）。
 
-    返回 {report_date, report_name, eps, bps, revenue, revenue_yoy,
-          net_profit, profit_yoy, roe, notice_date} 或 None（失败降级）
-    2026-08 新增：估值偏离需结合最新季报（净利润/营收同比、EPS）综合判断
-
-    S3-4A 迁移说明：请求、市场后缀（SECUCODE）、字段解析已整体搬到
-    `services/data/providers/eastmoney_f10.py::EastMoneyF10Provider`。
-    这里只保留缓存（fin_{code} / 6 小时 TTL / refresh 穿透）和旧返回契约。
-    采集证据 `tests/fixtures/s3_0/em_f10_600519.meta.json` 的 `source_ref`
-    仍然写的是本文件，S3-0 的漂移守卫（tests/test_s3_0_fixtures.py）要求
-    被引用文件里还能找到采集主机；因此此处保留原始接口地址作为出处标注，
-    真正的请求实现只有一个：上面的 Provider（`datacenter-web.eastmoney.com`
-    + RPT_F10_FINANCE_MAINFINADATA）。改接口请改 Provider，不要复制到这里。
+    六个事实分开说，不合并：
+      fetch_status  本次有没有打上游、结果如何（success/empty/failed/not_attempted）
+      served_from   这份数据从哪来（network/memory/file/file_fallback/memory_fallback/none）
+      freshness     相对于数据自身抓取时间的新鲜度（fresh/stale/unknown）
+      fetched_at    本次返回数据自己的抓取时间（本地时间字符串，绝不等于 report_date）
+      report_date   财报报告期（来自上游 REPORT_DATE）
+      cache_rejected 本次是否发生过非法缓存淘汰
+    另一个 report 字段 reason 是给人和日志看的原因说明。
     """
+    served = trace.get("served") or "none"
+    attempts = int(trace.get("attempts") or 0)
+    provider = trace.get("provider_status")
+    provider_reason = trace.get("provider_reason") or ""
+    rejected = bool(trace.get("cache_rejected"))
+
+    served_from = {
+        "network": "network",
+        "memory": "memory", "stale": "memory",
+        "file": "file",
+        "file_fallback": "file_fallback",
+        "memory_fallback": "memory_fallback",
+    }.get(served, "none")
+
+    # 1) 本次有没有请求上游
+    if served_from == "network":
+        fetch_status = "success"
+    elif served_from in ("file_fallback", "memory_fallback"):
+        # 回退就是回退，不能写 success；但上游到底是 empty 还是 failed 要如实保留
+        fetch_status = provider if provider in ("empty", "failed") else "failed"
+    elif attempts == 0:
+        fetch_status = "not_attempted"   # 纯缓存命中，不继承上一轮失败
+    else:
+        fetch_status = provider if provider in ("success", "empty", "failed") else "failed"
+
+    if fin is None:
+        if provider in ("empty", "failed"):
+            fetch_status = provider
+        elif attempts == 0:
+            fetch_status = "not_attempted"
+
+    asof = fin.get("_asof") if isinstance(fin, dict) else None
+    stale_flag = fin.get("_stale") if isinstance(fin, dict) else None
+
+    # 2) 新鲜度
+    if served_from == "network":
+        freshness = "fresh"
+    elif served_from == "memory":
+        freshness = "stale" if served == "stale" else "fresh"
+    elif served_from == "memory_fallback":
+        freshness = "stale"
+    elif served_from in ("file", "file_fallback"):
+        if asof is None:
+            freshness = "unknown"
+        elif stale_flag or served_from == "file_fallback":
+            freshness = "stale"
+        else:
+            freshness = "fresh"
+    else:
+        freshness = "unknown"
+
+    # 3) 原因
+    if trace.get("reason"):
+        reason = trace["reason"]
+    elif served_from == "network":
+        reason = "本次抓取成功"
+    elif served_from == "memory":
+        reason = ("返回内存中的上一轮财报，后台正在刷新" if served == "stale"
+                  else "命中内存缓存，本次未请求上游")
+    elif served_from == "file":
+        reason = "读取本地财报快照（本进程未请求上游）"
+    elif served_from == "file_fallback":
+        reason = "本次抓取失败，回退到文件缓存"
+    elif served_from == "memory_fallback":
+        reason = "本次抓取失败，回退到内存中的财报快照"
+    elif fetch_status == "empty":
+        reason = "上游正常响应但没有财报记录"
+    elif fetch_status == "failed":
+        reason = provider_reason or "本次未取得财报"
+    else:
+        reason = "本次未请求上游，也没有可用财报"
+
+    return {
+        "fetch_status": fetch_status,
+        "served_from": served_from,
+        "freshness": freshness,
+        "fetched_at": (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(asof)))
+                       if asof else None),
+        "report_date": (fin.get("report_date") if isinstance(fin, dict) else None) or None,
+        "cache_rejected": rejected,
+        "reason": reason,
+    }
+
+
+def _fin_legacy_label(status):
+    """旧版排查标签（S3-4A 的 status 字段），只给 _FIN_LAST_DIAG 用。"""
+    if status.get("served_from") == "memory_fallback":
+        return "memory_fallback"
+    fetch = status.get("fetch_status")
+    if fetch == "success":
+        return "ok" if status.get("served_from") == "network" else "cache_hit"
+    if fetch == "empty":
+        return "empty"
+    if fetch == "failed":
+        return "failed"
+    if fetch == "not_attempted":
+        return "cache_hit" if status.get("served_from") not in ("none",) else "failed"
+    return "failed"
+
+
+def _fin_get_with_cache(stock_code, refresh, trace):
+    """真正干活的部分：缓存读取、坏缓存淘汰、有界重抓、合法回退。状态写进 trace。"""
     key = f"fin_{stock_code}"
-    diag = {"status": "pending", "reason": "", "cache_reason": "",
-            "served": None, "cache_rejected": False}
+    trace.setdefault("attempts", 0)
+    trace.setdefault("cache_rejected", False)
 
     def fetch():
-        # S3-4A：请求/市场后缀/字段解析全部在 EastMoneyF10Provider 里，
-        # 这里只把 Provider 状态翻译回旧的业务返回值（业务方仍拿到 dict 或 None）。
         result = _providers.call("eastmoney_f10", stock_code)
-        if not result.ok():
-            # empty（没有财报）与 failed（接口/结构异常）在 Provider 层已区分，
-            # 但旧契约两者都返回 None；状态不塞进十字段 dict，避免估值代码把状态当财报。
-            diag["status"] = result.status
-            diag["reason"] = (result.error or {}).get("message", "")
-            return None
-        diag["status"] = "ok"
-        return result.data
+        if not trace.get("_closed"):
+            # 请求已结束（例如后台 SWR 后到）时仍要真抓真返回，只是不再回写状态，
+            # 否则后台刷新会拿到 None、把缓存越刷越空。
+            trace["attempts"] = trace.get("attempts", 0) + 1
+            trace["provider_status"] = result.status if not result.ok() else "success"
+            trace["provider_reason"] = (result.error or {}).get("message", "") if not result.ok() else ""
+        return result.data if result.ok() else None
 
     def read(force=False):
-        trace = {}
+        sub = {}
         value = _cached_get(key, fetch, validate_fn=_fin_values_finite,
-                            source="eastmoney", ttl=6 * 3600, force=force,
-                            trace=trace)
-        diag["served"] = trace.get("served")
+                            source="eastmoney", ttl=6 * 3600, force=force, trace=sub)
+        trace["served"] = sub.get("served")
         return value
 
-    # 进缓存层之前先摘掉"明显非法的内存条目"：
-    # 它不能当 SWR 旧数据（否则会先起一个后台刷新），也不该挡住后面那份合法文件缓存。
     if _fin_memory_invalid(stock_code):
         _drop_fin_memory(stock_code)
-        diag["cache_rejected"] = True
-        diag["cache_reason"] = "内存缓存中的财报含 NaN/Infinity，已淘汰内存条目"
+        trace["cache_rejected"] = True
+        trace["cache_reason"] = "内存缓存中的财报含 NaN/Infinity，已淘汰内存条目"
 
     fin = read(force=refresh)
 
     if fin is not None and not _fin_values_finite(fin):
-        # 走到这里说明坏值来自文件缓存（内存已预检），只删文件那一层，内存/其它 key 不动。
-        served = diag.get("served")
+        served = trace.get("served")
         if served in ("memory", "stale"):
             _drop_fin_memory(stock_code)
         else:
             _drop_fin_file(stock_code)
-        diag["cache_rejected"] = True
-        diag["cache_reason"] = f"缓存中的财报含 NaN/Infinity（来源 {served}），已淘汰该层"
+        trace["cache_rejected"] = True
+        trace["cache_reason"] = f"缓存中的财报含 NaN/Infinity（来源 {served}），已淘汰该层"
         if served == "file_fallback":
-            # 本轮上游刚刚已经失败过一次，坏文件只是兜底数据：淘汰即可，不再重复请求。
-            # 但另一层（内存）如果有合法财报，可以降级回退，别把数据一起丢掉。
             fb = _fin_memory_fallback(
                 stock_code, "本次抓取失败、文件缓存不可用，回退到内存中的财报快照（非本次网络结果）")
             if fb is not None:
-                diag["status"] = "memory_fallback"
-                diag["reason"] = f"{diag['cache_reason']}；已回退到内存中的合法财报快照"
-                _FIN_LAST_DIAG[stock_code] = dict(diag)
+                trace["served"] = "memory_fallback"
+                trace["reason"] = f"{trace['cache_reason']}；已回退到内存中的合法财报快照"
                 return fb
-            diag["status"] = "failed"
-            diag["reason"] = f"{diag['cache_reason']}；本轮上游已失败，不再重试"
-            _FIN_LAST_DIAG[stock_code] = dict(diag)
+            trace["reason"] = f"{trace['cache_reason']}；本轮上游已失败，不再重试"
             return None
-        diag["cache_reason"] = f"{diag['cache_reason']}并重抓一次"
+        trace["cache_reason"] = f"{trace['cache_reason']}并重抓一次"
         fin = read(force=True)
         if fin is not None and not _fin_values_finite(fin):
-            # 重抓拿回来的仍然不可用：宁可不给财报，也不能把非法值送进估值模型
-            diag["status"] = "cache_rejected"
-            diag["reason"] = (diag["cache_reason"] + "；重抓后仍含 NaN/Infinity，拒绝返回").strip("；")
-            _FIN_LAST_DIAG[stock_code] = dict(diag)
+            trace["reason"] = f"{trace['cache_reason']}；重抓后仍含 NaN/Infinity，拒绝返回"
             return None
 
     if fin is not None:
-        if diag["status"] != "ok":
-            diag["status"] = "ok" if diag.get("served") == "network" else "cache_hit"
-        if diag["cache_reason"]:
-            diag["reason"] = diag["cache_reason"]
-        _FIN_LAST_DIAG[stock_code] = dict(diag)
+        if trace.get("cache_reason"):
+            trace["reason"] = trace["cache_reason"]
         return fin
 
-    # 没拿到财报：先看另一层是否还有合法内存快照（休市读盘失败、force 刷新失败都走这里）
     fb = _fin_memory_fallback(
         stock_code, "本次未取得新的财报，回退到内存中的财报快照（非本次网络结果）")
     if fb is not None:
-        diag["status"] = "memory_fallback"
-        diag["reason"] = (diag["cache_reason"] + "；已回退到内存中的合法财报快照").strip("；")
-        _FIN_LAST_DIAG[stock_code] = dict(diag)
+        trace["served"] = "memory_fallback"
+        trace["reason"] = (str(trace.get("cache_reason") or "") + "；已回退到内存中的合法财报快照").strip("；")
         return fb
 
-    # 两层都没有可用财报：状态以 Provider 结果为准（empty / failed）
-    if diag["status"] == "pending":
-        diag["status"] = "failed"
-    if diag["cache_reason"]:
-        diag["reason"] = f"{diag['cache_reason']}；本次未取得财报（{diag['reason'] or '上游不可用'}）"
-    elif not diag["reason"]:
-        diag["reason"] = "本次未取得财报"
-    _FIN_LAST_DIAG[stock_code] = dict(diag)
+    if trace.get("cache_reason"):
+        trace["reason"] = (f"{trace['cache_reason']}；本次未取得财报"
+                           f"（{trace.get('provider_reason') or '上游不可用'}）")
     return None
+
+
+def get_latest_financials(stock_code, refresh=False, trace=None):
+    """最新一期财报（东方财富 F10 主要财务指标）
+
+    返回 {report_date, report_name, eps, bps, revenue, revenue_yoy,
+          net_profit, profit_yoy, roe, notice_date} 或 None（没有可用财报）
+    2026-08 新增：估值偏离需结合最新季报（净利润/营收同比、EPS）综合判断
+
+    S3-4A：请求、市场后缀、字段解析在 `EastMoneyF10Provider`；这里只保留缓存
+    （fin_{code} / 6 小时 TTL / refresh 穿透）与旧返回契约。
+    原采集出处（S3-0 夹具 source_ref 指向这里，勿删）：datacenter-web.eastmoney.com
+    /api/data/v1/get（RPT_F10_FINANCE_MAINFINADATA）。
+
+    S3-4B：`trace` 是**调用方自己的**字典，本次请求结束后会多出 `trace["status"]`
+    （请求级财报状态：fetch_status / served_from / freshness / fetched_at /
+    report_date / cache_rejected / reason）。不传 trace 时行为和以前完全一样。
+    返回值契约不变：仍是十字段 dict 或 None，状态绝不塞进财报本体。
+    """
+    trace = {} if trace is None else trace
+    fin = None
+    try:
+        fin = _fin_get_with_cache(stock_code, refresh, trace)
+    finally:
+        trace["_closed"] = True
+        trace["status"] = _fin_build_status(trace, fin)
+        try:
+            # 仅排查用，别拿去渲染页面：附带旧版 `status` 标签，方便对照历史日志
+            _FIN_LAST_DIAG[stock_code] = dict(
+                trace["status"], status=_fin_legacy_label(trace["status"]))
+        except Exception:
+            pass
+    return fin
 
 
 def get_industry_pe(stock_code, refresh=False):
@@ -1730,7 +1836,7 @@ def get_industry_pe(stock_code, refresh=False):
             "reason": "没有真实行业 PE，不用默认倍数顶替"}
 
 
-def get_stock_valuation(stock_code, refresh=False):
+def get_stock_valuation(stock_code, refresh=False, trace=None):
     """个股估值（refresh=True 时强制穿透行业PE/财报缓存重新拉取）
 
     2026-11：PE 缺失不再用行业 PE 顶替。
@@ -1782,7 +1888,12 @@ def get_stock_valuation(stock_code, refresh=False):
 
     # 2026-08 新增：估值偏离结合最新季报财报 + 产业政策事件
     # 财报（净利润/营收同比、EPS）动态拉取；政策事件手动维护在 policy_notes.py
-    result["financials"] = get_latest_financials(stock_code, refresh=refresh)
+    # S3-4B：请求级财报状态（本次请求自己的 trace，不读模块级 _FIN_LAST_DIAG）
+    fin_trace = {}
+    result["financials"] = get_latest_financials(stock_code, refresh=refresh, trace=fin_trace)
+    result["financials_status"] = fin_trace.get("status")
+    if trace is not None:
+        trace["financials_status"] = fin_trace.get("status")
     result["policy_notes"] = get_policy_notes(stock_code, result["industry_name"])
     return result
 
@@ -1922,7 +2033,7 @@ def _mock_index_history(index_code, days=30):
 
 
 
-def estimate_intrinsic_value(stock_quote):
+def estimate_intrinsic_value(stock_quote, trace=None):
     """估算内在价值（PE 估算法）
 
     内在价值 = 年化 EPS × 行业 PE × VALUATION_SAFETY_MARGIN
@@ -1946,7 +2057,11 @@ def estimate_intrinsic_value(stock_quote):
     # EPS：只认最新财报（按报告期年化）；亏损（EPS<=0）不适用 PE 估算法
     eps, eps_source = None, "report_missing"
     raw_eps, report_date, annual_factor = None, "", None
-    fin = get_latest_financials(code)
+    fin_trace = {}
+    fin = get_latest_financials(code, trace=fin_trace)
+    fin_status = fin_trace.get("status")
+    if trace is not None:
+        trace["financials_status"] = fin_status
     if fin and fin.get("eps") not in (None, ""):
         try:
             raw_eps = float(fin["eps"])
@@ -2009,6 +2124,7 @@ def estimate_intrinsic_value(stock_quote):
             "pe_reference": pe_reference,
             "model_params": model_params,
             "financials": fin,
+            "financials_status": fin_status,
         }
 
     intrinsic = round(eps * industry_pe * VALUATION_SAFETY_MARGIN, 2)
@@ -2025,6 +2141,7 @@ def estimate_intrinsic_value(stock_quote):
         "pe_reference": pe_reference,
         "model_params": model_params,
         "financials": fin,
+        "financials_status": fin_status,
     }
 
 

@@ -326,6 +326,8 @@ def api_valuation():
             "仅作横向参考，不直接等于高估/低估结论")
         # 2026-08: 财报快照 + 政策事件（build_valuation_chart 会重建 dict，需手动补挂）
         chart["financials"] = data.get("financials")
+        # S3-4B：请求级财报状态跟着这次响应走，不读全局最新值
+        chart["financials_status"] = data.get("financials_status")
         chart["policy_notes"] = data.get("policy_notes") or []
         return jsonify({"code": 200, "data": chart})
     return jsonify({"code": 500, "msg": "数据获取失败"})
@@ -504,6 +506,7 @@ def api_intrinsic_value():
     if not quote:
         return jsonify({"code": 500, "msg": "获取数据失败"})
     iv = estimate_intrinsic_value(quote)
+    # estimate_intrinsic_value 内部为自己的请求生成了状态，这里只是原样带出
     return jsonify({"code": 200, "data": iv})
 
 

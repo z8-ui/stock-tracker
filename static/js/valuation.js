@@ -122,8 +122,45 @@ function loadStockValBySearch(code, name) {
 // ========== 财报快照 + 政策事件（2026-08 新增） ==========
 // 财报数据来自 data_service.get_latest_financials（东财F10，动态拉取+6小时缓存）
 // 政策事件来自 policy_notes.py（手动维护的策池，按时间线倒序）
-function buildFinancialsHtml(fin) {
-    if (!fin || !fin.report_date) return '';
+function finStatusToneColor(tone) {
+    return ({ok: '#26a69a', info: '#42a5f5', warn: '#ffa726',
+             error: '#ef5350', muted: '#8892b0'})[tone] || '#8892b0';
+}
+
+// 财报状态徽标 + 说明行（S3-4B）。status 来自 /api/valuation 的 financials_status。
+function finStatusBlock(status, withTitle) {
+    var view = (window.financialsStatus && window.financialsStatus.view)
+        ? window.financialsStatus.view(status)
+        : {kind: 'unknown', tone: 'muted', badge: '', message: '财报状态未知'};
+    var metaLine = (window.financialsStatus && window.financialsStatus.meta)
+        ? window.financialsStatus.meta(status) : '';
+    var color = finStatusToneColor(view.tone);
+    var badge = view.badge
+        ? '<span style="display:inline-block;border:1px solid ' + color + ';color:' + color +
+          ';font-size:10px;padding:0 5px;border-radius:3px;margin-left:6px;font-weight:normal;">' +
+          valEsc(view.badge) + '</span>'
+        : '';
+    var html = '';
+    if (withTitle) html += '<hr><p style="color:#e0e0e0;font-weight:bold;margin:6px 0;">📊 最新财报</p>';
+    html += '<p style="color:' + color + ';font-size:12px;margin:2px 0;">' + valEsc(view.message) + badge + '</p>';
+    if (metaLine) {
+        html += '<p style="color:#8892b0;font-size:11px;margin:2px 0;">' + valEsc(metaLine) + '</p>';
+    }
+    if (status && status.reason && view.kind !== 'live' && view.kind !== 'cache') {
+        html += '<p style="color:#5c6b8a;font-size:11px;margin:2px 0;">原因：' +
+                valEsc(status.reason) + '</p>';
+    }
+    return html;
+}
+
+// ========== 财报快照 + 政策事件（2026-08 新增） ==========
+// 财报数据来自 data_service.get_latest_financials（东财F10，动态拉取+6小时缓存）
+// S3-4B：没有可用财报时不再返回空字符串 —— 必须明确写出"没有财报/获取失败/缓存无效/旧数据"。
+// 状态对象由后端随同一次请求返回（financials_status），不读全局最新状态。
+function buildFinancialsHtml(fin, status) {
+    if (!fin || !fin.report_date) {
+        return finStatusBlock(status, true);
+    }
     function fmtYi(v) { return (v === null || v === undefined) ? '-' : (v / 1e8).toFixed(2) + '亿'; }
     function fmtPct(v) { return (v === null || v === undefined) ? '-' : ((v > 0 ? '+' : '') + Number(v).toFixed(1) + '%'); }
     function pctColor(v) { return (v || 0) > 0 ? '#ef5350' : ((v || 0) < 0 ? '#26a69a' : '#8892b0'); }
@@ -133,6 +170,7 @@ function buildFinancialsHtml(fin) {
         '<p style="color:#e0e0e0;font-weight:bold;margin:6px 0;">📊 最新财报 ' +
         '<span style="color:#8892b0;font-size:11px;font-weight:normal;">' + valEsc(fin.report_name || '') +
         ' · 披露 ' + valEsc(fin.notice_date || '-') + '</span></p>' +
+        finStatusBlock(status, false) +
         '<div class="summary-row"><span class="label">EPS（基本）</span><span class="value">' + eps + ' 元</span></div>' +
         '<div class="summary-row"><span class="label">净利润同比</span><span class="value" style="color:' + pctColor(fin.profit_yoy) + ';">' + fmtPct(fin.profit_yoy) + '</span></div>' +
         '<div class="summary-row"><span class="label">营收同比</span><span class="value" style="color:' + pctColor(fin.revenue_yoy) + ';">' + fmtPct(fin.revenue_yoy) + '</span></div>' +
@@ -439,7 +477,7 @@ function loadStockVal(code, name, refresh) {
                     '。历史估值分位：未接入真实历史 PE 序列，本页不显示该指标。</p>';
 
             // 财报快照留在"一、基础估值"；政策与事件已拆到"四、政策与事件"
-            document.getElementById('valuation-detail').innerHTML += buildFinancialsHtml(d.financials);
+            document.getElementById('valuation-detail').innerHTML += buildFinancialsHtml(d.financials, d.financials_status);
             renderPolicy(d.policy_notes || [],
                          { status: (d.policy_notes && d.policy_notes.length) ? 'real' : 'empty' },
                          d.industry_name || '');

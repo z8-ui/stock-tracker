@@ -347,7 +347,7 @@ class TestGroupD_MarketSuffix(unittest.TestCase):
         import inspect
         import services.data.providers.eastmoney_f10 as mod
         self.assertEqual(mod.URL, "https://datacenter-web.eastmoney.com/api/data/v1/get")
-        src = inspect.getsource(d.get_latest_financials)
+        src = inspect.getsource(d._fin_get_with_cache)
         self.assertNotIn("requests.get", src)
         self.assertNotIn('SECUCODE="', src)
         self.assertIn("eastmoney_f10", src)
@@ -599,6 +599,17 @@ class TestGroupF_BusinessRegression(unittest.TestCase):
         self.assertEqual(rv.get_json()["code"], 200)
 
 
+def _has_nonfinite(obj):
+    """递归检查结构里有没有非有限的浮点数（字符串里出现 "Infinity" 字样不算）。"""
+    if isinstance(obj, float):
+        return not math.isfinite(obj)
+    if isinstance(obj, dict):
+        return any(_has_nonfinite(v) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return any(_has_nonfinite(v) for v in obj)
+    return False
+
+
 def mutate(**overrides):
     """真实报文的深拷贝副本（原 fixture 不动），按业务/原始字段名覆盖 data[0]。"""
     raw = copy.deepcopy(load_raw())
@@ -708,7 +719,8 @@ class TestGroupG_NonFiniteValues(unittest.TestCase):
         self.assertIsNone(iv["intrinsic_value"])
         self.assertIsNone(iv["model_params"]["raw_eps"])
         payload = json.dumps(iv, allow_nan=False)   # 严格序列化：不允许 inf/nan 逃逸
-        self.assertNotIn("Infinity", payload)
+        self.assertFalse(_has_nonfinite(json.loads(payload)),
+                         "结构里不允许出现非有限浮点数（reason 里引用原始值 'Infinity' 字样不算）")
 
 
 class TestGroupH_OptionalNoticeDate(unittest.TestCase):
