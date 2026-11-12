@@ -2,13 +2,22 @@
 {% block title %}板块热力图{% endblock %}
 
 {% block content %}
+<style>
+    /* 本页局部样式：只作用于热力图标题下方的范围说明，不改全局 card-header */
+    .heatmap-meta {
+        color: #8892b0; font-size: 12px; line-height: 1.7;
+        margin: -6px 0 12px; white-space: normal; word-break: break-word;
+    }
+    .heatmap-meta.warn { color: #ffb74d; }
+</style>
 <div class="card">
     <div class="card-header">
         行业板块热力图
         <span class="hint">方块面积 = 资金规模 | 颜色: 红/橙=流入, 绿/蓝=流出</span>
         <span id="status-heatmap-page" class="hint" style="color:#ffb74d;font-size:11px;"></span>
-        <div id="status-heatmap-range" class="hint" style="color:#8892b0;font-size:12px;padding:2px 0 0;line-height:1.6;"></div>
     </div>
+    <!-- 范围/完整性独立一行：不挤 flex 标题，长文案可换行（S3-3C 整改） -->
+    <div id="status-heatmap-range" class="heatmap-meta"></div>
     <div id="chart-heatmap" class="chart-box chart-largest"></div>
 </div>
 
@@ -49,7 +58,16 @@ function loadHeatmapData() {
         })
         .then(x => {
             const res = x.res, meta = x.meta;
-            if (!res || res.code !== 200) return;
+            if (!res || res.code !== 200) {
+                // 失败不能留空白图：明确写出"无可用数据"
+                const el = document.getElementById('status-heatmap-range');
+                if (el) {
+                    el.className = 'heatmap-meta warn';
+                    el.textContent = '⚠ 板块数据不可用：' + ((res && res.msg) || '接口未返回数据') +
+                        '。' + window.sectorView.freshnessText(meta);
+                }
+                return;
+            }
             const data = res.data;
 
             // 1. 热力图（treemap）—— 后端给多少画多少
@@ -66,9 +84,11 @@ function loadHeatmapData() {
             // 4. 范围与完整性
             const rangeEl = document.getElementById('status-heatmap-range');
             if (rangeEl) {
+                const fresh = window.sectorView.freshnessText(meta);
+                rangeEl.className = 'heatmap-meta' + ((meta.completeness !== 'complete' ||
+                    meta.freshness !== 'fresh' || meta.fetch_status === 'failed') ? ' warn' : '');
                 rangeEl.textContent = window.sectorView.rangeText(meta, data.length) +
-                    ' 涨跌幅 / 资金流入排行各展示前 ' + TOP_N + ' 个。' +
-                    ' ' + window.sectorView.freshnessText(meta);
+                    ' 涨跌幅 / 资金流入排行各展示前 ' + TOP_N + ' 个。 ' + fresh;
             }
 
             // 4. 市场状态（模拟数据必须显式标出，不能让人当真实资金流用）

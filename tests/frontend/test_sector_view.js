@@ -149,4 +149,72 @@ ok('无 NaN 泄漏: 全 null 输入不抛异常',
     sv.peRank([{ name: 'a', pe: null }, { name: 'b', pe: null }], 20).counts.missing === 2);
 
 console.log('\n' + (failed === 0 ? 'ALL PASS' : failed + ' FAILED'));
+
+/* ---------- 13. 极端负 PE 与正 PE 共存：分组与计数必须对得上 ---------- */
+const extreme = [];
+for (let i = 0; i < 406; i++) extreme.push({ name: 'P' + i, pe: 5 + i * 0.3, pb: null, market_cap: 100 + i });
+for (let i = 0; i < 89; i++) extreme.push({ name: 'L' + i, pe: -2 - i, pb: null, market_cap: 50 + i });
+extreme.push({ name: '极端亏损', pe: -36378.67, pb: null, market_cap: 12.3 });
+const bpX = sv.bubblePoints(extreme);
+ok('极端负 PE 被保留在 negative（不被删除）', bpX.negative.some(p => p.pe === -36378.67));
+ok('负 PE 数量 90', bpX.negative.length === 90, 'got=' + bpX.negative.length);
+ok('正 PE 数量 406', bpX.positive.length === 406, 'got=' + bpX.positive.length);
+ok('已绘制数 = 各组之和 = 总数（496）',
+   bpX.drawn === 496 && bpX.drawn === bpX.positive.length + bpX.negative.length + bpX.zero.length);
+ok('极端值后仍保留原始 PE 数值', bpX.negative.find(p => p.name === '极端亏损').pe === -36378.67);
+ok('极端值后仍保留市值', bpX.negative.find(p => p.name === '极端亏损').cap === 12.3);
+
+/* ---------- 14. PE=0 语义：不是盈利，也不是亏损 ---------- */
+const zeroRows = [
+    { name: '零PE', pe: 0, pb: null, market_cap: 300 },
+    { name: '正PE', pe: 9.9, pb: null, market_cap: 400 },
+    { name: '负PE', pe: -8.8, pb: null, market_cap: 500 }
+];
+const bpZ = sv.bubblePoints(zeroRows);
+eq('PE=0 单独一组', bpZ.zero.map(p => p.name), ['零PE']);
+ok('PE=0 不在盈利组', !bpZ.positive.some(p => p.pe === 0));
+ok('PE=0 不在亏损组', !bpZ.negative.some(p => p.pe === 0));
+ok('PE=0 仍被绘制（计入 drawn）', bpZ.drawn === 3);
+const rZ = sv.peRank(zeroRows, 20);
+ok('PE=0 不进入正 PE 排行', rZ.ranked.length === 1 && rZ.ranked[0].pe === 9.9);
+ok('PE=0 计入 zero 计数', rZ.counts.zero === 1);
+
+/* ---------- 15. completeness=unknown 但 total 已知 ---------- */
+const tU = sv.rangeText({ rows: 400, total: 496, completeness: 'unknown' }, 20);
+ok('unknown + total 已知：不能写"上游总量未知"', !/上游总量未知/.test(tU), tU);
+ok('unknown + total 已知：要写出上游报告总量 496', /上游报告总量 496/.test(tU), tU);
+ok('unknown + total 已知：不能声称完整', !/行业板块共/.test(tU), tU);
+ok('unknown + total 已知：保留 Top N 后缀', /当前展示前 20 个/.test(tU), tU);
+
+/* ---------- 16. failed + served_from=none：无可用数据 ---------- */
+const tNone = sv.freshnessText({ fetch_status: 'failed', served_from: 'none', freshness: 'unknown' });
+ok('完全失败不说"展示旧缓存"', !/旧缓存/.test(tNone), tNone);
+ok('完全失败明确说"当前无可用数据"', /当前无可用数据/.test(tNone), tNone);
+
+/* ---------- 17. failed + file_fallback：才可以说旧缓存 ---------- */
+const tFb = sv.freshnessText({ fetch_status: 'failed', served_from: 'file_fallback',
+                               freshness: 'stale', fetched_at: '2026-11-11 15:00:00' });
+ok('file_fallback 说旧缓存', /旧缓存/.test(tFb), tFb);
+ok('file_fallback 带本地抓取时间', /2026-11-11 15:00:00/.test(tFb), tFb);
+
+/* ---------- 18/19. 排行计数作用域 ---------- */
+const sPartial = sv.scopeText({ rows: 400, total: 496, completeness: 'partial' });
+ok('partial：说"本次取得 400/496"', /本次取得 400\/496/.test(sPartial), sPartial);
+ok('partial：不说"行业板块共"', !/行业板块共/.test(sPartial), sPartial);
+const sUnknown = sv.scopeText({ rows: 400, total: 496, completeness: 'unknown' });
+ok('unknown：说"完整性未知"且给出上游总量', /完整性未知/.test(sUnknown) && /496/.test(sUnknown), sUnknown);
+const sComplete = sv.scopeText({ rows: 496, total: 496, completeness: 'complete' });
+ok('complete 且 rows=total：才允许"行业板块共 496 个"', sComplete === '行业板块共 496 个', sComplete);
+const sMismatch = sv.scopeText({ rows: 400, total: 496, completeness: 'complete' });
+ok('complete 但 rows≠total：不得说"行业板块共"', !/行业板块共/.test(sMismatch), sMismatch);
+
+/* ---------- 20. 文案里的数字必须等于实际绘制数 ---------- */
+const note = '已绘制 ' + bpX.drawn + '/' + bpX.total + ' 个：正 PE ' + bpX.positive.length +
+    ' 个、PE=0 ' + bpX.zero.length + ' 个、亏损 ' + bpX.negative.length + ' 个';
+const m = note.match(/已绘制 (\d+)\/(\d+) 个：正 PE (\d+) 个、PE=0 (\d+) 个、亏损 (\d+) 个/);
+ok('文案可解析', !!m);
+ok('文案已绘制数 = 实际绘制数', Number(m[1]) === bpX.drawn && Number(m[1]) === 496);
+ok('文案各组之和 = 已绘制数',
+   Number(m[3]) + Number(m[4]) + Number(m[5]) === Number(m[1]));
+
 process.exit(failed === 0 ? 0 : 1);

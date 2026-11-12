@@ -752,7 +752,15 @@ function loadSectorValuation() {
         .then(function(x) {
             var st = document.getElementById('sector-status');
             if (st) st.textContent = window.sectorView.freshnessText(x.meta);
-            if (!x.res || x.res.code !== 200) return;
+            if (!x.res || x.res.code !== 200) {
+                var msg = '⚠ 板块估值数据不可用：' + ((x.res && x.res.msg) || '接口未返回数据') +
+                    '。' + window.sectorView.freshnessText(x.meta);
+                ['sector-scatter-note', 'sector-rank-note'].forEach(function (id) {
+                    var el = document.getElementById(id);
+                    if (el) el.textContent = msg;
+                });
+                return;
+            }
             renderSectorValuation('chart-sector-scatter', x.res.data, x.meta);
             renderSectorPERank('chart-sector-pe-rank', x.res.data, x.meta);
         });

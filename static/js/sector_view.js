@@ -55,7 +55,7 @@
     /* 气泡图数据：x=PE，y=市值（亿），气泡大小=市值。PB 缺失不画成 0。 */
     function bubblePoints(rows) {
         rows = rows || [];
-        var pos = [], neg = [], noPe = 0, noCap = 0, pbMissing = 0;
+        var pos = [], neg = [], zero = [], noPe = 0, noCap = 0, pbMissing = 0;
         rows.forEach(function (r) {
             var pe = r ? num(r.pe) : null;
             var cap = r ? num(r.market_cap) : null;
@@ -64,11 +64,14 @@
             if (pe === null) { noPe++; return; }          // 缺 PE：不画点（不能当 0 画在轴上）
             if (cap === null || cap <= 0) { noCap++; return; }  // 缺市值：不画点，但计数说明
             var pt = { name: String(r.name || ''), pe: pe, cap: cap };
-            if (pe < 0) neg.push(pt); else pos.push(pt);
+            // PE=0 是真实值，不是盈利也不是亏损：单独一组，避免"0 被算成盈利"
+            if (pe < 0) neg.push(pt); else if (pe > 0) pos.push(pt); else zero.push(pt);
         });
         return {
-            positive: pos, negative: neg, noPe: noPe, noCap: noCap,
+            positive: pos, negative: neg, zero: zero,
+            noPe: noPe, noCap: noCap,
             pbMissing: pbMissing, total: rows.length,
+            drawn: pos.length + neg.length + zero.length,
             pbAllMissing: rows.length > 0 && pbMissing === rows.length
         };
     }
@@ -95,7 +98,10 @@
                 s = '数据不完整：本次取得的板块数未知';
             }
         } else if (completeness === 'unknown') {
-            if (rows !== null) {
+            if (rows !== null && total !== null) {
+                s = '完整性未知：本次取得 ' + fmtInt(rows) + ' 个板块，上游报告总量 ' +
+                    fmtInt(total) + ' 个，但无法确认本次数据完整性';
+            } else if (rows !== null) {
                 s = '完整性未知：本次取得 ' + fmtInt(rows) + ' 个板块（上游总量未知）';
             } else {
                 s = '完整性未知：板块数量无法确认';
@@ -124,13 +130,45 @@
         var fresh = meta.freshness || 'unknown';
         var when = meta.fetched_at || '';
         var tail = when ? '（本地抓取时间 ' + when + '）' : '';
-        if (served === 'file_fallback' || meta.fetch_status === 'failed') {
+        var hasData = served && served !== 'none';
+        if (meta.fetch_status === 'failed' && !hasData) {
+            return '⚠ 本次抓取失败，当前无可用数据。';
+        }
+        if (served === 'file_fallback') {
             return '⚠ 本次抓取失败，展示的是旧缓存' + tail + '，不是实时数据。';
+        }
+        if (meta.fetch_status === 'failed' && hasData) {
+            return '⚠ 本次抓取失败，展示的是已有缓存' + tail + '。';
         }
         if (fresh === 'stale') return '⚠ 数据已过期' + tail + '。';
         if (fresh === 'unknown') return '⚠ 无法确认数据新鲜度' + tail + '。';
         if (meta.asof && meta.asof !== 'unknown') return '数据时间 ' + meta.asof + '；' + tail;
         return '上游未提供数据时间，仅显示本地抓取时间' + (when ? ' ' + when : '') + '。';
+    }
+
+    /* 计数作用域：complete 才说"共 N 个"，partial/unknown 只能说"本次取得"。 */
+    function scopeText(meta, rowsFromData) {
+        meta = meta || {};
+        var rows = num(meta.rows);
+        if (rows === null) rows = num(rowsFromData);
+        var total = num(meta.total);
+        var c = meta.completeness || 'unknown';
+        if (c === 'complete' && total !== null && rows !== null && rows === total) {
+            return '行业板块共 ' + fmtInt(total) + ' 个';
+        }
+        if (c === 'partial') {
+            if (rows !== null && total !== null) {
+                return '数据不完整：本次取得 ' + fmtInt(rows) + '/' + fmtInt(total) +
+                    ' 个板块（缺 ' + fmtInt(Math.max(0, total - rows)) + ' 个）';
+            }
+            return '数据不完整：本次取得 ' + (rows === null ? '未知' : fmtInt(rows)) + ' 个板块';
+        }
+        if (c === 'unknown' && rows !== null) {
+            return total !== null
+                ? '完整性未知：本次取得 ' + fmtInt(rows) + ' 个板块（上游报告总量 ' + fmtInt(total) + ' 个）'
+                : '完整性未知：本次取得 ' + fmtInt(rows) + ' 个板块（上游总量未知）';
+        }
+        return '完整性未知：本次取得 ' + (rows === null ? '未知' : fmtInt(rows)) + ' 个板块';
     }
 
     /* 读取 X-Data-*：只接受真实响应头，缺失一律 null（不猜）。 */
@@ -167,6 +205,7 @@
         peRank: peRank,
         bubblePoints: bubblePoints,
         rangeText: rangeText,
+        scopeText: scopeText,
         freshnessText: freshnessText,
         parseHeaders: parseHeaders
     };
