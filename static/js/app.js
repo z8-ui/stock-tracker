@@ -471,54 +471,122 @@ function renderIntrinsicValue(domId, data) {
     });
 }
 
-// ========== 板块估值气泡图 ==========
+// ========== 板块估值气泡图（S3-3C：PE × 市值，PB 缺失不再画成 0） ==========
 
-function renderSectorValuation(domId, sectors) {
+function renderSectorValuation(domId, sectors, meta) {
     const chart = getChart(domId);
     if (!chart) return;
+    const sv = window.sectorView;
+    const pts = sv.bubblePoints(sectors || []);
 
-    var data = sectors.map(function(s) {
+    function scatterSeries(label, arr, color) {
         return {
-            name: s.name,
-            value: [s.pe, s.pb, s.market_cap, s.name],
-            itemStyle: { color: s.change >= 0 ? '#ef5350' : '#26a69a' }
+            name: label,
+            type: 'scatter',
+            data: arr.map(function (p) {
+                return { name: p.name, value: [p.pe, p.cap], itemStyle: { color: color } };
+            }),
+            symbolSize: function (val) {
+                // 市值（亿元）→ 半径：log 压缩，避免个别超大板块吃掉整张图
+                var c = Math.max(1, Number(val[1]) || 1);
+                return Math.max(8, Math.min(46, 8 * Math.log10(c + 10)));
+            },
+            label: {
+                show: true,
+                formatter: function (p) { return p.data.name; },
+                color: '#e0e0e0', fontSize: 10, position: 'right'
+            }
         };
-    });
+    }
 
     chart.setOption({
-        title: { text: '板块估值散点图（PE vs PB）', textStyle: { color: '#e0e0e0', fontSize: 14 } },
-        tooltip: { formatter: function(p) { return p.data.name + '<br/>PE: ' + p.data.value[0] + '<br/>PB: ' + p.data.value[1] + '<br/>市值: ' + p.data.value[2] + '亿'; } },
-        grid: { left: '3%', right: '4%', bottom: '3%', containLabel: true },
-        xAxis: { name: 'PE', nameTextStyle: { color: '#8892b0' }, axisLabel: { color: '#8892b0' }, splitLine: { lineStyle: { color: '#233054' } } },
-        yAxis: { name: 'PB', nameTextStyle: { color: '#8892b0' }, axisLabel: { color: '#8892b0' }, splitLine: { lineStyle: { color: '#233054' } } },
-        series: [{
-            type: 'scatter',
-            data: data,
-            symbolSize: function(val) { return Math.max(10, Math.min(50, val[2] / 500)); },
-            label: { show: true, formatter: function(p) { return p.data.name; }, color: '#e0e0e0', fontSize: 10, position: 'right' }
-        }]
-    });
+        title: { text: '板块估值气泡图（PE × 市值）', textStyle: { color: '#e0e0e0', fontSize: 14 } },
+        legend: { data: ['盈利（PE>0）', '亏损（PE<0）'], textStyle: { color: '#8892b0' }, top: 24 },
+        tooltip: {
+            formatter: function (p) {
+                var pe = p.data.value[0], cap = p.data.value[1];
+                var peTxt = pe < 0 ? pe + '（亏损，不代表低估值）' : pe;
+                return p.data.name + '<br/>PE: ' + peTxt + '<br/>市值: ' + window.fmt.money(cap, '亿');
+            }
+        },
+        grid: { left: '3%', right: '6%', bottom: '10%', top: 60, containLabel: true },
+        xAxis: {
+            type: 'value', name: 'PE', nameTextStyle: { color: '#8892b0' },
+            axisLabel: { color: '#8892b0' }, splitLine: { lineStyle: { color: '#233054' } }
+        },
+        yAxis: {
+            type: 'value', name: '市值（亿元）', nameTextStyle: { color: '#8892b0' },
+            axisLabel: { color: '#8892b0' }, splitLine: { lineStyle: { color: '#233054' } }
+        },
+        series: [
+            scatterSeries('盈利（PE>0）', pts.positive, '#ef5350'),
+            scatterSeries('亏损（PE<0）', pts.negative, '#7e57c2')
+        ]
+    }, true);
+
+    var note = document.getElementById('sector-scatter-note');
+    if (note) {
+        var parts = [];
+        parts.push(pts.pbAllMissing
+            ? 'PB：暂无数据（上游 ' + pts.total + '/' + pts.total + ' 返回 "-"），本图不使用 PB 轴'
+            : 'PB：部分板块缺失（' + pts.pbMissing + '/' + pts.total + ' 为 null）');
+        parts.push('已绘制 ' + (pts.positive.length + pts.negative.length) + '/' + pts.total + ' 个板块');
+        if (pts.noPe) parts.push('PE 缺失 ' + pts.noPe + ' 个（不绘制，显示 --）');
+        if (pts.noCap) parts.push('市值缺失 ' + pts.noCap + ' 个（不绘制）');
+        if (pts.negative.length) parts.push('紫色为亏损板块（PE<0），不是低估值');
+        if (meta) parts.push(sv.rangeText(meta, pts.total));
+        note.textContent = parts.join('；');
+    }
 }
 
-// ========== 板块估值排行（PE排行） ==========
+// ========== 板块 PE 排行（S3-3C：只排正 PE，负 PE 单列） ==========
 
-function renderSectorPERank(domId, sectors) {
+function renderSectorPERank(domId, sectors, meta) {
     const chart = getChart(domId);
     if (!chart) return;
+    const sv = window.sectorView;
+    const TOP = 20;
+    const r = sv.peRank(sectors || [], TOP);
 
-    var sorted = sectors.slice().sort(function(a,b) { return b.pe - a.pe; });
+    var rows = r.ranked.slice().reverse();      // ECharts 横向柱：自下而上
     chart.setOption({
+        title: { text: '板块 PE 排行（仅正 PE，低估值在前）', textStyle: { color: '#e0e0e0', fontSize: 14 } },
         tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
-        grid: { left: '3%', right: '4%', bottom: '3%', containLabel: true },
-        xAxis: { type: 'value', axisLabel: { color: '#8892b0' }, splitLine: { lineStyle: { color: '#233054' } } },
-        yAxis: { type: 'category', data: sorted.map(function(s) { return s.name; }).reverse(), axisLabel: { color: '#e0e0e0', fontSize: 11 } },
+        grid: { left: '16%', right: '12%', bottom: '8%', top: 44, containLabel: true },
+        xAxis: {
+            type: 'value', name: 'PE', nameTextStyle: { color: '#8892b0' },
+            axisLabel: { color: '#8892b0' }, splitLine: { lineStyle: { color: '#233054' } }
+        },
+        yAxis: {
+            type: 'category', data: rows.map(function (x) { return x.name; }),
+            axisLabel: { color: '#e0e0e0', fontSize: 11 }
+        },
         series: [{
             type: 'bar',
-            data: sorted.map(function(s) { return { value: s.pe, itemStyle: { color: s.pe > 40 ? '#ef5350' : (s.pe < 15 ? '#26a69a' : '#ffb74d') } }; }).reverse(),
+            data: rows.map(function (x) {
+                return { value: x.pe, itemStyle: { color: x.pe > 40 ? '#ef5350' : (x.pe < 15 ? '#26a69a' : '#ffb74d') } };
+            }),
             barWidth: 14,
-            label: { show: true, position: 'right', formatter: function(p) { return p.value; }, color: '#8892b0', fontSize: 11 }
+            label: {
+                show: true, position: 'right', color: '#8892b0', fontSize: 11,
+                formatter: function (p) { return Number(p.value).toFixed(2); }
+            }
         }]
-    });
+    }, true);
+
+    var note = document.getElementById('sector-rank-note');
+    if (note) {
+        var c = r.counts;
+        var txt = '共 ' + c.total + ' 个板块：正 PE ' + c.positive + ' 个（排行只用这些）；' +
+            '亏损 ' + c.negative + ' 个（PE<0，不代表低估值）；' +
+            'PE=0 ' + c.zero + ' 个；PE 缺失 ' + c.missing + ' 个（显示 --，不参与排行）。';
+        if (r.loss.length) {
+            txt += ' 亏损板块（前 ' + r.loss.length + '）：' +
+                r.loss.map(function (x) { return x.name + '(' + x.pe.toFixed(2) + ')'; }).join('、') + '。';
+        }
+        if (meta) txt += ' ' + sv.rangeText(meta, r.shown);
+        note.textContent = txt;
+    }
 }
 
 /* ---------------------------------------------------------------- 数据健康

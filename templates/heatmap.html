@@ -7,6 +7,7 @@
         行业板块热力图
         <span class="hint">方块面积 = 资金规模 | 颜色: 红/橙=流入, 绿/蓝=流出</span>
         <span id="status-heatmap-page" class="hint" style="color:#ffb74d;font-size:11px;"></span>
+        <div id="status-heatmap-range" class="hint" style="color:#8892b0;font-size:12px;padding:2px 0 0;line-height:1.6;"></div>
     </div>
     <div id="chart-heatmap" class="chart-box chart-largest"></div>
 </div>
@@ -39,22 +40,36 @@
 {% block scripts %}
 <script>
 function loadHeatmapData() {
+    const TOP_N = 20;
     fetch('/api/heatmap')
-        .then(r => r.json())
-        .then(res => {
-            if (res.code !== 200) return;
+        .then(r => {
+            // S3-3C：完整性只认 X-Data-*，不从本地行数推断上游总量
+            const meta = window.sectorView.parseHeaders(n => r.headers.get(n));
+            return r.json().then(res => ({ res: res, meta: meta }));
+        })
+        .then(x => {
+            const res = x.res, meta = x.meta;
+            if (!res || res.code !== 200) return;
             const data = res.data;
 
-            // 1. 热力图（treemap）
+            // 1. 热力图（treemap）—— 后端给多少画多少
             renderTreemap('chart-heatmap', '行业板块热力图', data);
 
-            // 2. 涨跌幅排行
+            // 2. 涨跌幅排行（Top N）
             const sortedByChange = [...data].sort((a, b) => b.change - a.change);
-            renderBarChart('chart-sector-rank', '涨跌幅 %', sortedByChange);
+            renderBarChart('chart-sector-rank', '涨跌幅 %', sortedByChange.slice(0, TOP_N));
 
-            // 3. 资金流入排行
+            // 3. 资金流入排行（Top N）
             const sortedByFlow = [...data].sort((a, b) => b.flow - a.flow);
-            renderBarChart('chart-sector-flow', '资金流入（亿）', sortedByFlow);
+            renderBarChart('chart-sector-flow', '资金流入（亿）', sortedByFlow.slice(0, TOP_N));
+
+            // 4. 范围与完整性
+            const rangeEl = document.getElementById('status-heatmap-range');
+            if (rangeEl) {
+                rangeEl.textContent = window.sectorView.rangeText(meta, data.length) +
+                    ' 涨跌幅 / 资金流入排行各展示前 ' + TOP_N + ' 个。' +
+                    ' ' + window.sectorView.freshnessText(meta);
+            }
 
             // 4. 市场状态（模拟数据必须显式标出，不能让人当真实资金流用）
             if (res.is_mock) {

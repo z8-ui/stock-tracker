@@ -744,11 +744,17 @@ function loadSectorValuation() {
     if (window._sectorLoaded) return;
     window._sectorLoaded = true;
     fetch('/api/sector-valuation')
-        .then(function(r) { return r.json(); })
-        .then(function(res) {
-            if (res.code !== 200) return;
-            renderSectorValuation('chart-sector-scatter', res.data);
-            renderSectorPERank('chart-sector-pe-rank', res.data);
+        .then(function(r) {
+            // S3-3C：完整性/新鲜度只认后端 Headers，不从本地数据猜
+            var meta = window.sectorView.parseHeaders(function(n) { return r.headers.get(n); });
+            return r.json().then(function(res) { return { res: res, meta: meta }; });
+        })
+        .then(function(x) {
+            var st = document.getElementById('sector-status');
+            if (st) st.textContent = window.sectorView.freshnessText(x.meta);
+            if (!x.res || x.res.code !== 200) return;
+            renderSectorValuation('chart-sector-scatter', x.res.data, x.meta);
+            renderSectorPERank('chart-sector-pe-rank', x.res.data, x.meta);
         });
 }
 
