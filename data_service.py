@@ -487,9 +487,6 @@ def _spawn_refresh(cache_key, fetcher, validate_fn, meta_fn=None):
             existing = _IN_MEMORY_CACHE.get(cache_key, {}).get("data")
             if _refresh_is_valid(fresh, validate_fn, existing):
                 ts = time.time()
-                with _CACHE_LOCK:
-                    _IN_MEMORY_CACHE[cache_key] = {"data": fresh, "time": ts}
-                    _LAST_SUCCESS[cache_key] = ts
                 meta, meta_failed = None, False
                 if meta_fn is not None:
                     try:
@@ -498,8 +495,18 @@ def _spawn_refresh(cache_key, fetcher, validate_fn, meta_fn=None):
                         meta = None
                     if not isinstance(meta, dict) or not meta:
                         meta, meta_failed = None, True
-                _cache_update(cache_key, fresh, ts, meta=meta,
-                              drop_meta=meta_failed)
+                if meta_fn is not None:
+                    # r1b：先落盘、后发布。写盘失败时磁盘仍是旧数据 + 旧元数据，
+                    # 此时若先把新数据写进 _IN_MEMORY_CACHE，响应会拿新数据配旧
+                    # complete 元数据（GPT 复现：新 partial 被旧 complete 掩盖）。
+                    if not _cache_update(cache_key, fresh, ts, meta=meta,
+                                         drop_meta=meta_failed):
+                        return
+                else:
+                    _cache_update(cache_key, fresh, ts)
+                with _CACHE_LOCK:
+                    _IN_MEMORY_CACHE[cache_key] = {"data": fresh, "time": ts}
+                    _LAST_SUCCESS[cache_key] = ts
         except Exception:
             pass          # 后台刷新失败不影响前台：旧内存/文件缓存原样保留
         finally:

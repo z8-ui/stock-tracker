@@ -71,9 +71,11 @@ def _staleness_from_meta(meta, cm):
     fresh = meta.get("freshness")
     if fresh == "stale":
         return True, reason or "缓存已过期"
-    if fresh != "fresh":
-        return True, reason or "缺少可信元数据，无法确认新鲜度"
-    return bool(cm.get("is_stale")), reason
+    if fresh == "fresh":
+        # r1b：以"本次实际返回数据的元数据"为准，不再回头看进程内 _LAST_SUCCESS。
+        # 否则外部进程更新过缓存文件时会出现 freshness=fresh 却 is_stale=true。
+        return False, ""
+    return True, reason or "缺少可信元数据，无法确认新鲜度"
 
 
 def _attach_data_headers(resp, meta):
@@ -250,9 +252,13 @@ def api_heatmap():
         is_mock = any(bool(s.get("is_mock")) for s in (sectors or []) if isinstance(s, dict))
         cm = cache_meta("sector_flow")
         is_stale, stale_reason = _staleness_from_meta(meta, cm)
+        # asof 与 freshness 同源：外部进程更新过缓存文件时 _LAST_SUCCESS 可能还是旧的
+        asof = cm.get("asof")
+        if meta.get("freshness") == "fresh":
+            asof = meta.get("fetched_at_iso") or asof
         resp = jsonify({"code": 200, "data": chart, "_market_status": status,
                         "is_mock": is_mock, "is_stale": is_stale,
-                        "asof": cm["asof"], "stale_reason": stale_reason})
+                        "asof": asof, "stale_reason": stale_reason})
         return _attach_data_headers(resp, meta)
     if sectors is None:
         resp = jsonify({"code": 500, "msg": "暂无板块资金数据（接口未返回，未启用模拟兜底）"})
