@@ -707,7 +707,7 @@ class TestGroupG_NonFiniteValues(unittest.TestCase):
         self.assertFalse(iv["available"])
         self.assertIsNone(iv["intrinsic_value"])
         self.assertIsNone(iv["model_params"]["raw_eps"])
-        payload = json.dumps(iv)              # 严格序列化：不允许 inf/nan 逃逸
+        payload = json.dumps(iv, allow_nan=False)   # 严格序列化：不允许 inf/nan 逃逸
         self.assertNotIn("Infinity", payload)
 
 
@@ -789,6 +789,199 @@ class TestGroupH_OptionalNoticeDate(unittest.TestCase):
             val = d.get_stock_valuation("600519")
         self.assertEqual(sorted(val["financials"].keys()), sorted([k for k, _, _ in FIELD_MAP]))
         self.assertIsNone(val["financials"]["notice_date"])
+
+
+
+class TestGroupI_CachedFinancialsGuard(unittest.TestCase):
+    """I：缓存里的财报也要过有效性质检（S3-4A r3）。
+
+    场景覆盖授权文档 §四 的 8 个测试：文件缓存 inf / 内存缓存 nan / 其他字段异常 /
+    异常缓存+重抓成功 / 异常缓存+重抓失败 / 合法旧缓存 / 零与 null / 严格 JSON。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        self.tmp.close()
+        os.remove(self.tmp.name)
+        self._orig_file = d._CACHE_FILE
+        d._CACHE_FILE = self.tmp.name
+        d._IN_MEMORY_CACHE.clear()
+        d._LAST_SUCCESS.clear()
+        d._IN_FLIGHT.clear()
+        self.calls = []
+
+    def tearDown(self):
+        d._CACHE_FILE = self._orig_file
+        d._IN_MEMORY_CACHE.clear()
+        d._LAST_SUCCESS.clear()
+        d._IN_FLIGHT.clear()
+        if os.path.exists(self.tmp.name):
+            os.remove(self.tmp.name)
+
+    # ---- 夹具 ----
+    def _good_fin(self, **overrides):
+        fin = dict(EastMoneyF10Provider().normalize(load_raw(), "600519")[0])
+        fin.update(overrides)
+        return fin
+
+    def _preload_file(self, fin, ts=None):
+        ts = time.time() if ts is None else ts
+        with open(d._CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"fin_600519": {"__data": fin, "fetched_at": ts}}, f)
+
+    def _preload_memory(self, fin):
+        d._IN_MEMORY_CACHE["fin_600519"] = {"data": fin, "time": time.time()}
+
+    def _provider_ok(self):
+        def call(name, *args, **kwargs):
+            self.calls.append(name)
+            return FakeF10(load_raw()).fetch(args[0])
+        return call
+
+    def _provider_fail(self):
+        def call(name, *args, **kwargs):
+            self.calls.append(name)
+            return ProviderResult(None, PROVIDER_NAME, "failed", "", 0.0, False,
+                                  {"message": "上游不可用"})
+        return call
+
+    # ---- 1. 文件缓存 Infinity ----
+    def test_file_cache_infinity_rejected(self):
+        self._preload_file(self._good_fin(eps=float("inf")))
+        with mock.patch.object(d._providers, "call", side_effect=self._provider_fail()), \
+             mock.patch.object(d, "_market_status", return_value=("已收盘", False)):
+            self.assertIsNone(d.get_latest_financials("600519"))
+        self.assertEqual(self.calls, ["eastmoney_f10"], "坏缓存必须淘汰并尝试重抓一次")
+
+    def test_file_cache_infinity_never_reaches_intrinsic_value(self):
+        self._preload_file(self._good_fin(eps=float("inf")))
+        quote = {"code": "600519", "price": 1500.0, "pe": 30.0}
+        with mock.patch.object(d._providers, "call", side_effect=self._provider_fail()), \
+             mock.patch.object(d, "_market_status", return_value=("已收盘", False)), \
+             mock.patch.object(d, "get_industry_pe", return_value={"pe": 25.0, "industry": "白酒"}):
+            iv = d.estimate_intrinsic_value(quote)
+        self.assertFalse(iv["available"])
+        self.assertIsNone(iv["intrinsic_value"])
+        json.dumps(iv, allow_nan=False)          # 不得抛 inf/nan 序列化错误
+
+    # ---- 2. 内存缓存 NaN ----
+    def test_memory_cache_nan_rejected(self):
+        self._preload_memory(self._good_fin(eps=float("nan")))
+        with mock.patch.object(d._providers, "call", side_effect=self._provider_fail()), \
+             mock.patch.object(d, "_market_status", return_value=("交易中", True)):
+            self.assertIsNone(d.get_latest_financials("600519"))
+        self.assertEqual(len(self.calls), 1)
+        self.assertNotIn("fin_600519", d._IN_MEMORY_CACHE, "坏内存条目应被淘汰")
+
+    def test_memory_cache_nan_recovered_by_successful_refetch(self):
+        self._preload_memory(self._good_fin(eps=float("nan")))
+        with mock.patch.object(d._providers, "call", side_effect=self._provider_ok()), \
+             mock.patch.object(d, "_market_status", return_value=("交易中", True)):
+            fin = d.get_latest_financials("600519")
+        self.assertIsNotNone(fin)
+        self.assertEqual(fin["eps"], 51.53)
+        self.assertTrue(math.isfinite(fin["eps"]))
+
+    # ---- 3. 其他财务字段 ----
+    def test_other_nonfinite_fields_rejected(self):
+        for field_name, value in (("bps", float("inf")), ("revenue", float("nan")),
+                                  ("net_profit", float("-inf")), ("roe", float("nan"))):
+            self._preload_file(self._good_fin(**{field_name: value}))
+            with mock.patch.object(d._providers, "call", side_effect=self._provider_fail()), \
+                 mock.patch.object(d, "_market_status", return_value=("已收盘", False)):
+                fin = d.get_latest_financials("600519")
+            self.assertIsNone(fin, field_name)
+
+    # ---- 4. 异常缓存 + 重抓成功 ----
+    def test_invalid_cache_replaced_by_good_data(self):
+        self._preload_file(self._good_fin(eps=float("inf")))
+        with mock.patch.object(d._providers, "call", side_effect=self._provider_ok()), \
+             mock.patch.object(d, "_market_status", return_value=("已收盘", False)):
+            first = d.get_latest_financials("600519")
+            second = d.get_latest_financials("600519")
+        self.assertEqual(first["eps"], 51.53)
+        self.assertEqual(sorted(first.keys() & set(k for k, _, _ in FIELD_MAP)),
+                         sorted([k for k, _, _ in FIELD_MAP]))
+        self.assertEqual(second["eps"], 51.53)
+        self.assertEqual(len(self.calls), 1, "恢复后应继续走正常缓存，不再请求上游")
+        with open(d._CACHE_FILE, encoding="utf-8") as f:
+            disk = json.load(f)["fin_600519"]["__data"]
+        self.assertEqual(disk["eps"], 51.53, "坏缓存应被替换为有效财报")
+
+    # ---- 5. 异常缓存 + 重抓失败 ----
+    def test_invalid_cache_not_used_as_fallback_when_refetch_fails(self):
+        self._preload_file(self._good_fin(eps=float("inf")))
+        with mock.patch.object(d._providers, "call", side_effect=self._provider_fail()), \
+             mock.patch.object(d, "_market_status", return_value=("已收盘", False)):
+            self.assertIsNone(d.get_latest_financials("600519"))
+        with open(d._CACHE_FILE, encoding="utf-8") as f:
+            self.assertNotIn("fin_600519", json.load(f), "坏缓存不得留在文件里当兜底")
+
+    def test_invalid_cache_refresh_failure_no_nan_valuation(self):
+        self._preload_file(self._good_fin(eps=float("inf")))
+        quote = {"code": "600519", "price": 1500.0, "pe": 30.0}
+        with mock.patch.object(d._providers, "call", side_effect=self._provider_fail()), \
+             mock.patch.object(d, "_market_status", return_value=("已收盘", False)), \
+             mock.patch.object(d, "get_industry_pe", return_value={"pe": 25.0, "industry": "白酒"}):
+            iv = d.estimate_intrinsic_value(quote)
+        self.assertFalse(iv["available"])
+        self.assertIsNone(iv["model_params"]["raw_eps"])
+        json.dumps(iv, allow_nan=False)
+
+    # ---- 6. 合法旧缓存 ----
+    def test_valid_old_cache_still_served_without_upstream_call(self):
+        legacy = {"report_date": "2025-12-31", "report_name": "2025年报", "eps": 1.5,
+                  "bps": 10.0, "revenue": 1e9, "revenue_yoy": 3.0, "net_profit": 2e8,
+                  "profit_yoy": 4.0, "roe": 12.0, "notice_date": "2026-03-01"}
+        self._preload_file(legacy)
+        with mock.patch.object(d._providers, "call",
+                               side_effect=AssertionError("合法缓存不该请求上游")), \
+             mock.patch.object(d, "_market_status", return_value=("已收盘", False)):
+            first = d.get_latest_financials("600519")
+            second = d.get_latest_financials("600519")
+        self.assertEqual(first["report_date"], "2025-12-31")
+        self.assertEqual(first["eps"], 1.5)
+        self.assertEqual(second["eps"], 1.5)
+        self.assertEqual(self.calls, [])
+
+    # ---- 7. 零与 null ----
+    def test_zero_and_null_values_are_valid(self):
+        fin = self._good_fin(eps=0, revenue=0, net_profit=0, roe=None,
+                             revenue_yoy=None, notice_date=None)
+        self._preload_file(fin)
+        with mock.patch.object(d._providers, "call",
+                               side_effect=AssertionError("合法缓存不该请求上游")), \
+             mock.patch.object(d, "_market_status", return_value=("已收盘", False)):
+            got = d.get_latest_financials("600519")
+        self.assertEqual(got["eps"], 0)
+        self.assertEqual(got["revenue"], 0)
+        self.assertEqual(got["net_profit"], 0)
+        self.assertIsNone(got["roe"])
+        self.assertIsNone(got["notice_date"])
+        self.assertTrue(d._fin_values_finite(got))
+
+    # ---- 8. 严格 JSON 序列化 ----
+    def test_intrinsic_value_strict_json(self):
+        with mock.patch.object(d._providers, "call", side_effect=self._provider_ok()), \
+             mock.patch.object(d, "_market_status", return_value=("已收盘", False)), \
+             mock.patch.object(d, "get_industry_pe", return_value={"pe": 25.0, "industry": "白酒"}):
+            quote = {"code": "600519", "price": 1500.0, "pe": 30.0}
+            iv = d.estimate_intrinsic_value(quote)
+        self.assertTrue(iv["available"])
+        blob = json.dumps(iv, allow_nan=False)
+        self.assertNotIn("Infinity", blob)
+        self.assertNotIn("NaN", blob)
+
+    # ---- 诊断侧通道（S3-4B 预留）----
+    def test_diagnostic_records_cache_rejection(self):
+        self._preload_file(self._good_fin(eps=float("inf")))
+        with mock.patch.object(d._providers, "call", side_effect=self._provider_fail()), \
+             mock.patch.object(d, "_market_status", return_value=("已收盘", False)):
+            d.get_latest_financials("600519")
+        diag = d.get_financials_diagnostic("600519")
+        self.assertEqual(diag["status"], "failed", "重抓也失败：本次结果就是失败")
+        self.assertTrue(diag["cache_rejected"], "但要保留缓存曾含非法值这一事实")
+        self.assertIn("NaN", diag["reason"])
 
 
 if __name__ == "__main__":
