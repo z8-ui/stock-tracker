@@ -50,8 +50,9 @@
 <script src="/static/js/heatmap.js"></script>
 <script>
 document.addEventListener('DOMContentLoaded', function () {
-    loadHeatmapData();
-    startAutoRefresh('heatmap', loadHeatmapData);
+    loadHeatmapData();                 // 首次加载：普通模式（成功后不重复请求）
+    // 定时器回调不传参，必须显式 force，否则会被 loader 当成"已加载"直接跳过
+    startAutoRefresh('heatmap', function () { return loadHeatmapData(true); });
 });
 </script>
 {% endblock %}
