@@ -1506,6 +1506,41 @@ def _drop_fin_file(stock_code):
     return True
 
 
+def _fin_memory_snapshot(stock_code):
+    """取内存里那条**合法**财报快照：(data, ts)；没有或非法则 (None, None)。
+
+    只读不删，也不改时间 —— 用于"文件缓存坏了、上游又不可达"时的降级回退。
+    """
+    entry = _IN_MEMORY_CACHE.get(f"fin_{stock_code}")
+    if not isinstance(entry, dict):
+        return None, None
+    data = entry.get("data")
+    if not _fin_values_finite(data):
+        return None, None
+    return data, entry.get("time")
+
+
+def _fin_memory_fallback(stock_code, reason):
+    """把合法内存快照包装成"降级数据"返回：保留原始抓取时间，显式标 stale。
+
+    明确不是本次网络成功：`_source` 仍写来源，但 `_stale=True` + 文案说明；
+    `_asof` 用内存条目自己的时间，绝不刷成 now。
+    """
+    data, ts = _fin_memory_snapshot(stock_code)
+    if data is None:
+        return None
+    out = dict(data)
+    out["_asof"] = ts
+    out["_asof_known"] = ts is not None
+    out["_age_sec"] = round(time.time() - ts, 1) if ts else None
+    out["_stale"] = True
+    out["_stale_reason"] = reason
+    out["_market_status"] = _market_status()[0]
+    out["_source"] = "eastmoney"
+    out["_fallback"] = "memory"
+    return out
+
+
 def get_financials_diagnostic(stock_code):
     """最近一次 F10 取数状态（ok / cache_hit / empty / failed / cache_rejected）。
 
@@ -1575,7 +1610,15 @@ def get_latest_financials(stock_code, refresh=False):
         diag["cache_rejected"] = True
         diag["cache_reason"] = f"缓存中的财报含 NaN/Infinity（来源 {served}），已淘汰该层"
         if served == "file_fallback":
-            # 本轮上游刚刚已经失败过一次，坏文件只是兜底数据：淘汰即可，不再重复请求
+            # 本轮上游刚刚已经失败过一次，坏文件只是兜底数据：淘汰即可，不再重复请求。
+            # 但另一层（内存）如果有合法财报，可以降级回退，别把数据一起丢掉。
+            fb = _fin_memory_fallback(
+                stock_code, "本次抓取失败、文件缓存不可用，回退到内存中的财报快照（非本次网络结果）")
+            if fb is not None:
+                diag["status"] = "memory_fallback"
+                diag["reason"] = f"{diag['cache_reason']}；已回退到内存中的合法财报快照"
+                _FIN_LAST_DIAG[stock_code] = dict(diag)
+                return fb
             diag["status"] = "failed"
             diag["reason"] = f"{diag['cache_reason']}；本轮上游已失败，不再重试"
             _FIN_LAST_DIAG[stock_code] = dict(diag)
@@ -1597,7 +1640,16 @@ def get_latest_financials(stock_code, refresh=False):
         _FIN_LAST_DIAG[stock_code] = dict(diag)
         return fin
 
-    # 没拿到财报：状态以 Provider 结果为准（empty / failed），并保留缓存曾被拒的事实
+    # 没拿到财报：先看另一层是否还有合法内存快照（休市读盘失败、force 刷新失败都走这里）
+    fb = _fin_memory_fallback(
+        stock_code, "本次未取得新的财报，回退到内存中的财报快照（非本次网络结果）")
+    if fb is not None:
+        diag["status"] = "memory_fallback"
+        diag["reason"] = (diag["cache_reason"] + "；已回退到内存中的合法财报快照").strip("；")
+        _FIN_LAST_DIAG[stock_code] = dict(diag)
+        return fb
+
+    # 两层都没有可用财报：状态以 Provider 结果为准（empty / failed）
     if diag["status"] == "pending":
         diag["status"] = "failed"
     if diag["cache_reason"]:
