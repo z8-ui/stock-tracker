@@ -93,7 +93,9 @@ def result_unavailable(err):
 from .providers import tencent as _tencent      # noqa: E402
 from .providers import eastmoney_flow as _emflow  # noqa: E402
 from .providers import eastmoney_sector as _emsector  # noqa: E402
+from .providers import eastmoney_f10 as _emf10      # noqa: E402
 
 tencent_quote = register(_tencent.TencentQuoteProvider())
 eastmoney_flow = register(_emflow.EastMoneyFlowProvider())
 eastmoney_sector = register(_emsector.EastmoneySectorProvider())
+eastmoney_f10 = register(_emf10.EastMoneyF10Provider())

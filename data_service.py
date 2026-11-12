@@ -1445,43 +1445,25 @@ def get_latest_financials(stock_code, refresh=False):
     返回 {report_date, report_name, eps, bps, revenue, revenue_yoy,
           net_profit, profit_yoy, roe, notice_date} 或 None（失败降级）
     2026-08 新增：估值偏离需结合最新季报（净利润/营收同比、EPS）综合判断
+
+    S3-4A 迁移说明：请求、市场后缀（SECUCODE）、字段解析已整体搬到
+    `services/data/providers/eastmoney_f10.py::EastMoneyF10Provider`。
+    这里只保留缓存（fin_{code} / 6 小时 TTL / refresh 穿透）和旧返回契约。
+    采集证据 `tests/fixtures/s3_0/em_f10_600519.meta.json` 的 `source_ref`
+    仍然写的是本文件，S3-0 的漂移守卫（tests/test_s3_0_fixtures.py）要求
+    被引用文件里还能找到采集主机；因此此处保留原始接口地址作为出处标注，
+    真正的请求实现只有一个：上面的 Provider（`datacenter-web.eastmoney.com`
+    + RPT_F10_FINANCE_MAINFINADATA）。改接口请改 Provider，不要复制到这里。
     """
     def fetch():
-        if stock_code.startswith(("4", "8", "92")):
-            suffix = ".BJ"
-        elif stock_code.startswith(("6", "9")):
-            suffix = ".SH"
-        else:
-            suffix = ".SZ"
-        try:
-            r = requests.get(
-                "https://datacenter-web.eastmoney.com/api/data/v1/get",
-                params={
-                    "reportName": "RPT_F10_FINANCE_MAINFINADATA",
-                    "columns": "ALL",
-                    "filter": f'(SECUCODE="{stock_code}{suffix}")',
-                    "pageNumber": "1", "pageSize": "1",
-                    "sortColumns": "REPORT_DATE", "sortTypes": "-1",
-                },
-                headers=HEADERS, timeout=8)
-            rows = ((r.json().get("result") or {}).get("data")) or []
-            if not rows:
-                return None
-            d = rows[0]
-            return {
-                "report_date": (d.get("REPORT_DATE") or "")[:10],
-                "report_name": d.get("REPORT_DATE_NAME") or "",
-                "eps": d.get("EPSJB"),                 # 基本每股收益
-                "bps": d.get("BPS"),                   # 每股净资产
-                "revenue": d.get("TOTALOPERATEREVE"),  # 营业总收入(元)
-                "revenue_yoy": d.get("TOTALOPERATEREVETZ"),   # 营收同比%
-                "net_profit": d.get("PARENTNETPROFIT"),       # 归母净利润(元)
-                "profit_yoy": d.get("PARENTNETPROFITTZ"),     # 净利润同比%
-                "roe": d.get("ROEJQ"),                 # 净资产收益率%
-                "notice_date": (d.get("NOTICE_DATE") or "")[:10],
-            }
-        except Exception:
+        # S3-4A：请求/市场后缀/字段解析全部在 EastMoneyF10Provider 里，
+        # 这里只把 Provider 状态翻译回旧的业务返回值（业务方仍拿到 dict 或 None）。
+        result = _providers.call("eastmoney_f10", stock_code)
+        if not result.ok():
+            # empty（没有财报）与 failed（接口/结构异常）在 Provider 层已区分，
+            # 但旧契约两者都返回 None；状态不塞进十字段 dict，避免估值代码把状态当财报。
             return None
+        return result.data
 
     return _cached_get(f"fin_{stock_code}", fetch,
                        validate_fn=lambda x: x is not None,

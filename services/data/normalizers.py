@@ -104,6 +104,38 @@ _SZ_STOCK_PREFIXES = ("000", "001", "002", "003", "300", "301", "200")
 _BJ_STOCK_PREFIXES = ("43", "83", "87", "88", "92")
 
 
+def stock_market(code):
+    """A 股股票代码 → 交易所（"SH" / "SZ" / "BJ"）。唯一一处代码段判定。
+
+    北交所（43/83/87/88/92）必须单独判出来：它和深市一样用 secid 市场位 0，
+    只看 secid 前缀会把北交所误当成深交所（S3-4 TD-03）。
+
+    非法输入抛 ValueError —— 不静默归入某个市场。
+    """
+    text = str(code or "").strip()
+    if len(text) != 6 or not text.isdigit():
+        raise ValueError(f"非法股票代码：{code!r}")
+    # 北交所先判：92 段和沪市 9 开头不同，但顺序写死更安全
+    if text.startswith(_BJ_STOCK_PREFIXES):
+        return "BJ"
+    if text.startswith(_SH_STOCK_PREFIXES):
+        return "SH"
+    if text.startswith(_SZ_STOCK_PREFIXES):
+        return "SZ"
+    raise ValueError(f"无法确定市场：{code!r}")
+
+
+def stock_secucode(code):
+    """A 股股票代码 → 东方财富 F10 的 SECUCODE（"600519.SH"）。
+
+    与 `secid()` 共用同一套代码段定义（`stock_market()`），不复制 startswith 判断。
+    注意：`secid()` 的北交所市场位是 0，而 F10 要的是 ".BJ" 后缀 ——
+    同一个"市场"在两个接口里有两种拼法，不能互相顶替。
+    """
+    text = str(code or "").strip()
+    return f"{text}.{stock_market(text)}"
+
+
 def secid(code, kind="stock"):
     """A 股代码 → 东方财富 secid（"市场.代码"）。
 
@@ -118,13 +150,8 @@ def secid(code, kind="stock"):
         return hit
     if kind != "stock":
         raise ValueError(f"未知 kind：{kind!r}（只支持 stock / index）")
-    if len(text) != 6 or not text.isdigit():
-        raise ValueError(f"非法股票代码：{code!r}")
-    if text.startswith(_SH_STOCK_PREFIXES):
-        return f"1.{text}"
-    if text.startswith(_SZ_STOCK_PREFIXES) or text.startswith(_BJ_STOCK_PREFIXES):
-        return f"0.{text}"
-    raise ValueError(f"无法确定市场：{code!r}")
+    market = stock_market(text)          # 与 stock_secucode() 同一套判定
+    return f"1.{text}" if market == "SH" else f"0.{text}"
 
 
 def yuan_to_yi(value):
