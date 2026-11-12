@@ -220,6 +220,13 @@ def data_meta(cache_key, served_from=None, trace=None, data=None):
     served = served_from or "none"
     trace = trace or {}
     served_data = data if data is not None else persisted
+    # r2：优先用"本次实际返回的那份数据"的版本（trace["version"]），而不是磁盘条目的时间。
+    # 两次读取之间别的请求可能已经更新了缓存：磁盘是 B，本次返回的是 A，
+    # 拿 B 的元数据描述 A 就是跨请求错配（GPT 复现）。没有 version 的调用方才退回磁盘时间。
+    if "version" in trace:
+        version = trace.get("version")
+    else:
+        version = persisted_at
     out = {
         "cache_key": cache_key,
         "meta_status": "missing",
@@ -233,8 +240,8 @@ def data_meta(cache_key, served_from=None, trace=None, data=None):
         "missing_pages": [],
         "notes": [],
         "duplicates": 0,
-        "fetched_at": persisted_at,
-        "fetched_at_iso": _fmt_ts(persisted_at) if persisted_at else None,
+        "fetched_at": version,
+        "fetched_at_iso": _fmt_ts(version) if version else None,
         "asof": "unknown",
         "source": "",
         "served_from": served,
@@ -265,7 +272,7 @@ def data_meta(cache_key, served_from=None, trace=None, data=None):
             out["fetch_status"] = "success"     # 抓取本身成功，只是没能落盘
         return out
 
-    status = _meta_trust(record, served_data, persisted_at)
+    status = _meta_trust(record, served_data, version)
     if status != "ok":
         out["meta_status"] = status
         out["missing"] = {
@@ -626,10 +633,17 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
     ttl = ttl or _IN_MEMORY_TTL
     now = time.time()
 
-    def _mark(where):
-        """记录本次实际返回来源（只在真正返回的路径上调一次）。"""
+    def _mark(where, version=None):
+        """记录本次实际返回来源 + **该返回值所属的缓存版本**（r2）。
+
+        version 是这条返回路径上那份数据的 fetched_at（内存/文件/网络各自的真实时间）。
+        data_meta() 必须用它把"这份数据"和"描述这份数据的元数据"绑在一起；
+        没有它就会出现"请求拿到旧 A、元数据却是新 B"的跨请求错配（GPT 复现）。
+        """
         if trace is not None:
             trace["served"] = where
+            trace["version"] = version
+            trace["version_known"] = version is not None
         return where
 
     def _inject(value, asof):
@@ -678,10 +692,15 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
         return value
 
     def _file_cache():
+        """返回 (注入标注后的值, 该缓存条目的 fetched_at)；无缓存返回 (None, None)。
+
+        r2：把 fetched_at 一并交出去 —— 调用方要把它当作"这份数据的版本"记进 trace，
+        供 data_meta() 校验元数据属于同一轮抓取。旧格式（裸 list）没有时间戳，版本为 None。
+        """
         with _CACHE_LOCK:
             raw = _load_cache().get(cache_key)
         if raw is None:
-            return None
+            return None, None
         if isinstance(raw, dict) and "__data" in raw:
             val, fetched_at = raw["__data"], raw.get("fetched_at")
         else:
@@ -690,7 +709,7 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
         if fetched_at:
             # 重启后把落盘的抓取时间补回内存，/api/ready 与前端时间戳才有依据
             _LAST_SUCCESS.setdefault(cache_key, fetched_at)
-        return _inject(val, fetched_at)
+        return _inject(val, fetched_at), fetched_at
 
     def _ok(v):
         """None 永远不算有效数据：宁可显示"暂无数据"，也不能把 null 存进缓存。"""
@@ -717,12 +736,13 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
         _bump("miss")
         fresh = _timed_fetch()
         if _ok(fresh):
-            _mark("network")
+            _mark("network", now)
             return _inject(_store(fresh), now)
-        cached = _file_cache()
+        cached, cver = _file_cache()
         if cached is not None:
-            _mark("file_fallback")      # 强制刷新失败 → 返回旧缓存，同样是降级
+            _mark("file_fallback", cver)   # 强制刷新失败 → 返回旧缓存，同样是降级
             return cached
+        _mark("none", None)
         return fresh
 
     if is_trading:
@@ -730,7 +750,7 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
         # 1) 新鲜内存 → 直接返回
         if mem and (now - mem["time"]) < ttl:
             _bump("hit")
-            _mark("memory")
+            _mark("memory", mem["time"])
             return _inject(mem["data"], mem["time"])
         # 2) 过期内存 → SWR：先返回旧数据，后台异步重建
         if mem:
@@ -740,7 +760,7 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
                 _spawn_refresh(cache_key, _timed_fetch, validate_fn)
             else:
                 _spawn_refresh(cache_key, _timed_fetch, validate_fn, meta_fn=meta_fn)
-            _mark("stale")
+            _mark("stale", mem["time"])
             return _inject(mem["data"], mem["time"])
         # 3) 无内存 → single-flight 同步构建（并发只建一次，检查+注册原子化）
         evt, other = _inflight_acquire(cache_key)
@@ -751,34 +771,36 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
             mem = _IN_MEMORY_CACHE.get(cache_key)
             if mem:
                 _bump("hit")
-                _mark("memory")      # 等别人构建完再读内存 = 内存命中，不是读文件
+                _mark("memory", mem["time"])   # 等别人构建完再读内存 = 内存命中，不是读文件
                 return _inject(mem["data"], mem["time"])
-            cached = _file_cache()
+            cached, cver = _file_cache()
             if cached is not None:
                 # 等到的是"别人没建成、只剩旧文件缓存"→ 这是降级，不是休市读盘
-                _mark("file_fallback")
+                _mark("file_fallback", cver)
                 return cached
+            _mark("none", None)
             return None
         try:
             _bump("miss")
             fresh = _timed_fetch()
             if _ok(fresh):
-                _mark("network")
+                _mark("network", now)
                 return _inject(_store(fresh), now)
             # 构建失败（含网络异常）→ 文件缓存兜底
-            cached = _file_cache()
+            cached, cver = _file_cache()
             if cached is not None:
-                _mark("file_fallback")
+                _mark("file_fallback", cver)
                 return cached
+            _mark("none", None)
             return fresh
         except Exception:
             # 抓取抛异常（超时/连接失败）不能把整个请求打成 500：
             # 有旧缓存就返回旧缓存（带 _stale），没有就返回 None 让路由给"暂无数据"
-            cached = _file_cache()
+            cached, cver = _file_cache()
             if cached is not None:
-                _mark("file_fallback")
+                _mark("file_fallback", cver)
             else:
-                _mark("none")
+                _mark("none", None)
                 if trace is not None:
                     trace["fetch_failed"] = True   # 让 X-Data-Fetch-Status 如实记 failed
             return cached if cached is not None else None
@@ -786,11 +808,11 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
             _inflight_release(cache_key, evt)
 
     # 非交易时段：优先文件缓存（定格快照）
-    cached = _file_cache()
+    cached, cver = _file_cache()
     # 注意：缓存值可能是 list（板块资金流），list 没有 _stale 字段，不能直接 .get()
     if cached is not None and not (isinstance(cached, dict) and cached.get("_stale")):
         _bump("closed_served")
-        _mark("file")
+        _mark("file", cver)
         return cached
     # 无缓存，或缓存已经旧到不能代表"最近一次收盘"（例如停在两个月前）：
     # 先尝试抓一次；抓到就存，抓不到才退回旧缓存并保留 _stale 标记。
@@ -799,12 +821,14 @@ def _cached_get(cache_key, fetcher, validate_fn=None, source="", ttl=None, force
     except Exception:
         fresh = None
     if _ok(fresh):
-        _mark("network")
+        _mark("network", now)
         return _inject(_store(fresh), now)
     if cached is not None:
         # 上游刷新没成功，退回的是旧快照：file_fallback（不是"休市直接读盘"）
-        _mark("file_fallback")
-    return cached if cached is not None else fresh
+        _mark("file_fallback", cver)
+        return cached
+    _mark("none", None)
+    return fresh
 
 
 # ==============================================================
