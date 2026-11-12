@@ -67,12 +67,124 @@
             // PE=0 是真实值，不是盈利也不是亏损：单独一组，避免"0 被算成盈利"
             if (pe < 0) neg.push(pt); else if (pe > 0) pos.push(pt); else zero.push(pt);
         });
+        // drawn 只统计"真的有有限绘制坐标"的点：正 PE（对数轴）、负 PE（线性负轴）、PE=0（独立类目轴）
         return {
             positive: pos, negative: neg, zero: zero,
             noPe: noPe, noCap: noCap,
             pbMissing: pbMissing, total: rows.length,
             drawn: pos.length + neg.length + zero.length,
+            undrawn: noPe + noCap,
             pbAllMissing: rows.length > 0 && pbMissing === rows.length
+        };
+    }
+
+    /* ECharts option：纯函数，便于用真实 ECharts 在 Node 里验证坐标。
+     * 关键：对数轴不能表示 0，所以 PE=0 走独立 grid + 类目轴，
+     * 它是真实坐标（有限值），不是被丢掉或改成 0.01 的假值。 */
+    function scatterOption(pts) {
+        pts = pts || { positive: [], negative: [], zero: [], total: 0, drawn: 0 };
+        var negMin = -10;
+        if (pts.negative.length) {
+            negMin = Math.floor(Math.min.apply(null, pts.negative.map(function (p) { return p.pe; })) * 1.1);
+        }
+        var hasZero = pts.zero.length > 0;
+        var AX = { color: '#8892b0' };
+
+        function bubbleSize(val) {
+            var c = Math.max(1, Number(val[1]) || 1);
+            return Math.max(7, Math.min(34, 7 * Math.log10(c + 10)));
+        }
+
+        function series(label, arr, color, gridIndex, xIdx, yIdx, catValue) {
+            var s = {
+                name: label, type: 'scatter',
+                xAxisIndex: xIdx, yAxisIndex: yIdx, gridIndex: gridIndex,
+                data: arr.map(function (p) {
+                    return {
+                        name: p.name, pe: p.pe, cap: p.cap,
+                        value: [catValue === undefined ? p.pe : catValue, p.cap],
+                        itemStyle: { color: color }
+                    };
+                }),
+                symbolSize: bubbleSize,
+                label: { show: false },
+                emphasis: {
+                    label: { show: true, color: '#fff', fontSize: 11,
+                             formatter: function (q) { return q.data.name; } }
+                }
+            };
+            return s;
+        }
+
+        var grids = [{ left: '4%', width: '50%', top: 100, bottom: 28, containLabel: true }];
+        var xAxes = [{ type: 'log', gridIndex: 0, name: 'PE（对数刻度，非线性）', nameLocation: 'middle',
+                       nameGap: 30, nameTextStyle: AX, axisLabel: AX, splitLine: { lineStyle: { color: '#233054' } } }];
+        var yAxes = [{ type: 'log', gridIndex: 0, name: '市值（亿元，对数）', nameTextStyle: AX,
+                       axisLabel: AX, splitLine: { lineStyle: { color: '#233054' } } }];
+        var allSeries = [series('盈利（PE>0）', pts.positive, '#ef5350', 0, 0, 0)];
+
+        xAxes.push({ type: 'value', gridIndex: 1, min: negMin, max: 0, name: 'PE（负值，独立线性轴）',
+                     nameTextStyle: { color: '#7e57c2' }, axisLabel: AX,
+                     splitLine: { lineStyle: { color: '#233054' } } });
+        yAxes.push({ type: 'log', gridIndex: 1, name: '市值（亿元，对数）', nameTextStyle: AX,
+                     axisLabel: AX, splitLine: { lineStyle: { color: '#233054' } } });
+
+        if (hasZero) {
+            grids.push({ left: '63%', width: '33%', top: 100, height: 200, containLabel: true });
+            grids.push({ left: '63%', width: '33%', top: 352, height: 96, containLabel: true });
+            xAxes.push({ type: 'category', gridIndex: 2, data: ['PE=0'], name: 'PE=0（非盈利，独立区域）',
+                         nameTextStyle: { color: '#90a4ae' }, axisLabel: { color: '#90a4ae' },
+                         splitLine: { show: false } });
+            yAxes.push({ type: 'log', gridIndex: 2, name: '市值（亿元，对数）', nameTextStyle: AX,
+                         axisLabel: AX, splitLine: { lineStyle: { color: '#233054' } } });
+        } else {
+            grids.push({ left: '63%', width: '33%', top: 100, bottom: 28, containLabel: true });
+        }
+
+        var lossSeries = series('亏损（PE<0）', pts.negative, '#7e57c2', 1, 1, 1);
+        if (pts.negative.length) {
+            var worst = pts.negative.reduce(function (a, b) { return b.pe < a.pe ? b : a; });
+            lossSeries.markPoint = {
+                symbolSize: 8,
+                itemStyle: { color: '#ffd54f' },
+                label: { show: true, color: '#ffd54f', fontSize: 11,
+                         formatter: worst.name + ' ' + worst.pe },
+                data: [{ name: worst.name, coord: [worst.pe, worst.cap] }]
+            };
+        }
+        allSeries.push(lossSeries);
+        if (hasZero) {
+            allSeries.push(series('PE=0（非盈利）', pts.zero, '#90a4ae', 2, 2, 2, 'PE=0'));
+        }
+
+        return {
+            color: ['#ef5350', '#90a4ae', '#7e57c2'],
+            title: {
+                text: hasZero ? '板块估值气泡图（左：PE>0 / 右上：PE<0 / 右下：PE=0）'
+                              : '板块估值气泡图（左：PE>0 / 右：PE<0 独立坐标）',
+                subtext: 'PB 上游全部缺失，不参与坐标；左侧 PE 与两侧市值均为对数轴，右侧负 PE 为独立线性轴；负 PE 为亏损，不是低估值',
+                textStyle: { color: '#e0e0e0', fontSize: 14 },
+                subtextStyle: { color: '#8892b0', fontSize: 11 }
+            },
+            legend: {
+                data: hasZero ? ['盈利（PE>0）', '亏损（PE<0）', 'PE=0（非盈利）']
+                              : ['盈利（PE>0）', '亏损（PE<0）'],
+                textStyle: { color: '#8892b0' }, top: 54
+            },
+            tooltip: {
+                formatter: function (q) {
+                    var pe = q.data.pe, cap = q.data.cap;
+                    var peTxt = pe === 0 ? '0（PE=0，非盈利也不亏损）'
+                              : (pe < 0 ? pe + '（亏损，不代表低估值）' : String(pe));
+                    var money = (typeof window !== 'undefined' && window.fmt && window.fmt.money)
+                        ? window.fmt.money(cap, '亿') : (cap + ' 亿');
+                    return q.data.name + '<br/>PE: ' + peTxt + '<br/>市值: ' + money;
+                }
+            },
+            grid: grids,
+            xAxis: xAxes,
+            yAxis: yAxes,
+            series: allSeries
         };
     }
 
@@ -171,6 +283,91 @@
         return '完整性未知：本次取得 ' + (rows === null ? '未知' : fmtInt(rows)) + ' 个板块';
     }
 
+    /* 网络异常文案：只有真的有旧数据才说"保留此前数据"，否则就是"无可用数据"。 */
+    function netErrorText(hadData, kind) {
+        var why = kind === 'network' ? '（网络连接失败）'
+                : kind === 'parse' ? '（响应解析失败）'
+                : kind === 'code' ? '（接口返回异常）' : '';
+        return hadData ? '⚠ 本次刷新失败，当前保留此前页面数据' + why + '。'
+                       : '⚠ 请求失败，当前无可用数据' + why + '。';
+    }
+
+    /* 统一取数：任何异常都走 onError，Promise 永不 reject（不会产生未处理拒绝）。 */
+    function loadSectorData(opts) {
+        opts = opts || {};
+        var f = opts.fetch || (typeof fetch !== 'undefined' ? fetch : null);
+        var onData = opts.onData || function () {};
+        var onError = opts.onError || function () {};
+        if (!f) {
+            var none = { kind: 'network', error: new Error('fetch unavailable') };
+            onError(none);
+            return Promise.resolve({ ok: false, kind: 'network' });
+        }
+        return Promise.resolve()
+            .then(function () { return f(opts.url); })
+            .then(function (resp) {
+                var meta = parseHeaders(function (n) {
+                    return (resp && resp.headers && resp.headers.get) ? resp.headers.get(n) : null;
+                });
+                return Promise.resolve()
+                    .then(function () { return resp.json(); })
+                    .then(function (body) { return { body: body, meta: meta }; },
+                          function () { return { body: null, meta: meta, parseError: true }; });
+            })
+            .then(function (x) {
+                if (!x.body || x.body.code !== 200) {
+                    var kind = x.parseError ? 'parse' : 'code';
+                    onError({ kind: kind, body: x.body, meta: x.meta });
+                    return { ok: false, kind: kind, meta: x.meta, body: x.body };
+                }
+                onData(x.body, x.meta);
+                return { ok: true, meta: x.meta, body: x.body };
+            })
+            .catch(function (err) {
+                onError({ kind: 'network', error: err, meta: null });
+                return { ok: false, kind: 'network', error: err };
+            });
+    }
+
+    /* 页面级加载器：
+     *   - 成功后再次 load() 直接跳过（防重复请求）；load(true) 强制刷新（定时刷新用）
+     *   - 首次失败自动解除占位，允许重试
+     *   - 已有数据时刷新失败只提示，不清掉已显示的数据
+     */
+    function sectorLoader(cfg) {
+        cfg = cfg || {};
+        var state = { loaded: false, data: null, lastError: null, attempts: 0, inFlight: false };
+
+        function load(force) {
+            if (state.loaded && !force) return Promise.resolve({ skipped: true, ok: true });
+            if (state.inFlight) return state.inFlight;
+
+            state.loaded = true;                 // 先占位，防止连点 Tab/并发刷新
+            state.inFlight = true;
+            state.attempts += 1;
+            var hadData = state.data !== null;
+
+            var p = loadSectorData({
+                url: cfg.url,
+                fetch: cfg.fetch,
+                onData: function (body, meta) {
+                    state.data = body.data;
+                    state.lastError = null;
+                    if (cfg.render) cfg.render(body, meta);
+                },
+                onError: function (info) {
+                    state.lastError = info.kind;
+                    if (!hadData) state.loaded = false;   // 首次失败：解除占位，允许重新请求
+                    if (cfg.fail) cfg.fail(info, hadData, netErrorText(hadData, info.kind));
+                }
+            });
+            state.inFlight = p;
+            return p.then(function (r) { state.inFlight = false; return r; });
+        }
+
+        return { load: load, state: state };
+    }
+
     /* 读取 X-Data-*：只接受真实响应头，缺失一律 null（不猜）。 */
     var HEADER_MAP = {
         'X-Data-Fetch-Status': 'fetch_status',
@@ -204,7 +401,11 @@
         classifyPE: classifyPE,
         peRank: peRank,
         bubblePoints: bubblePoints,
+        scatterOption: scatterOption,
         rangeText: rangeText,
+        netErrorText: netErrorText,
+        loadSectorData: loadSectorData,
+        sectorLoader: sectorLoader,
         scopeText: scopeText,
         freshnessText: freshnessText,
         parseHeaders: parseHeaders

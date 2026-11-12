@@ -47,66 +47,9 @@
 {% endblock %}
 
 {% block scripts %}
+<script src="/static/js/heatmap.js"></script>
 <script>
-function loadHeatmapData() {
-    const TOP_N = 20;
-    fetch('/api/heatmap')
-        .then(r => {
-            // S3-3C：完整性只认 X-Data-*，不从本地行数推断上游总量
-            const meta = window.sectorView.parseHeaders(n => r.headers.get(n));
-            return r.json().then(res => ({ res: res, meta: meta }));
-        })
-        .then(x => {
-            const res = x.res, meta = x.meta;
-            if (!res || res.code !== 200) {
-                // 失败不能留空白图：明确写出"无可用数据"
-                const el = document.getElementById('status-heatmap-range');
-                if (el) {
-                    el.className = 'heatmap-meta warn';
-                    el.textContent = '⚠ 板块数据不可用：' + ((res && res.msg) || '接口未返回数据') +
-                        '。' + window.sectorView.freshnessText(meta);
-                }
-                return;
-            }
-            const data = res.data;
-
-            // 1. 热力图（treemap）—— 后端给多少画多少
-            renderTreemap('chart-heatmap', '行业板块热力图', data);
-
-            // 2. 涨跌幅排行（Top N）
-            const sortedByChange = [...data].sort((a, b) => b.change - a.change);
-            renderBarChart('chart-sector-rank', '涨跌幅 %', sortedByChange.slice(0, TOP_N));
-
-            // 3. 资金流入排行（Top N）
-            const sortedByFlow = [...data].sort((a, b) => b.flow - a.flow);
-            renderBarChart('chart-sector-flow', '资金流入（亿）', sortedByFlow.slice(0, TOP_N));
-
-            // 4. 范围与完整性
-            const rangeEl = document.getElementById('status-heatmap-range');
-            if (rangeEl) {
-                const fresh = window.sectorView.freshnessText(meta);
-                rangeEl.className = 'heatmap-meta' + ((meta.completeness !== 'complete' ||
-                    meta.freshness !== 'fresh' || meta.fetch_status === 'failed') ? ' warn' : '');
-                rangeEl.textContent = window.sectorView.rangeText(meta, data.length) +
-                    ' 涨跌幅 / 资金流入排行各展示前 ' + TOP_N + ' 个。 ' + fresh;
-            }
-
-            // 4. 市场状态（模拟数据必须显式标出，不能让人当真实资金流用）
-            if (res.is_mock) {
-                const st = document.getElementById('status-heatmap-page');
-                st.textContent = '⚠ 模拟数据（非真实资金流，仅供界面演示）';
-                st.style.color = '#ef5350';
-            } else if (res.is_stale) {
-                const st = document.getElementById('status-heatmap-page');
-                st.textContent = '⚠ 缓存数据' + (res.asof ? '（' + res.asof + '）' : '（抓取时间未知）') + '，非实时';
-                st.style.color = '#ffb74d';
-            } else if (res._market_status) {
-                document.getElementById('status-heatmap-page').textContent = res._market_status;
-            }
-        });
-}
-
-document.addEventListener('DOMContentLoaded', function() {
+document.addEventListener('DOMContentLoaded', function () {
     loadHeatmapData();
     startAutoRefresh('heatmap', loadHeatmapData);
 });

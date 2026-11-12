@@ -740,31 +740,42 @@ function renderSwingChart(d) {
 }
 
 // ========== 板块估值 ==========
-function loadSectorValuation() {
-    if (window._sectorLoaded) return;
-    window._sectorLoaded = true;
-    fetch('/api/sector-valuation')
-        .then(function(r) {
-            // S3-3C：完整性/新鲜度只认后端 Headers，不从本地数据猜
-            var meta = window.sectorView.parseHeaders(function(n) { return r.headers.get(n); });
-            return r.json().then(function(res) { return { res: res, meta: meta }; });
-        })
-        .then(function(x) {
-            var st = document.getElementById('sector-status');
-            if (st) st.textContent = window.sectorView.freshnessText(x.meta);
-            if (!x.res || x.res.code !== 200) {
-                var msg = '⚠ 板块估值数据不可用：' + ((x.res && x.res.msg) || '接口未返回数据') +
-                    '。' + window.sectorView.freshnessText(x.meta);
-                ['sector-scatter-note', 'sector-rank-note'].forEach(function (id) {
-                    var el = document.getElementById(id);
-                    if (el) el.textContent = msg;
-                });
-                return;
-            }
-            renderSectorValuation('chart-sector-scatter', x.res.data, x.meta);
-            renderSectorPERank('chart-sector-pe-rank', x.res.data, x.meta);
-        });
+var _sectorLoader = null;
+
+function _sectorNotes(msg) {
+    ['sector-scatter-note', 'sector-rank-note'].forEach(function (id) {
+        var el = document.getElementById(id);
+        if (el) el.textContent = msg;
+    });
 }
+
+function loadSectorValuation() {
+    var sv = window.sectorView;
+    if (!_sectorLoader) {
+        _sectorLoader = sv.sectorLoader({
+            url: '/api/sector-valuation',
+            render: function (res, meta) {
+                var st = document.getElementById('sector-status');
+                if (st) st.textContent = sv.freshnessText(meta);
+                renderSectorValuation('chart-sector-scatter', res.data, meta);
+                renderSectorPERank('chart-sector-pe-rank', res.data, meta);
+            },
+            fail: function (info, hadData, text) {
+                var st = document.getElementById('sector-status');
+                if (st) st.textContent = text;
+                var detail = (info && info.body && info.body.msg) ? '（' + info.body.msg + '）' : '';
+                _sectorNotes(text + detail + (hadData ? '' : ' 可在切换 Tab 后重试。'));
+            }
+        });
+    }
+    // 成功后 loader 内部 loaded=true，重复打开 Tab 不会重复抓取；失败会自动解除，允许重试
+    window._sectorLoaded = _sectorLoader.state.loaded;
+    return _sectorLoader.load().then(function (r) {
+        window._sectorLoaded = _sectorLoader.state.loaded;
+        return r;
+    });
+}
+window.loadSectorValuation = loadSectorValuation;
 
 // ========== 指数技术分析（支持切换） ==========
 var currentIndexCode = '000688';

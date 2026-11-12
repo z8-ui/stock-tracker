@@ -478,91 +478,10 @@ function renderSectorValuation(domId, sectors, meta) {
     if (!chart) return;
     const sv = window.sectorView;
     const pts = sv.bubblePoints(sectors || []);
-    // 板块 Tab 默认是隐藏的：ECharts 初始化时量到的是隐藏宽度，这里必须重新量一次
+    // 板块 Tab 默认隐藏：ECharts 初始化时量到的是隐藏宽度，必须重新量
     chart.resize();
     setTimeout(function () { chart.resize(); }, 60);
-
-    // 负 PE 极端值（-36378）会把正 PE 压成一条线：正/负分屏，各自独立 x 轴。
-    var negMin = -10;
-    if (pts.negative.length) {
-        negMin = Math.floor(Math.min.apply(null, pts.negative.map(function (p) { return p.pe; })) * 1.1);
-    }
-
-    function scatterSeries(label, arr, color, gridIndex, xIdx, yIdx) {
-        return {
-            name: label, type: 'scatter',
-            xAxisIndex: xIdx, yAxisIndex: yIdx, gridIndex: gridIndex,
-            data: arr.map(function (p) {
-                return { name: p.name, value: [p.pe, p.cap], itemStyle: { color: color } };
-            }),
-            symbolSize: function (val) {
-                var c = Math.max(1, Number(val[1]) || 1);
-                return Math.max(7, Math.min(34, 7 * Math.log10(c + 10)));
-            },
-            label: { show: false },          // 496 个点不叠标签，hover 再看名字
-            emphasis: {
-                label: { show: true, color: '#fff', fontSize: 11,
-                         formatter: function (p) { return p.data.name; } }
-            }
-        };
-    }
-
-    chart.setOption({
-        color: ['#ef5350', '#90a4ae', '#7e57c2'],
-        title: {
-            text: '板块估值气泡图（左：PE>0 / 右：PE<0 独立坐标）',
-            subtext: 'PB 上游全部缺失，不参与坐标；横/纵轴为对数刻度（非线性），点为真实值；负 PE 为亏损，不是低估值',
-            textStyle: { color: '#e0e0e0', fontSize: 14 },
-            subtextStyle: { color: '#8892b0', fontSize: 11 }
-        },
-        legend: {
-            data: ['盈利（PE>0）', 'PE=0（非盈利）', '亏损（PE<0）'],
-            textStyle: { color: '#8892b0' }, top: 54
-        },
-        tooltip: {
-            formatter: function (p) {
-                var pe = p.data.value[0], cap = p.data.value[1];
-                var peTxt = pe < 0 ? pe + '（亏损，不代表低估值）' : String(pe);
-                return p.data.name + '<br/>PE: ' + peTxt + '<br/>市值: ' + window.fmt.money(cap, '亿');
-            }
-        },
-        grid: [
-            { left: '4%', width: '50%', top: 100, bottom: 28, containLabel: true },
-            { left: '63%', width: '33%', top: 100, bottom: 28, containLabel: true }
-        ],
-        xAxis: [
-            { type: 'log', gridIndex: 0, name: 'PE（对数刻度，非线性）', nameLocation: 'middle',
-              nameGap: 30, nameTextStyle: { color: '#8892b0' }, axisLabel: { color: '#8892b0' },
-              splitLine: { lineStyle: { color: '#233054' } } },
-            { type: 'value', gridIndex: 1, min: negMin, max: 0, name: 'PE（负值，独立坐标）',
-              nameTextStyle: { color: '#7e57c2' }, axisLabel: { color: '#8892b0' },
-              splitLine: { lineStyle: { color: '#233054' } } }
-        ],
-        yAxis: [
-            { type: 'log', gridIndex: 0, name: '市值（亿元，对数）', nameTextStyle: { color: '#8892b0' },
-              axisLabel: { color: '#8892b0' }, splitLine: { lineStyle: { color: '#233054' } } },
-            { type: 'log', gridIndex: 1, name: '市值（亿元，对数）', nameTextStyle: { color: '#8892b0' },
-              axisLabel: { color: '#8892b0' }, splitLine: { lineStyle: { color: '#233054' } } }
-        ],
-        series: (function () {
-            var lossSeries = scatterSeries('亏损（PE<0）', pts.negative, '#7e57c2', 1, 1, 1);
-            if (pts.negative.length) {
-                var worst = pts.negative.reduce(function (a, b) { return b.pe < a.pe ? b : a; });
-                lossSeries.markPoint = {
-                    symbolSize: 8,
-                    itemStyle: { color: '#ffd54f' },
-                    label: { show: true, color: '#ffd54f', fontSize: 11,
-                             formatter: worst.name + ' ' + worst.pe },
-                    data: [{ name: worst.name, coord: [worst.pe, worst.cap] }]
-                };
-            }
-            return [
-                scatterSeries('盈利（PE>0）', pts.positive, '#ef5350', 0, 0, 0),
-                scatterSeries('PE=0（非盈利）', pts.zero, '#90a4ae', 0, 0, 0),
-                lossSeries
-            ];
-        })()
-    }, true);
+    chart.setOption(sv.scatterOption(pts), true);
 
     var note = document.getElementById('sector-scatter-note');
     if (note) {
@@ -571,10 +490,10 @@ function renderSectorValuation(domId, sectors, meta) {
             ? 'PB：暂无数据（上游 ' + pts.total + '/' + pts.total + ' 返回 "-"），本图不使用 PB 轴'
             : 'PB：部分板块缺失（' + pts.pbMissing + '/' + pts.total + ' 为 null）');
         parts.push('已绘制 ' + pts.drawn + '/' + pts.total + ' 个：正 PE ' + pts.positive.length +
-            ' 个（左，PE/市值均为对数轴）、PE=0 ' + pts.zero.length + ' 个、亏损 ' + pts.negative.length +
-            ' 个（右，独立负 PE 轴；极端值已标在图内，其余可 hover 查看原值）');
-        if (pts.noPe) parts.push('PE 缺失 ' + pts.noPe + ' 个（不绘制，显示 --）');
-        if (pts.noCap) parts.push('市值缺失 ' + pts.noCap + ' 个（不绘制）');
+            ' 个（左，PE 对数轴）、亏损 ' + pts.negative.length + ' 个（右，独立线性负轴）' +
+            (pts.zero.length ? '、PE=0 ' + pts.zero.length + ' 个（右下独立区域，类目轴）' : ''));
+        if (pts.noPe) parts.push('未绘制 ' + pts.noPe + ' 个：PE 缺失（显示 --）');
+        if (pts.noCap) parts.push('未绘制 ' + pts.noCap + ' 个：市值缺失');
         if (meta) parts.push(sv.rangeText(meta, pts.total));
         note.textContent = parts.join('；');
     }
